@@ -19,7 +19,9 @@ RUN pip install --upgrade pip && \
 
 COPY . /app
 
-RUN chmod +x /app/entrypoint.sh
+RUN mkdir -p /app/staticfiles /app/media && \
+    chmod +x /app/entrypoint.sh && \
+    chown -R appuser:appuser /app
 
 USER appuser
 

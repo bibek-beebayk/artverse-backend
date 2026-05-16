@@ -6,6 +6,8 @@ WEB_CONCURRENCY="${WEB_CONCURRENCY:-2}"
 GUNICORN_TIMEOUT="${GUNICORN_TIMEOUT:-120}"
 GUNICORN_LOG_LEVEL="${GUNICORN_LOG_LEVEL:-info}"
 
+mkdir -p /app/staticfiles /app/media
+
 echo "Applying database migrations..."
 python manage.py migrate --noinput
 
