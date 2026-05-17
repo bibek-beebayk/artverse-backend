@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+from django.core.exceptions import ImproperlyConfigured
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -14,6 +15,7 @@ def env_list(name: str, default: str = "") -> list[str]:
 
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "artverse-dev-secret-key")
 DEBUG = os.getenv("DJANGO_DEBUG", "true").lower() == "true"
+MAINTENANCE_TOKEN_MAX_AGE = int(os.getenv("DJANGO_MAINTENANCE_TOKEN_MAX_AGE", "86400"))
 
 ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", "127.0.0.1,localhost")
 
@@ -123,15 +125,16 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 MEDIA_URL = "media/"
 MEDIA_ROOT = BASE_DIR / "media"
 
-RAILWAY_BUCKET_NAME = os.getenv("BUCKET") or os.getenv("AWS_STORAGE_BUCKET_NAME", "")
-RAILWAY_BUCKET_ENDPOINT = os.getenv("ENDPOINT") or os.getenv("AWS_S3_ENDPOINT_URL", "")
-RAILWAY_BUCKET_ACCESS_KEY = os.getenv("ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID", "")
-RAILWAY_BUCKET_SECRET_KEY = os.getenv("SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY", "")
-RAILWAY_BUCKET_REGION = os.getenv("REGION") or os.getenv("AWS_S3_REGION_NAME", "auto")
+RAILWAY_BUCKET_NAME = (os.getenv("BUCKET") or os.getenv("AWS_STORAGE_BUCKET_NAME", "")).strip()
+RAILWAY_BUCKET_ENDPOINT = (os.getenv("ENDPOINT") or os.getenv("AWS_S3_ENDPOINT_URL", "")).strip()
+RAILWAY_BUCKET_ACCESS_KEY = (os.getenv("ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID", "")).strip()
+RAILWAY_BUCKET_SECRET_KEY = (os.getenv("SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY", "")).strip()
+RAILWAY_BUCKET_REGION = (os.getenv("REGION") or os.getenv("AWS_S3_REGION_NAME", "auto")).strip()
 RAILWAY_BUCKET_ADDRESSING_STYLE = os.getenv("RAILWAY_BUCKET_ADDRESSING_STYLE", "virtual")
+FORCE_RAILWAY_BUCKET = env_bool("USE_RAILWAY_BUCKET", False)
 
 USE_RAILWAY_BUCKET = (
-    env_bool("USE_RAILWAY_BUCKET", False) or
+    FORCE_RAILWAY_BUCKET or
     all(
         [
             RAILWAY_BUCKET_NAME,
@@ -152,6 +155,25 @@ STORAGES = {
 }
 
 if USE_RAILWAY_BUCKET:
+    missing_bucket_settings = [
+        name
+        for name, value in {
+            "BUCKET": RAILWAY_BUCKET_NAME,
+            "ENDPOINT": RAILWAY_BUCKET_ENDPOINT,
+            "ACCESS_KEY_ID": RAILWAY_BUCKET_ACCESS_KEY,
+            "SECRET_ACCESS_KEY": RAILWAY_BUCKET_SECRET_KEY,
+        }.items()
+        if not value
+    ]
+
+    if missing_bucket_settings:
+        raise ImproperlyConfigured(
+            "Railway bucket storage is enabled but required bucket variables are missing: "
+            f"{', '.join(missing_bucket_settings)}. "
+            "On Railway, attach your Bucket credentials to this service using Variable References. "
+            "For Railway Buckets the ENDPOINT should typically look like https://storage.railway.app."
+        )
+
     AWS_S3_ENDPOINT_URL = RAILWAY_BUCKET_ENDPOINT
     AWS_STORAGE_BUCKET_NAME = RAILWAY_BUCKET_NAME
     AWS_ACCESS_KEY_ID = RAILWAY_BUCKET_ACCESS_KEY
