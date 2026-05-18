@@ -147,7 +147,7 @@ class MockupRender(models.Model):
         null=True,
         blank=True,
     )
-    source_image_url = models.URLField(blank=True)
+    source_image_url = models.TextField(blank=True)
     source_prompt = models.TextField(blank=True)
     source_fingerprint = models.CharField(max_length=64)
     template = models.ForeignKey(

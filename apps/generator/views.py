@@ -110,6 +110,7 @@ class MockupRenderListCreateView(APIView):
             artwork = get_object_or_404(Artwork, pk=artwork_id)
 
         source_image_url = serializer.validated_data.get("source_image_url", "").strip()
+        persisted_source_image_url = "" if source_image_url.startswith("data:image/") else source_image_url
         source_prompt = serializer.validated_data.get("source_prompt", "").strip()
         variant_color = serializer.validated_data.get("variant_color", "").strip()
         variant_size = serializer.validated_data.get("variant_size", "").strip()
@@ -143,7 +144,7 @@ class MockupRenderListCreateView(APIView):
                 "generated_image": generated_image,
                 "artwork": artwork,
                 "source_asset": source_asset,
-                "source_image_url": source_image_url,
+                "source_image_url": persisted_source_image_url,
                 "source_prompt": source_prompt or getattr(generated_image, "prompt", "") or getattr(artwork, "title", ""),
                 "source_fingerprint": source_fingerprint,
                 "template": template,
@@ -164,8 +165,8 @@ class MockupRenderListCreateView(APIView):
         if source_asset is not None and mockup_render.source_asset_id != source_asset.pk:
             mockup_render.source_asset = source_asset
             changed_fields.append("source_asset")
-        if source_image_url and mockup_render.source_image_url != source_image_url:
-            mockup_render.source_image_url = source_image_url
+        if mockup_render.source_image_url != persisted_source_image_url:
+            mockup_render.source_image_url = persisted_source_image_url
             changed_fields.append("source_image_url")
         if source_prompt and mockup_render.source_prompt != source_prompt:
             mockup_render.source_prompt = source_prompt
