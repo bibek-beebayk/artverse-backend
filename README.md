@@ -211,6 +211,37 @@ Add a real async render worker with:
 - OpenCV for perspective transforms
 - Railway Buckets for rendered preview storage
 
+## Bulk artwork upload
+
+The Django admin now includes a bulk uploader for artworks.
+
+Where to find it:
+
+1. Open Django admin
+2. Go to `Gallery > Artworks`
+3. Click `Bulk Upload`
+
+Upload inputs:
+
+- a CSV manifest
+- an optional ZIP of image files referenced by `image_filename`
+
+Supported CSV headers:
+
+```csv
+title,slug,category,description,image_filename,is_featured,is_published,image_url
+```
+
+Notes:
+
+- `title` and `category` are required
+- `slug` is optional and will be generated from `title` if omitted
+- `image_filename` should match a file inside the uploaded ZIP
+- `image_url` can be used when you don't want to upload the image file
+- `update_existing` lets you update rows that match an existing slug
+- `auto_create_categories` lets the importer create missing categories
+- `dry_run` validates the import without writing any data
+
 ## Notes
 
 - The image generation API is scaffolded as a queue-style request endpoint.

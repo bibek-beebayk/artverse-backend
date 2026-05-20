@@ -1,0 +1,88 @@
+{% extends "admin/base_site.html" %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+  <a href="{% url 'admin:index' %}">Home</a>
+  &rsaquo; <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_config.verbose_name }}</a>
+  &rsaquo; <a href="{% url 'admin:gallery_artwork_changelist' %}">{{ opts.verbose_name_plural|capfirst }}</a>
+  &rsaquo; Bulk Upload
+</div>
+{% endblock %}
+
+{% block content %}
+  <div id="content-main">
+    <h1>Bulk Upload Artworks</h1>
+    <p>
+      Upload a CSV manifest and, optionally, a ZIP file containing the referenced images.
+      Rows are keyed by <code>slug</code> when present, otherwise a slug is generated from the title.
+    </p>
+
+    <form method="post" enctype="multipart/form-data" novalidate>
+      {% csrf_token %}
+      {{ form.non_field_errors }}
+      <fieldset class="module aligned">
+        {% for field in form %}
+          <div class="form-row">
+            {{ field.errors }}
+            <div>
+              {{ field.label_tag }}
+              {{ field }}
+              {% if field.help_text %}
+                <div class="help">{{ field.help_text }}</div>
+              {% endif %}
+            </div>
+          </div>
+        {% endfor %}
+      </fieldset>
+      <div class="submit-row">
+        <input type="submit" value="Run Import" class="default">
+        <a href="{% url 'admin:gallery_artwork_changelist' %}" class="button cancel-link">Back to artworks</a>
+      </div>
+    </form>
+
+    <div class="module" style="margin-top: 2rem;">
+      <h2>Expected CSV Headers</h2>
+      <pre style="white-space: pre-wrap;">title,slug,category,description,image_filename,is_featured,is_published,image_url</pre>
+      <p>
+        <strong>Example row:</strong>
+        <code>Neon Nexus,neon-nexus,Cyberpunk Metropolis,Signature skyline artwork,neon-nexus.png,true,true,</code>
+      </p>
+    </div>
+
+    {% if import_result %}
+      <div class="module" style="margin-top: 2rem;">
+        <h2>Import Summary</h2>
+        <ul>
+          <li>Created: {{ import_result.created }}</li>
+          <li>Updated: {{ import_result.updated }}</li>
+          <li>Skipped: {{ import_result.skipped }}</li>
+          <li>Failed: {{ import_result.failed }}</li>
+        </ul>
+      </div>
+
+      <div class="module">
+        <h2>Row Results</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Row</th>
+              <th>Slug</th>
+              <th>Action</th>
+              <th>Message</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in import_result.row_results %}
+              <tr>
+                <td>{{ row.row_number }}</td>
+                <td>{{ row.slug }}</td>
+                <td>{{ row.action }}</td>
+                <td>{{ row.message }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+  </div>
+{% endblock %}

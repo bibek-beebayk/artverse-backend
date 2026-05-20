@@ -1,0 +1,242 @@
+import csv
+from dataclasses import dataclass, field
+from io import TextIOWrapper
+from pathlib import Path
+from zipfile import BadZipFile, ZipFile
+
+from django.core.files.base import ContentFile
+from django.db import transaction
+from django.utils.text import slugify
+
+from .models import Artwork, Category
+
+
+def _parse_bool(value: str | None, default: bool) -> bool:
+    if value is None or value == "":
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_filename(name: str) -> str:
+    return Path(name).name.strip().lower()
+
+
+@dataclass
+class ArtworkImportRowResult:
+    row_number: int
+    slug: str
+    action: str
+    message: str
+
+
+@dataclass
+class ArtworkImportResult:
+    created: int = 0
+    updated: int = 0
+    skipped: int = 0
+    failed: int = 0
+    row_results: list[ArtworkImportRowResult] = field(default_factory=list)
+
+
+class ArtworkBulkImporter:
+    expected_headers = {
+        "title",
+        "slug",
+        "category",
+        "description",
+        "image_filename",
+        "is_featured",
+        "is_published",
+        "image_url",
+    }
+
+    def __init__(
+        self,
+        *,
+        update_existing: bool = True,
+        auto_create_categories: bool = True,
+        dry_run: bool = False,
+    ):
+        self.update_existing = update_existing
+        self.auto_create_categories = auto_create_categories
+        self.dry_run = dry_run
+
+    def import_from_files(self, *, csv_file, images_zip_file=None) -> ArtworkImportResult:
+        result = ArtworkImportResult()
+        zip_contents = self._load_zip(images_zip_file) if images_zip_file else {}
+
+        csv_file.seek(0)
+        wrapper = TextIOWrapper(csv_file, encoding="utf-8-sig", newline="")
+        try:
+            reader = csv.DictReader(wrapper)
+            headers = set(reader.fieldnames or [])
+            missing_headers = {"title", "category"} - headers
+            if missing_headers:
+                raise ValueError(
+                    "CSV is missing required headers: " + ", ".join(sorted(missing_headers))
+                )
+
+            for row_number, row in enumerate(reader, start=2):
+                self._process_row(
+                    row_number=row_number,
+                    row=row,
+                    zip_contents=zip_contents,
+                    result=result,
+                )
+        finally:
+            wrapper.detach()
+
+        return result
+
+    def _load_zip(self, images_zip_file) -> dict[str, bytes]:
+        images_zip_file.seek(0)
+        try:
+            with ZipFile(images_zip_file) as archive:
+                return {
+                    _normalize_filename(name): archive.read(name)
+                    for name in archive.namelist()
+                    if not name.endswith("/")
+                }
+        except BadZipFile as exc:
+            raise ValueError("The uploaded images ZIP file is invalid.") from exc
+
+    def _process_row(self, *, row_number: int, row: dict, zip_contents: dict[str, bytes], result: ArtworkImportResult) -> None:
+        title = (row.get("title") or "").strip()
+        if not title:
+            result.failed += 1
+            result.row_results.append(
+                ArtworkImportRowResult(
+                    row_number=row_number,
+                    slug="",
+                    action="failed",
+                    message="Missing title.",
+                )
+            )
+            return
+
+        slug = ((row.get("slug") or "").strip() or slugify(title))[:50]
+        category_name = (row.get("category") or "").strip()
+        if not category_name:
+            result.failed += 1
+            result.row_results.append(
+                ArtworkImportRowResult(
+                    row_number=row_number,
+                    slug=slug,
+                    action="failed",
+                    message="Missing category.",
+                )
+            )
+            return
+
+        description = (row.get("description") or "").strip()
+        image_filename = (row.get("image_filename") or "").strip()
+        image_url = (row.get("image_url") or "").strip()
+        is_featured = _parse_bool(row.get("is_featured"), False)
+        is_published = _parse_bool(row.get("is_published"), True)
+
+        category = Category.objects.filter(name__iexact=category_name).first()
+        category_created = False
+        if category is None:
+            if not self.auto_create_categories:
+                result.failed += 1
+                result.row_results.append(
+                    ArtworkImportRowResult(
+                        row_number=row_number,
+                        slug=slug,
+                        action="failed",
+                        message=f'Category "{category_name}" does not exist.',
+                    )
+                )
+                return
+            if not self.dry_run:
+                category = Category.objects.create(
+                    name=category_name,
+                    slug=slugify(category_name),
+                )
+            else:
+                category = Category(name=category_name, slug=slugify(category_name))
+            category_created = True
+
+        artwork = Artwork.objects.filter(slug=slug).first()
+        if artwork and not self.update_existing:
+            result.skipped += 1
+            result.row_results.append(
+                ArtworkImportRowResult(
+                    row_number=row_number,
+                    slug=slug,
+                    action="skipped",
+                    message="Artwork already exists and update_existing is disabled.",
+                )
+            )
+            return
+
+        image_bytes = None
+        normalized_image_filename = _normalize_filename(image_filename) if image_filename else ""
+        if normalized_image_filename:
+            image_bytes = zip_contents.get(normalized_image_filename)
+            if image_bytes is None:
+                result.failed += 1
+                result.row_results.append(
+                    ArtworkImportRowResult(
+                        row_number=row_number,
+                        slug=slug,
+                        action="failed",
+                        message=f'Image "{image_filename}" was not found in the uploaded ZIP.',
+                    )
+                )
+                return
+
+        action = "updated" if artwork else "created"
+        message = []
+        if category_created:
+            message.append(f'Created category "{category_name}"')
+        if image_bytes:
+            message.append(f'Attached image "{image_filename}"')
+        elif image_url:
+            message.append("Using image_url only")
+
+        if self.dry_run:
+            if artwork:
+                result.updated += 1
+            else:
+                result.created += 1
+            result.row_results.append(
+                ArtworkImportRowResult(
+                    row_number=row_number,
+                    slug=slug,
+                    action=f"dry-run-{action}",
+                    message=", ".join(message) or "Validated successfully.",
+                )
+            )
+            return
+
+        with transaction.atomic():
+            artwork = artwork or Artwork(slug=slug)
+            artwork.title = title
+            artwork.category = category
+            artwork.description = description
+            artwork.is_featured = is_featured
+            artwork.is_published = is_published
+            artwork.image_url = image_url
+            artwork.save()
+
+            if image_bytes:
+                file_extension = Path(image_filename).suffix or ".png"
+                artwork.image.save(
+                    f"{slug}{file_extension}",
+                    ContentFile(image_bytes),
+                    save=True,
+                )
+
+        if action == "created":
+            result.created += 1
+        else:
+            result.updated += 1
+        result.row_results.append(
+            ArtworkImportRowResult(
+                row_number=row_number,
+                slug=slug,
+                action=action,
+                message=", ".join(message) or "Imported successfully.",
+            )
+        )
