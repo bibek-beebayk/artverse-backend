@@ -410,10 +410,9 @@ def process_mockup_render(render):
         output.save(buffer, format="PNG", optimize=True)
         filename = f"{render.cache_key}.png"
         render.output_image.save(filename, ContentFile(buffer.getvalue()), save=False)
-        try:
-            render.output_image_url = render.output_image.url
-        except Exception:
-            render.output_image_url = ""
+        # Use the file-backed URL at serialization time instead of persisting
+        # long signed storage URLs into the database.
+        render.output_image_url = ""
         render.status = render.Status.READY
         render.processing_notes = {
             **(render.processing_notes or {}),

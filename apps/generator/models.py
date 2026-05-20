@@ -161,7 +161,7 @@ class MockupRender(models.Model):
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
     cache_key = models.CharField(max_length=255, unique=True)
     output_image = models.ImageField(upload_to="mockup-renders/", blank=True, null=True)
-    output_image_url = models.URLField(blank=True)
+    output_image_url = models.TextField(blank=True)
     processing_notes = models.JSONField(default=dict, blank=True)
     error_message = models.TextField(blank=True)
     render_started_at = models.DateTimeField(null=True, blank=True)
