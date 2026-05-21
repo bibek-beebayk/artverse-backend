@@ -241,6 +241,8 @@ Notes:
 - `update_existing` lets you update rows that match an existing slug
 - `auto_create_categories` lets the importer create missing categories
 - `dry_run` validates the import without writing any data
+- for large production uploads, keep `WEB_CONCURRENCY=1` and raise `GUNICORN_TIMEOUT` (for example `300`) so Railway workers have enough time to finish admin imports
+- the importer now streams ZIP members one file at a time instead of loading the entire ZIP into memory first, which is much safer for large archives
 
 ## Notes
 

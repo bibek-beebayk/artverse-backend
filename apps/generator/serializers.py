@@ -101,6 +101,7 @@ class MockupRenderSerializer(serializers.ModelSerializer):
             "variant_color",
             "variant_size",
             "placement_override",
+            "crop_override",
             "status",
             "cache_key",
             "output_image",
@@ -131,6 +132,7 @@ class MockupRenderCreateSerializer(serializers.Serializer):
     variant_color = serializers.CharField(required=False, allow_blank=True, max_length=120)
     variant_size = serializers.CharField(required=False, allow_blank=True, max_length=120)
     placement_override = serializers.JSONField(required=False)
+    crop_override = serializers.JSONField(required=False)
 
     def validate(self, attrs):
         generated_image_id = attrs.get("generated_image_id")
@@ -158,5 +160,16 @@ class MockupRenderCreateSerializer(serializers.Serializer):
                 normalized_override["fit"] = fit.strip().lower()
 
             attrs["placement_override"] = normalized_override
+
+        crop_override = attrs.get("crop_override")
+        if isinstance(crop_override, dict):
+            normalized_crop = {}
+            for key in ("left", "top", "width", "height"):
+                value = crop_override.get(key)
+                if value is None or value == "":
+                    continue
+                normalized_crop[key] = float(value)
+
+            attrs["crop_override"] = normalized_crop
 
         return attrs

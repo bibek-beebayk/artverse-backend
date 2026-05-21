@@ -1,4 +1,5 @@
 import csv
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from io import TextIOWrapper
 from pathlib import Path
@@ -63,44 +64,62 @@ class ArtworkBulkImporter:
 
     def import_from_files(self, *, csv_file, images_zip_file=None) -> ArtworkImportResult:
         result = ArtworkImportResult()
-        zip_contents = self._load_zip(images_zip_file) if images_zip_file else {}
+        zip_context = self._open_zip(images_zip_file) if images_zip_file else nullcontext((None, {}))
 
-        csv_file.seek(0)
-        wrapper = TextIOWrapper(csv_file, encoding="utf-8-sig", newline="")
-        try:
-            reader = csv.DictReader(wrapper)
-            headers = set(reader.fieldnames or [])
-            missing_headers = {"title", "category"} - headers
-            if missing_headers:
-                raise ValueError(
-                    "CSV is missing required headers: " + ", ".join(sorted(missing_headers))
-                )
+        with zip_context as (archive, zip_index):
+            csv_file.seek(0)
+            wrapper = TextIOWrapper(csv_file, encoding="utf-8-sig", newline="")
+            try:
+                reader = csv.DictReader(wrapper)
+                headers = set(reader.fieldnames or [])
+                missing_headers = {"title", "category"} - headers
+                if missing_headers:
+                    raise ValueError(
+                        "CSV is missing required headers: " + ", ".join(sorted(missing_headers))
+                    )
 
-            for row_number, row in enumerate(reader, start=2):
-                self._process_row(
-                    row_number=row_number,
-                    row=row,
-                    zip_contents=zip_contents,
-                    result=result,
-                )
-        finally:
-            wrapper.detach()
+                for row_number, row in enumerate(reader, start=2):
+                    self._process_row(
+                        row_number=row_number,
+                        row=row,
+                        archive=archive,
+                        zip_index=zip_index,
+                        result=result,
+                    )
+            finally:
+                wrapper.detach()
 
         return result
 
-    def _load_zip(self, images_zip_file) -> dict[str, bytes]:
+    @contextmanager
+    def _open_zip(self, images_zip_file):
         images_zip_file.seek(0)
         try:
             with ZipFile(images_zip_file) as archive:
-                return {
-                    _normalize_filename(name): archive.read(name)
+                yield archive, {
+                    _normalize_filename(name): name
                     for name in archive.namelist()
                     if not name.endswith("/")
                 }
         except BadZipFile as exc:
             raise ValueError("The uploaded images ZIP file is invalid.") from exc
 
-    def _process_row(self, *, row_number: int, row: dict, zip_contents: dict[str, bytes], result: ArtworkImportResult) -> None:
+    def _read_zip_member(self, archive: ZipFile | None, zip_member_name: str | None) -> bytes | None:
+        if archive is None or not zip_member_name:
+            return None
+
+        with archive.open(zip_member_name) as member:
+            return member.read()
+
+    def _process_row(
+        self,
+        *,
+        row_number: int,
+        row: dict,
+        archive: ZipFile | None,
+        zip_index: dict[str, str],
+        result: ArtworkImportResult,
+    ) -> None:
         title = (row.get("title") or "").strip()
         if not title:
             result.failed += 1
@@ -173,7 +192,10 @@ class ArtworkBulkImporter:
         image_bytes = None
         normalized_image_filename = _normalize_filename(image_filename) if image_filename else ""
         if normalized_image_filename:
-            image_bytes = zip_contents.get(normalized_image_filename)
+            image_bytes = self._read_zip_member(
+                archive,
+                zip_index.get(normalized_image_filename),
+            )
             if image_bytes is None:
                 result.failed += 1
                 result.row_results.append(

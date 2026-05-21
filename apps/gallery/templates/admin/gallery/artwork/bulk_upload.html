@@ -17,7 +17,93 @@
       Rows are keyed by <code>slug</code> when present, otherwise a slug is generated from the title.
     </p>
 
-    <form method="post" enctype="multipart/form-data" novalidate>
+    <style>
+      .upload-status-card {
+        display: none;
+        margin: 1.5rem 0;
+        padding: 1rem 1.25rem;
+        border: 1px solid #d0d7de;
+        border-radius: 8px;
+        background: #f6f8fa;
+      }
+
+      .upload-status-card.is-visible {
+        display: block;
+      }
+
+      .upload-status-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 0.75rem;
+        margin-top: 0.75rem;
+      }
+
+      .upload-status-label {
+        color: #57606a;
+        display: block;
+        font-size: 0.75rem;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        margin-bottom: 0.15rem;
+        text-transform: uppercase;
+      }
+
+      .upload-status-value {
+        color: #24292f;
+        font-size: 0.95rem;
+        font-weight: 700;
+      }
+
+      .upload-progress {
+        width: 100%;
+        height: 12px;
+        border-radius: 999px;
+        overflow: hidden;
+        background: #d8dee4;
+        margin-top: 1rem;
+      }
+
+      .upload-progress-bar {
+        width: 0%;
+        height: 100%;
+        background: linear-gradient(90deg, #0969da 0%, #1f6feb 50%, #2da44e 100%);
+        transition: width 0.2s ease;
+      }
+    </style>
+
+    <div id="upload-status-card" class="upload-status-card" aria-live="polite">
+      <strong id="upload-status-title">Uploading files…</strong>
+      <p id="upload-status-message" style="margin: 0.5rem 0 0;">
+        Preparing your CSV and ZIP for upload.
+      </p>
+      <div class="upload-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div id="upload-progress-bar" class="upload-progress-bar"></div>
+      </div>
+      <div class="upload-status-grid">
+        <div>
+          <span class="upload-status-label">Progress</span>
+          <span id="upload-progress-text" class="upload-status-value">0%</span>
+        </div>
+        <div>
+          <span class="upload-status-label">Uploaded</span>
+          <span id="upload-uploaded-text" class="upload-status-value">0 MB / 0 MB</span>
+        </div>
+        <div>
+          <span class="upload-status-label">Speed</span>
+          <span id="upload-speed-text" class="upload-status-value">Calculating…</span>
+        </div>
+        <div>
+          <span class="upload-status-label">ETA</span>
+          <span id="upload-eta-text" class="upload-status-value">Calculating…</span>
+        </div>
+        <div>
+          <span class="upload-status-label">Elapsed</span>
+          <span id="upload-elapsed-text" class="upload-status-value">0s</span>
+        </div>
+      </div>
+    </div>
+
+    <form id="bulk-upload-form" method="post" enctype="multipart/form-data" novalidate>
       {% csrf_token %}
       {{ form.non_field_errors }}
       <fieldset class="module aligned">
@@ -35,7 +121,7 @@
         {% endfor %}
       </fieldset>
       <div class="submit-row">
-        <input type="submit" value="Run Import" class="default">
+        <input id="bulk-upload-submit" type="submit" value="Run Import" class="default">
         <a href="{% url 'admin:gallery_artwork_changelist' %}" class="button cancel-link">Back to artworks</a>
       </div>
     </form>
@@ -85,4 +171,163 @@
       </div>
     {% endif %}
   </div>
+
+  <script>
+    (() => {
+      const form = document.getElementById('bulk-upload-form');
+      const submitButton = document.getElementById('bulk-upload-submit');
+      const statusCard = document.getElementById('upload-status-card');
+      const statusTitle = document.getElementById('upload-status-title');
+      const statusMessage = document.getElementById('upload-status-message');
+      const progressBar = document.getElementById('upload-progress-bar');
+      const progressBarContainer = progressBar?.parentElement;
+      const progressText = document.getElementById('upload-progress-text');
+      const uploadedText = document.getElementById('upload-uploaded-text');
+      const speedText = document.getElementById('upload-speed-text');
+      const etaText = document.getElementById('upload-eta-text');
+      const elapsedText = document.getElementById('upload-elapsed-text');
+
+      if (!form || !submitButton || !statusCard || !statusTitle || !statusMessage || !progressBar || !progressBarContainer || !progressText || !uploadedText || !speedText || !etaText || !elapsedText) {
+        return;
+      }
+
+      let submitInFlight = false;
+
+      function formatBytes(bytes) {
+        if (!Number.isFinite(bytes) || bytes <= 0) {
+          return '0 MB';
+        }
+        const units = ['B', 'KB', 'MB', 'GB'];
+        let value = bytes;
+        let unitIndex = 0;
+        while (value >= 1024 && unitIndex < units.length - 1) {
+          value /= 1024;
+          unitIndex += 1;
+        }
+        return `${value.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+      }
+
+      function formatDuration(seconds) {
+        if (!Number.isFinite(seconds) || seconds < 0) {
+          return 'Calculating…';
+        }
+        const rounded = Math.max(0, Math.round(seconds));
+        const minutes = Math.floor(rounded / 60);
+        const remainingSeconds = rounded % 60;
+        if (minutes === 0) {
+          return `${remainingSeconds}s`;
+        }
+        if (minutes < 60) {
+          return `${minutes}m ${remainingSeconds}s`;
+        }
+        const hours = Math.floor(minutes / 60);
+        const remainingMinutes = minutes % 60;
+        return `${hours}h ${remainingMinutes}m`;
+      }
+
+      form.addEventListener('submit', (event) => {
+        if (submitInFlight) {
+          event.preventDefault();
+          return;
+        }
+
+        event.preventDefault();
+        submitInFlight = true;
+        submitButton.disabled = true;
+        submitButton.value = 'Uploading…';
+        statusCard.classList.add('is-visible');
+
+        const startedAt = Date.now();
+        const formData = new FormData(form);
+        const xhr = new XMLHttpRequest();
+        let latestLoaded = 0;
+        let latestTotal = 0;
+
+        const elapsedTimer = window.setInterval(() => {
+          const elapsedSeconds = (Date.now() - startedAt) / 1000;
+          elapsedText.textContent = formatDuration(elapsedSeconds);
+
+          if (latestLoaded > 0 && latestTotal > 0 && latestLoaded < latestTotal) {
+            const bytesPerSecond = latestLoaded / Math.max(elapsedSeconds, 0.5);
+            speedText.textContent = `${formatBytes(bytesPerSecond)}/s`;
+            etaText.textContent = formatDuration((latestTotal - latestLoaded) / Math.max(bytesPerSecond, 1));
+          }
+        }, 500);
+
+        xhr.open(form.method || 'POST', form.action || window.location.href, true);
+        xhr.responseType = 'text';
+        xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+
+        xhr.upload.addEventListener('progress', (progressEvent) => {
+          if (!progressEvent.lengthComputable) {
+            statusTitle.textContent = 'Uploading files…';
+            statusMessage.textContent = 'Uploading your files. Progress information is not available yet.';
+            return;
+          }
+
+          latestLoaded = progressEvent.loaded;
+          latestTotal = progressEvent.total;
+
+          const percent = Math.min(100, Math.round((progressEvent.loaded / progressEvent.total) * 100));
+          progressBar.style.width = `${percent}%`;
+          progressBarContainer.setAttribute('aria-valuenow', String(percent));
+          progressText.textContent = `${percent}%`;
+          uploadedText.textContent = `${formatBytes(progressEvent.loaded)} / ${formatBytes(progressEvent.total)}`;
+          statusTitle.textContent = 'Uploading files…';
+          statusMessage.textContent = 'Your CSV and ZIP are being transferred to the server.';
+        });
+
+        xhr.addEventListener('loadstart', () => {
+          progressBar.style.width = '0%';
+          progressBarContainer.setAttribute('aria-valuenow', '0');
+          progressText.textContent = '0%';
+          uploadedText.textContent = '0 MB / 0 MB';
+          speedText.textContent = 'Calculating…';
+          etaText.textContent = 'Calculating…';
+          elapsedText.textContent = '0s';
+        });
+
+        xhr.addEventListener('readystatechange', () => {
+          if (xhr.readyState === XMLHttpRequest.HEADERS_RECEIVED) {
+            statusTitle.textContent = 'Processing import…';
+            statusMessage.textContent = 'The upload is complete. The server is now validating and importing the artworks.';
+            progressBar.style.width = '100%';
+            progressBarContainer.setAttribute('aria-valuenow', '100');
+            progressText.textContent = '100%';
+            etaText.textContent = 'Finalizing…';
+          }
+        });
+
+        xhr.addEventListener('load', () => {
+          window.clearInterval(elapsedTimer);
+          document.open();
+          document.write(xhr.responseText);
+          document.close();
+        });
+
+        xhr.addEventListener('error', () => {
+          window.clearInterval(elapsedTimer);
+          submitInFlight = false;
+          submitButton.disabled = false;
+          submitButton.value = 'Run Import';
+          statusTitle.textContent = 'Upload failed';
+          statusMessage.textContent = 'The upload could not be completed. Please try again.';
+          etaText.textContent = 'Unavailable';
+          speedText.textContent = 'Unavailable';
+        });
+
+        xhr.addEventListener('abort', () => {
+          window.clearInterval(elapsedTimer);
+          submitInFlight = false;
+          submitButton.disabled = false;
+          submitButton.value = 'Run Import';
+          statusTitle.textContent = 'Upload cancelled';
+          statusMessage.textContent = 'The upload was cancelled before completion.';
+          etaText.textContent = 'Cancelled';
+        });
+
+        xhr.send(formData);
+      });
+    })();
+  </script>
 {% endblock %}

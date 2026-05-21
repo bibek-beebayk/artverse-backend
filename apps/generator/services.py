@@ -76,8 +76,10 @@ def build_mockup_cache_key(
     variant_color: str = "",
     variant_size: str = "",
     placement_override: dict | None = None,
+    crop_override: dict | None = None,
 ) -> str:
     normalized_override = json.dumps(placement_override or {}, sort_keys=True, separators=(",", ":"))
+    normalized_crop = json.dumps(crop_override or {}, sort_keys=True, separators=(",", ":"))
     raw_value = "|".join(
         [
             template.slug,
@@ -86,6 +88,7 @@ def build_mockup_cache_key(
             variant_color.strip().lower(),
             variant_size.strip().lower(),
             normalized_override,
+            normalized_crop,
         ]
     )
     return hashlib.sha256(raw_value.encode("utf-8")).hexdigest()
@@ -109,6 +112,33 @@ def _sanitize_placement_override(placement_override: dict | None) -> dict:
     fit = placement_override.get("fit")
     if isinstance(fit, str) and fit.strip():
         normalized["fit"] = fit.strip().lower()
+
+    return normalized
+
+
+def _sanitize_crop_override(crop_override: dict | None) -> dict:
+    if not isinstance(crop_override, dict):
+        return {}
+
+    normalized = {}
+    for key in ("left", "top", "width", "height"):
+        value = crop_override.get(key)
+        if value is None or value == "":
+            continue
+        normalized[key] = float(value)
+
+    width = max(5.0, min(100.0, normalized.get("width", 100.0)))
+    height = max(5.0, min(100.0, normalized.get("height", 100.0)))
+    left = normalized.get("left", 0.0)
+    top = normalized.get("top", 0.0)
+
+    left = max(0.0, min(100.0 - width, left))
+    top = max(0.0, min(100.0 - height, top))
+
+    normalized["left"] = left
+    normalized["top"] = top
+    normalized["width"] = width
+    normalized["height"] = height
 
     return normalized
 
@@ -306,10 +336,26 @@ def _apply_corner_radius(image: Image.Image, radius: int) -> Image.Image:
     return image
 
 
-def _prepare_design_layer(source: Image.Image, placement: dict) -> Image.Image:
+def _prepare_design_layer(source: Image.Image, placement: dict, crop_override: dict | None = None) -> Image.Image:
     width = max(1, int(placement.get("width", source.width)))
     height = max(1, int(placement.get("height", source.height)))
     fit_mode = str(placement.get("fit", "contain")).lower()
+    normalized_crop = _sanitize_crop_override(crop_override)
+    
+    if normalized_crop and (
+        normalized_crop.get("left", 0.0) != 0.0
+        or normalized_crop.get("top", 0.0) != 0.0
+        or normalized_crop.get("width", 100.0) != 100.0
+        or normalized_crop.get("height", 100.0) != 100.0
+    ):
+        crop_left = int(round((normalized_crop["left"] / 100.0) * source.width))
+        crop_top = int(round((normalized_crop["top"] / 100.0) * source.height))
+        crop_right = int(round(((normalized_crop["left"] + normalized_crop["width"]) / 100.0) * source.width))
+        crop_bottom = int(round(((normalized_crop["top"] + normalized_crop["height"]) / 100.0) * source.height))
+        crop_right = max(crop_left + 1, min(source.width, crop_right))
+        crop_bottom = max(crop_top + 1, min(source.height, crop_bottom))
+        source = source.crop((crop_left, crop_top, crop_right, crop_bottom))
+        fit_mode = "contain"
 
     if fit_mode == "cover":
         prepared = ImageOps.fit(
@@ -368,11 +414,12 @@ def render_mockup_to_image(render) -> Image.Image:
         **(config.get("placement") or {}),
         **_sanitize_placement_override(render.placement_override),
     }
+    crop_override = _sanitize_crop_override(render.crop_override)
 
     x = int(placement.get("x", 0) or 0)
     y = int(placement.get("y", 0) or 0)
 
-    prepared_design = _prepare_design_layer(source_image, placement)
+    prepared_design = _prepare_design_layer(source_image, placement, crop_override)
     design_layer = Image.new("RGBA", base_image.size, (0, 0, 0, 0))
 
     target_width = max(1, int(placement.get("width", prepared_design.width) or prepared_design.width))

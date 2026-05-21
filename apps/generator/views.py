@@ -115,6 +115,7 @@ class MockupRenderListCreateView(APIView):
         variant_color = serializer.validated_data.get("variant_color", "").strip()
         variant_size = serializer.validated_data.get("variant_size", "").strip()
         placement_override = serializer.validated_data.get("placement_override", {}) or {}
+        crop_override = serializer.validated_data.get("crop_override", {}) or {}
 
         source_fingerprint = resolve_source_fingerprint(
             generated_image=generated_image,
@@ -135,6 +136,7 @@ class MockupRenderListCreateView(APIView):
             variant_color=variant_color,
             variant_size=variant_size,
             placement_override=placement_override,
+            crop_override=crop_override,
         )
 
         mockup_render, created = MockupRender.objects.get_or_create(
@@ -151,6 +153,7 @@ class MockupRenderListCreateView(APIView):
                 "variant_color": variant_color,
                 "variant_size": variant_size,
                 "placement_override": placement_override,
+                "crop_override": crop_override,
                 "processing_notes": {
                     "pipeline": "backend-mockup",
                     "next_step": "Run async compositing worker",
@@ -171,6 +174,9 @@ class MockupRenderListCreateView(APIView):
         if source_prompt and mockup_render.source_prompt != source_prompt:
             mockup_render.source_prompt = source_prompt
             changed_fields.append("source_prompt")
+        if mockup_render.crop_override != crop_override:
+            mockup_render.crop_override = crop_override
+            changed_fields.append("crop_override")
         if changed_fields:
             changed_fields.append("updated_at")
             mockup_render.save(update_fields=changed_fields)
