@@ -6,6 +6,7 @@ from pathlib import Path
 from zipfile import BadZipFile, ZipFile
 
 from django.core.files.base import ContentFile
+from django.db import IntegrityError
 from django.db import transaction
 from django.utils.text import slugify
 
@@ -111,6 +112,39 @@ class ArtworkBulkImporter:
         with archive.open(zip_member_name) as member:
             return member.read()
 
+    def _resolve_category(self, category_name: str) -> tuple[Category | None, bool, str | None]:
+        category_slug = slugify(category_name)
+
+        category = Category.objects.filter(name__iexact=category_name).first()
+        if category is not None:
+            return category, False, None
+
+        category = Category.objects.filter(slug=category_slug).first()
+        if category is not None:
+            return (
+                category,
+                False,
+                f'Reused existing category "{category.name}" from matching slug "{category_slug}".',
+            )
+
+        if not self.auto_create_categories:
+            return None, False, f'Category "{category_name}" does not exist.'
+
+        if self.dry_run:
+            return Category(name=category_name, slug=category_slug), True, None
+
+        try:
+            return Category.objects.create(name=category_name, slug=category_slug), True, None
+        except IntegrityError:
+            category = Category.objects.filter(slug=category_slug).first()
+            if category is not None:
+                return (
+                    category,
+                    False,
+                    f'Reused existing category "{category.name}" after detecting slug collision.',
+                )
+            raise
+
     def _process_row(
         self,
         *,
@@ -153,28 +187,18 @@ class ArtworkBulkImporter:
         is_featured = _parse_bool(row.get("is_featured"), False)
         is_published = _parse_bool(row.get("is_published"), True)
 
-        category = Category.objects.filter(name__iexact=category_name).first()
-        category_created = False
+        category, category_created, category_note = self._resolve_category(category_name)
         if category is None:
-            if not self.auto_create_categories:
-                result.failed += 1
-                result.row_results.append(
-                    ArtworkImportRowResult(
-                        row_number=row_number,
-                        slug=slug,
-                        action="failed",
-                        message=f'Category "{category_name}" does not exist.',
-                    )
+            result.failed += 1
+            result.row_results.append(
+                ArtworkImportRowResult(
+                    row_number=row_number,
+                    slug=slug,
+                    action="failed",
+                    message=category_note or f'Category "{category_name}" does not exist.',
                 )
-                return
-            if not self.dry_run:
-                category = Category.objects.create(
-                    name=category_name,
-                    slug=slugify(category_name),
-                )
-            else:
-                category = Category(name=category_name, slug=slugify(category_name))
-            category_created = True
+            )
+            return
 
         artwork = Artwork.objects.filter(slug=slug).first()
         if artwork and not self.update_existing:
@@ -212,6 +236,8 @@ class ArtworkBulkImporter:
         message = []
         if category_created:
             message.append(f'Created category "{category_name}"')
+        elif category_note:
+            message.append(category_note)
         if image_bytes:
             message.append(f'Attached image "{image_filename}"')
         elif image_url:
