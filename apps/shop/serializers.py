@@ -12,6 +12,7 @@ class ProductCategorySerializer(serializers.ModelSerializer):
 class ProductSerializer(serializers.ModelSerializer):
     category = ProductCategorySerializer(read_only=True)
     image = serializers.SerializerMethodField()
+    thumbnail = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
@@ -23,6 +24,7 @@ class ProductSerializer(serializers.ModelSerializer):
             "description",
             "price",
             "image",
+            "thumbnail",
             "image_url",
             "inventory",
             "is_active",
@@ -33,6 +35,14 @@ class ProductSerializer(serializers.ModelSerializer):
             return None
         try:
             return obj.image.url
+        except Exception:
+            return None
+
+    def get_thumbnail(self, obj: Product):
+        if not obj.thumbnail:
+            return None
+        try:
+            return obj.thumbnail.url
         except Exception:
             return None
 

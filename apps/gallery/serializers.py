@@ -12,6 +12,7 @@ class CategorySerializer(serializers.ModelSerializer):
 class ArtworkSerializer(serializers.ModelSerializer):
     category = CategorySerializer(read_only=True)
     image = serializers.SerializerMethodField()
+    thumbnail = serializers.SerializerMethodField()
 
     class Meta:
         model = Artwork
@@ -22,6 +23,7 @@ class ArtworkSerializer(serializers.ModelSerializer):
             "category",
             "description",
             "image",
+            "thumbnail",
             "image_url",
             "is_featured",
             "created_at",
@@ -32,6 +34,14 @@ class ArtworkSerializer(serializers.ModelSerializer):
             return None
         try:
             return obj.image.url
+        except Exception:
+            return None
+
+    def get_thumbnail(self, obj: Artwork):
+        if not obj.thumbnail:
+            return None
+        try:
+            return obj.thumbnail.url
         except Exception:
             return None
 

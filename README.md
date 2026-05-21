@@ -244,6 +244,26 @@ Notes:
 - for large production uploads, keep `WEB_CONCURRENCY=1` and raise `GUNICORN_TIMEOUT` (for example `300`) so Railway workers have enough time to finish admin imports
 - the importer now streams ZIP members one file at a time instead of loading the entire ZIP into memory first, which is much safer for large archives
 
+## Thumbnails
+
+Uploaded artwork and product images now generate smaller thumbnail files automatically for list views.
+
+- artwork thumbnails are stored under `artworks/thumbnails/`
+- product thumbnails are stored under `products/thumbnails/`
+- APIs return both the full image and the thumbnail URL
+
+To backfill thumbnails for existing uploaded media:
+
+```bash
+python manage.py generate_thumbnails
+```
+
+Use `--force` to regenerate thumbnails for everything:
+
+```bash
+python manage.py generate_thumbnails --force
+```
+
 ## Notes
 
 - The image generation API is scaffolded as a queue-style request endpoint.
