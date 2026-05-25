@@ -5,6 +5,18 @@ from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv(BASE_DIR / ".env")
+except ImportError:
+    import sys
+    sys.stderr.write(
+        "\n[WARNING] 'python-dotenv' is not installed in this Python environment.\n"
+        "Your '.env' file will NOT be loaded automatically.\n"
+        "To fix this, run: pip install python-dotenv\n\n"
+    )
+
 
 def env_bool(name: str, default: bool = False) -> bool:
     return os.getenv(name, str(default)).lower() in {"1", "true", "yes", "on"}

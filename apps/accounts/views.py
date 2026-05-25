@@ -1,14 +1,18 @@
 import secrets
+from uuid import uuid4
 from django.conf import settings
 from django.core import signing
+from django.db import transaction
 from rest_framework import status
 from rest_framework.generics import CreateAPIView, RetrieveUpdateAPIView
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import SiteConfiguration
-from .serializers import RegisterSerializer, UserSerializer
+from .firebase_auth import FirebaseConfigurationError, verify_firebase_id_token
+from .models import SiteConfiguration, User
+from .serializers import GoogleAuthSerializer, RegisterSerializer, UserSerializer
 
 
 def validate_maintenance_token(token: str, access_key: str, token_max_age: int) -> bool:
@@ -37,6 +41,88 @@ class MeView(RetrieveUpdateAPIView):
 
     def get_object(self):
         return self.request.user
+
+
+class GoogleLoginView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        serializer = GoogleAuthSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            decoded_token = verify_firebase_id_token(serializer.validated_data["id_token"])
+        except FirebaseConfigurationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except Exception:
+            return Response({"detail": "Invalid Firebase ID token."}, status=status.HTTP_400_BAD_REQUEST)
+
+        firebase_uid = decoded_token.get("uid")
+        email = decoded_token.get("email")
+        email_verified = bool(decoded_token.get("email_verified"))
+
+        if not firebase_uid or not email:
+            return Response(
+                {"detail": "Firebase token is missing required identity fields."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not email_verified:
+            return Response(
+                {"detail": "Google email address must be verified before signing in."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        display_name = decoded_token.get("name", "")
+        avatar = decoded_token.get("picture", "")
+
+        with transaction.atomic():
+            user = User.objects.filter(firebase_uid=firebase_uid).first()
+
+            if not user:
+                user = User.objects.filter(email__iexact=email).first()
+
+            if not user:
+                base_username = email.split("@", 1)[0][:120] or "artverse-user"
+                username = base_username
+                while User.objects.filter(username=username).exists():
+                    username = f"{base_username[:110]}-{uuid4().hex[:8]}"
+
+                user = User.objects.create(
+                    username=username,
+                    email=email,
+                )
+
+            updates = []
+            if user.email.lower() != email.lower():
+                user.email = email
+                updates.append("email")
+            if display_name and user.display_name != display_name:
+                user.display_name = display_name
+                updates.append("display_name")
+            if avatar and user.avatar != avatar:
+                user.avatar = avatar
+                updates.append("avatar")
+            if user.firebase_uid != firebase_uid:
+                user.firebase_uid = firebase_uid
+                updates.append("firebase_uid")
+            if user.auth_provider != "google":
+                user.auth_provider = "google"
+                updates.append("auth_provider")
+
+            if updates:
+                user.save(update_fields=updates)
+
+        refresh = RefreshToken.for_user(user)
+
+        return Response(
+            {
+                "access": str(refresh.access_token),
+                "refresh": str(refresh),
+                "user": UserSerializer(user).data,
+            }
+        )
 
 
 class MaintenanceStatusView(APIView):
