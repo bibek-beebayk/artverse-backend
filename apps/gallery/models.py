@@ -15,10 +15,29 @@ class Category(models.Model):
         return self.name
 
 
+class Collection(models.Model):
+    name = models.CharField(max_length=120, unique=True)
+    slug = models.SlugField(unique=True)
+    description = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ("name",)
+
+    def __str__(self) -> str:
+        return self.name
+
+
 class Artwork(models.Model):
     title = models.CharField(max_length=255)
     slug = models.SlugField(unique=True)
     category = models.ForeignKey(Category, on_delete=models.PROTECT, related_name="artworks")
+    collection = models.ForeignKey(
+        Collection,
+        on_delete=models.SET_NULL,
+        related_name="artworks",
+        blank=True,
+        null=True,
+    )
     description = models.TextField(blank=True)
     image = models.ImageField(upload_to="artworks/", blank=True, null=True)
     thumbnail = models.ImageField(upload_to="artworks/thumbnails/", blank=True, null=True)

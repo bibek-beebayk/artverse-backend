@@ -4,6 +4,7 @@ from .views import (
     ArtworkDetailView,
     ArtworkListView,
     CategoryListView,
+    CollectionListView,
     FavoriteListView,
     FavoriteToggleView,
     VideoClipListView,
@@ -12,6 +13,7 @@ from .views import (
 
 urlpatterns = [
     path("categories/", CategoryListView.as_view(), name="category-list"),
+    path("collections/", CollectionListView.as_view(), name="collection-list"),
     path("artworks/", ArtworkListView.as_view(), name="artwork-list"),
     path("artworks/<slug:slug>/", ArtworkDetailView.as_view(), name="artwork-detail"),
     path("videos/", VideoClipListView.as_view(), name="video-list"),

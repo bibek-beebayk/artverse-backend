@@ -10,7 +10,7 @@ from django.db import IntegrityError
 from django.db import transaction
 from django.utils.text import slugify
 
-from .models import Artwork, Category
+from .models import Artwork, Category, Collection
 
 
 def _parse_bool(value: str | None, default: bool) -> bool:
@@ -45,6 +45,7 @@ class ArtworkBulkImporter:
         "title",
         "slug",
         "category",
+        "collection",
         "description",
         "image_filename",
         "is_featured",
@@ -145,6 +146,39 @@ class ArtworkBulkImporter:
                 )
             raise
 
+    def _resolve_collection(self, collection_name: str) -> tuple[Collection | None, bool, str | None]:
+        if not collection_name:
+            return None, False, None
+
+        collection_slug = slugify(collection_name)
+
+        collection = Collection.objects.filter(name__iexact=collection_name).first()
+        if collection is not None:
+            return collection, False, None
+
+        collection = Collection.objects.filter(slug=collection_slug).first()
+        if collection is not None:
+            return (
+                collection,
+                False,
+                f'Reused existing collection "{collection.name}" from matching slug "{collection_slug}".',
+            )
+
+        if self.dry_run:
+            return Collection(name=collection_name, slug=collection_slug), True, None
+
+        try:
+            return Collection.objects.create(name=collection_name, slug=collection_slug), True, None
+        except IntegrityError:
+            collection = Collection.objects.filter(slug=collection_slug).first()
+            if collection is not None:
+                return (
+                    collection,
+                    False,
+                    f'Reused existing collection "{collection.name}" after detecting slug collision.',
+                )
+            raise
+
     def _process_row(
         self,
         *,
@@ -169,6 +203,7 @@ class ArtworkBulkImporter:
 
         slug = ((row.get("slug") or "").strip() or slugify(title))[:50]
         category_name = (row.get("category") or "").strip()
+        collection_name = (row.get("collection") or "").strip()
         if not category_name:
             result.failed += 1
             result.row_results.append(
@@ -199,6 +234,8 @@ class ArtworkBulkImporter:
                 )
             )
             return
+
+        collection, collection_created, collection_note = self._resolve_collection(collection_name)
 
         artwork = Artwork.objects.filter(slug=slug).first()
         if artwork and not self.update_existing:
@@ -238,6 +275,10 @@ class ArtworkBulkImporter:
             message.append(f'Created category "{category_name}"')
         elif category_note:
             message.append(category_note)
+        if collection_created and collection_name:
+            message.append(f'Created collection "{collection_name}"')
+        elif collection_note:
+            message.append(collection_note)
         if image_bytes:
             message.append(f'Attached image "{image_filename}"')
         elif image_url:
@@ -262,6 +303,7 @@ class ArtworkBulkImporter:
             artwork = artwork or Artwork(slug=slug)
             artwork.title = title
             artwork.category = category
+            artwork.collection = collection
             artwork.description = description
             artwork.is_featured = is_featured
             artwork.is_published = is_published

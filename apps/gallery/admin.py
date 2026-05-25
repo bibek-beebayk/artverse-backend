@@ -3,7 +3,7 @@ from django.shortcuts import redirect, render
 from django.urls import path, reverse
 
 from .forms import ArtworkBulkUploadForm
-from .models import Artwork, Category, Favorite, VideoClip
+from .models import Artwork, Category, Collection, Favorite, VideoClip
 from .services import ArtworkBulkImporter
 
 
@@ -13,10 +13,17 @@ class CategoryAdmin(admin.ModelAdmin):
     prepopulated_fields = {"slug": ("name",)}
 
 
+@admin.register(Collection)
+class CollectionAdmin(admin.ModelAdmin):
+    list_display = ("id", "name", "slug")
+    prepopulated_fields = {"slug": ("name",)}
+    search_fields = ("name", "description")
+
+
 @admin.register(Artwork)
 class ArtworkAdmin(admin.ModelAdmin):
-    list_display = ("id", "title", "category", "is_featured", "is_published", "created_at")
-    list_filter = ("category", "is_featured", "is_published")
+    list_display = ("id", "title", "category", "collection", "is_featured", "is_published", "created_at")
+    list_filter = ("category", "collection", "is_featured", "is_published")
     prepopulated_fields = {"slug": ("title",)}
     search_fields = ("title", "description")
     change_list_template = "admin/gallery/artwork/change_list.html"

@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from .models import Artwork, Category, Favorite, VideoClip
+from .models import Artwork, Category, Collection, Favorite, VideoClip
 
 
 class CategorySerializer(serializers.ModelSerializer):
@@ -9,8 +9,15 @@ class CategorySerializer(serializers.ModelSerializer):
         fields = ("id", "name", "slug")
 
 
+class CollectionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Collection
+        fields = ("id", "name", "slug", "description")
+
+
 class ArtworkSerializer(serializers.ModelSerializer):
     category = CategorySerializer(read_only=True)
+    collection = CollectionSerializer(read_only=True)
     image = serializers.SerializerMethodField()
     thumbnail = serializers.SerializerMethodField()
 
@@ -21,6 +28,7 @@ class ArtworkSerializer(serializers.ModelSerializer):
             "title",
             "slug",
             "category",
+            "collection",
             "description",
             "image",
             "thumbnail",

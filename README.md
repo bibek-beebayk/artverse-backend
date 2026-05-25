@@ -37,6 +37,7 @@ This Django backend is designed to replace the current Firebase-first flows in t
 1. Replace Firebase auth with JWT login and `GET /api/auth/me/`.
 2. Replace `constants.ts` data with API calls:
    - `/api/gallery/categories/`
+   - `/api/gallery/collections/`
    - `/api/gallery/artworks/`
    - `/api/gallery/videos/`
    - `/api/shop/products/`
@@ -229,12 +230,13 @@ Upload inputs:
 Supported CSV headers:
 
 ```csv
-title,slug,category,description,image_filename,is_featured,is_published,image_url
+title,slug,category,collection,description,image_filename,is_featured,is_published,image_url
 ```
 
 Notes:
 
 - `title` and `category` are required
+- `collection` is optional
 - `slug` is optional and will be generated from `title` if omitted
 - `image_filename` should match a file inside the uploaded ZIP
 - `image_url` can be used when you don't want to upload the image file
