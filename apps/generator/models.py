@@ -96,6 +96,7 @@ class MockupTemplate(models.Model):
     is_active = models.BooleanField(default=True)
     base_image = models.ImageField(upload_to="mockup-templates/base/")
     mask_image = models.ImageField(upload_to="mockup-templates/masks/", blank=True, null=True)
+    displacement_map = models.ImageField(upload_to="mockup-templates/displacement/", blank=True, null=True)
     shadow_layer = models.ImageField(upload_to="mockup-templates/shadows/", blank=True, null=True)
     highlight_layer = models.ImageField(upload_to="mockup-templates/highlights/", blank=True, null=True)
     template_version = models.PositiveIntegerField(default=1)

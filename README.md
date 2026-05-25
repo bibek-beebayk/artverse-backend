@@ -55,7 +55,7 @@ The backend now includes the first scaffolding for backend-driven merch previews
 ### Core models
 
 - `MockupTemplate`
-  - Stores the base product image, mask layer, lighting layers, supported colors/sizes, and JSON config for print placement and warp rules.
+  - Stores the base product image, mask layer, displacement map, lighting layers, supported colors/sizes, and JSON config for print placement and warp rules.
 - `MockupRender`
   - Stores a single requested preview render for a source design plus template/variant combination.
   - Uses a deterministic `cache_key` so the same preview can be reused instead of rerendered.
@@ -151,10 +151,87 @@ Recommended asset setup for a T-shirt template:
   - the clean shirt mockup
 - `mask_image`
   - grayscale full-canvas mask limiting where the design can appear
+- `displacement_map`
+  - grayscale wrinkle/height map used to bend the design with folds and surface irregularities
 - `shadow_layer`
   - transparent PNG with folds/shadows above the design
 - `highlight_layer`
   - transparent PNG with highlights above the design
+
+### Displacement map support
+
+The renderer now supports wrinkle-aware warping through `MockupTemplate.displacement_map`.
+
+- The displacement map should match the template base image dimensions.
+- It should be a grayscale image:
+  - mid gray = neutral/no movement
+  - lighter and darker transitions = wrinkle height changes
+- The backend uses the local gradients in this map to bend the design before masking and before shadow/highlight layers are composited.
+
+Optional `config.displacement` settings:
+
+```json
+{
+  "placement": {
+    "x": 390,
+    "y": 310,
+    "width": 420,
+    "height": 430,
+    "fit": "contain",
+    "rotation": 0,
+    "opacity": 0.96,
+    "corner_radius": 18
+  },
+  "displacement": {
+    "strength_x": 12,
+    "strength_y": 8,
+    "blur_radius": 1.4
+  }
+}
+```
+
+Recommended starting values:
+
+- T-shirt / hoodie:
+  - `strength_x: 12`
+  - `strength_y: 8`
+- Mug:
+  - `strength_x: 18`
+  - `strength_y: 4`
+- Canvas / poster:
+  - `strength_x: 3`
+  - `strength_y: 3`
+
+How to create a displacement map:
+
+1. Start from the same base mockup image.
+2. Remove the background so the prop surface stands out clearly.
+3. Convert to grayscale.
+4. Increase local contrast so wrinkles and folds are more visible.
+5. Blur lightly so you keep broad wrinkle flow without noisy pixel texture.
+6. Save it at the exact same dimensions as the base image.
+
+Practical ways to make one:
+
+- Photoshop:
+  - duplicate the base mockup
+  - desaturate
+  - use `Levels` or `Curves` to push wrinkle contrast
+  - lightly blur with Gaussian Blur
+  - export as PNG
+- Photopea:
+  - same workflow as Photoshop, fully in browser
+- GIMP:
+  - desaturate
+  - use `Colors > Levels`
+  - apply small Gaussian blur
+  - export as PNG
+
+Good rule of thumb:
+
+- use a soft, smooth wrinkle map
+- avoid harsh black/white edges
+- think of it as a fabric height field, not a visible texture layer
 
 ### Starter templates included
 

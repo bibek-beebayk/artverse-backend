@@ -38,6 +38,7 @@ class GeneratedImageSerializer(serializers.ModelSerializer):
 class MockupTemplateSerializer(serializers.ModelSerializer):
     base_image = serializers.SerializerMethodField()
     mask_image = serializers.SerializerMethodField()
+    displacement_map = serializers.SerializerMethodField()
     shadow_layer = serializers.SerializerMethodField()
     highlight_layer = serializers.SerializerMethodField()
     product_type_display = serializers.CharField(source="get_product_type_display", read_only=True)
@@ -54,6 +55,7 @@ class MockupTemplateSerializer(serializers.ModelSerializer):
             "is_active",
             "base_image",
             "mask_image",
+            "displacement_map",
             "shadow_layer",
             "highlight_layer",
             "template_version",
@@ -76,6 +78,9 @@ class MockupTemplateSerializer(serializers.ModelSerializer):
 
     def get_mask_image(self, obj: MockupTemplate):
         return self._get_file_url(obj.mask_image)
+
+    def get_displacement_map(self, obj: MockupTemplate):
+        return self._get_file_url(obj.displacement_map)
 
     def get_shadow_layer(self, obj: MockupTemplate):
         return self._get_file_url(obj.shadow_layer)

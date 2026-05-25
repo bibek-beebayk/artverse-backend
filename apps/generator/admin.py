@@ -65,6 +65,22 @@ class MockupTemplateAdmin(admin.ModelAdmin):
     list_filter = ("product_type", "is_active")
     search_fields = ("name", "slug")
     prepopulated_fields = {"slug": ("name",)}
+    fields = (
+        "name",
+        "slug",
+        "product_type",
+        "description",
+        "is_active",
+        "base_image",
+        "mask_image",
+        "displacement_map",
+        "shadow_layer",
+        "highlight_layer",
+        "template_version",
+        "config",
+        "supported_colors",
+        "supported_sizes",
+    )
 
 
 @admin.register(SourceDesignAsset)

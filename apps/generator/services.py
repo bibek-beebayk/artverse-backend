@@ -8,7 +8,7 @@ from urllib.request import Request, urlopen
 
 from django.core.files.base import ContentFile
 from django.utils import timezone
-from PIL import Image, ImageChops, ImageDraw, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
 
 from apps.gallery.models import Artwork
 
@@ -402,6 +402,115 @@ def _apply_design_mask(layer: Image.Image, mask_image: Image.Image | None) -> Im
     return layer
 
 
+def _sample_bilinear_rgba(source_pixels, width: int, height: int, x: float, y: float) -> tuple[int, int, int, int]:
+    x = max(0.0, min(width - 1, x))
+    y = max(0.0, min(height - 1, y))
+
+    x0 = int(x)
+    y0 = int(y)
+    x1 = min(x0 + 1, width - 1)
+    y1 = min(y0 + 1, height - 1)
+    tx = x - x0
+    ty = y - y0
+
+    c00 = source_pixels[x0, y0]
+    c10 = source_pixels[x1, y0]
+    c01 = source_pixels[x0, y1]
+    c11 = source_pixels[x1, y1]
+
+    result = []
+    for index in range(4):
+        top = c00[index] * (1.0 - tx) + c10[index] * tx
+        bottom = c01[index] * (1.0 - tx) + c11[index] * tx
+        value = top * (1.0 - ty) + bottom * ty
+        result.append(int(round(value)))
+
+    return tuple(result)
+
+
+def _warp_rgba_with_displacement(
+    layer_crop: Image.Image,
+    displacement_crop: Image.Image,
+    *,
+    strength_x: float,
+    strength_y: float,
+    blur_radius: float,
+) -> Image.Image:
+    if strength_x <= 0 and strength_y <= 0:
+        return layer_crop
+
+    width, height = layer_crop.size
+    if width <= 1 or height <= 1:
+        return layer_crop
+
+    normalized_map = displacement_crop.convert("L")
+    if blur_radius > 0:
+        normalized_map = normalized_map.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    source_pixels = layer_crop.load()
+    map_pixels = normalized_map.load()
+    warped = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    warped_pixels = warped.load()
+
+    for y in range(height):
+        for x in range(width):
+            left = map_pixels[max(0, x - 1), y]
+            right = map_pixels[min(width - 1, x + 1), y]
+            up = map_pixels[x, max(0, y - 1)]
+            down = map_pixels[x, min(height - 1, y + 1)]
+
+            gradient_x = (right - left) / 255.0
+            gradient_y = (down - up) / 255.0
+
+            sample_x = x - (gradient_x * strength_x)
+            sample_y = y - (gradient_y * strength_y)
+            warped_pixels[x, y] = _sample_bilinear_rgba(source_pixels, width, height, sample_x, sample_y)
+
+    return warped
+
+
+def _apply_displacement_map(
+    design_layer: Image.Image,
+    displacement_map: Image.Image | None,
+    config: dict | None = None,
+) -> Image.Image:
+    if displacement_map is None:
+        return design_layer
+
+    alpha_bbox = design_layer.getchannel("A").getbbox()
+    if alpha_bbox is None:
+        return design_layer
+
+    displacement_config = (config or {}).get("displacement") or {}
+    strength_x = float(displacement_config.get("strength_x", 12) or 0)
+    strength_y = float(displacement_config.get("strength_y", 8) or 0)
+    blur_radius = float(displacement_config.get("blur_radius", 1.4) or 0)
+
+    if strength_x <= 0 and strength_y <= 0:
+        return design_layer
+
+    normalized_map = displacement_map.convert("L").resize(design_layer.size, Image.Resampling.LANCZOS)
+    padding = max(2, int(round(max(strength_x, strength_y))) + 2)
+    left = max(0, alpha_bbox[0] - padding)
+    top = max(0, alpha_bbox[1] - padding)
+    right = min(design_layer.width, alpha_bbox[2] + padding)
+    bottom = min(design_layer.height, alpha_bbox[3] + padding)
+
+    layer_crop = design_layer.crop((left, top, right, bottom))
+    displacement_crop = normalized_map.crop((left, top, right, bottom))
+    warped_crop = _warp_rgba_with_displacement(
+        layer_crop,
+        displacement_crop,
+        strength_x=strength_x,
+        strength_y=strength_y,
+        blur_radius=blur_radius,
+    )
+
+    result = Image.new("RGBA", design_layer.size, (0, 0, 0, 0))
+    result.alpha_composite(warped_crop, dest=(left, top))
+    return result
+
+
 def render_mockup_to_image(render) -> Image.Image:
     template = render.template
     base_image = _load_storage_image(template.base_image)
@@ -429,6 +538,8 @@ def render_mockup_to_image(render) -> Image.Image:
     design_layer.alpha_composite(prepared_design, dest=(paste_x, paste_y))
 
     mask_image = _load_storage_image(template.mask_image)
+    displacement_map = _load_storage_image(template.displacement_map)
+    design_layer = _apply_displacement_map(design_layer, displacement_map, config)
     design_layer = _apply_design_mask(design_layer, mask_image)
 
     composite = base_image.copy()
