@@ -1,0 +1,256 @@
+.mockup-config-editor {
+  margin-top: 12px;
+}
+
+.mockup-config-editor__workspace {
+  display: grid;
+  gap: 20px;
+  grid-template-columns: minmax(0, 1.5fr) minmax(280px, 0.9fr);
+  align-items: start;
+}
+
+.mockup-config-editor__preview-panel,
+.mockup-config-editor__sidebar,
+.mockup-config-editor__json details {
+  border: 1px solid #d5d9e2;
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.05);
+}
+
+.mockup-config-editor__header {
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid #edf0f5;
+}
+
+.mockup-config-editor__header strong,
+.mockup-config-editor__section h4 {
+  display: block;
+  color: #111827;
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+
+.mockup-config-editor__header span,
+.mockup-config-editor__hint {
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.mockup-config-editor__canvas-shell {
+  padding: 16px;
+}
+
+.mockup-config-editor__canvas {
+  position: relative;
+  overflow: hidden;
+  border-radius: 10px;
+  min-height: 360px;
+  background: linear-gradient(180deg, #f8fafc, #e5e7eb);
+  border: 1px dashed #cbd5e1;
+}
+
+.mockup-config-editor__image {
+  width: 100%;
+  display: block;
+}
+
+.mockup-config-editor__overlay {
+  position: absolute;
+  inset: 0;
+}
+
+.mockup-config-editor__selection {
+  position: absolute;
+  border: 2px solid #2563eb;
+  background: rgba(37, 99, 235, 0.12);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.75) inset;
+  cursor: move;
+  min-width: 24px;
+  min-height: 24px;
+}
+
+.mockup-config-editor__label {
+  position: absolute;
+  top: -28px;
+  left: 0;
+  padding: 4px 8px;
+  background: #2563eb;
+  color: #fff;
+  font-size: 11px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.mockup-config-editor__resize {
+  position: absolute;
+  right: -8px;
+  bottom: -8px;
+  width: 16px;
+  height: 16px;
+  border: 0;
+  border-radius: 999px;
+  background: #111827;
+  box-shadow: 0 0 0 2px #fff;
+  cursor: nwse-resize;
+}
+
+.mockup-config-editor__empty {
+  position: absolute;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  text-align: center;
+  color: #6b7280;
+  font-size: 13px;
+}
+
+.mockup-config-editor--empty .mockup-config-editor__empty {
+  display: flex;
+}
+
+.mockup-config-editor--empty .mockup-config-editor__overlay,
+.mockup-config-editor--empty .mockup-config-editor__image {
+  display: none;
+}
+
+.mockup-config-editor__sidebar {
+  padding: 16px;
+}
+
+.mockup-config-editor__section + .mockup-config-editor__section {
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid #edf0f5;
+}
+
+.mockup-config-editor__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.mockup-config-editor__grid label,
+.mockup-config-editor__sample-actions input {
+  color: #374151;
+  font-size: 12px;
+}
+
+.mockup-config-editor__grid input,
+.mockup-config-editor__grid input[type="number"],
+.mockup-config-editor__sample-actions input,
+.mockup-config-editor__sample-actions input[type="text"] {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #fff !important;
+  color: #000 !important;
+  caret-color: #000 !important;
+  -webkit-text-fill-color: #000 !important;
+  box-sizing: border-box;
+  opacity: 1 !important;
+}
+
+.mockup-config-editor__grid input::placeholder,
+.mockup-config-editor__sample-actions input::placeholder,
+.mockup-config-editor__textarea textarea::placeholder {
+  color: #9ca3af !important;
+  -webkit-text-fill-color: #9ca3af !important;
+}
+
+.mockup-config-editor__grid input:focus,
+.mockup-config-editor__grid input[type="number"]:focus,
+.mockup-config-editor__sample-actions input:focus,
+.mockup-config-editor__sample-actions input[type="text"]:focus,
+.mockup-config-editor__textarea textarea:focus {
+  outline: 2px solid rgba(37, 99, 235, 0.18);
+  outline-offset: 1px;
+  border-color: #2563eb;
+  color: #000 !important;
+  -webkit-text-fill-color: #000 !important;
+}
+
+.mockup-config-editor__textarea textarea {
+  color: #000 !important;
+  background: #fff !important;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  padding: 10px 12px;
+  box-sizing: border-box;
+  caret-color: #000 !important;
+  -webkit-text-fill-color: #000 !important;
+  opacity: 1 !important;
+}
+
+.mockup-config-editor__sample-actions {
+  display: grid;
+  gap: 10px;
+}
+
+.mockup-config-editor__sample-list {
+  margin-top: 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.mockup-config-editor__sample-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid #dbe3f1;
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: #f8fafc;
+}
+
+.mockup-config-editor__sample-meta strong {
+  display: block;
+  font-size: 12px;
+  color: #111827;
+}
+
+.mockup-config-editor__sample-meta span {
+  font-size: 11px;
+  color: #6b7280;
+}
+
+.mockup-config-editor__sample-buttons {
+  display: flex;
+  gap: 8px;
+}
+
+.mockup-config-editor__json {
+  margin-top: 18px;
+}
+
+.mockup-config-editor__json details {
+  padding: 12px 14px;
+}
+
+.mockup-config-editor__json summary {
+  cursor: pointer;
+  color: #111827;
+  font-weight: 600;
+}
+
+.mockup-config-editor__textarea {
+  margin-top: 12px;
+}
+
+.mockup-config-editor__textarea textarea {
+  width: 100%;
+  min-height: 220px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+@media (max-width: 1100px) {
+  .mockup-config-editor__workspace {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,0 +1,77 @@
+<div
+  class="mockup-config-editor"
+  data-empty-config="{{ widget.empty_config|escapejs }}"
+  data-base-image="{{ widget.base_image_url|default:''|escape }}"
+>
+  <div class="mockup-config-editor__workspace">
+    <div class="mockup-config-editor__preview-panel">
+      <div class="mockup-config-editor__header">
+        <strong>Placement Editor</strong>
+        <span>Drag the box. Use the handle to resize it.</span>
+      </div>
+
+      <div class="mockup-config-editor__canvas-shell">
+        <div class="mockup-config-editor__canvas" data-role="canvas">
+          <img
+            data-role="preview-image"
+            class="mockup-config-editor__image"
+            alt="Mockup template preview"
+          />
+          <div class="mockup-config-editor__overlay" data-role="overlay">
+            <div class="mockup-config-editor__selection" data-role="selection">
+              <div class="mockup-config-editor__label" data-role="selection-label">Print Area</div>
+              <button
+                type="button"
+                class="mockup-config-editor__resize"
+                data-role="resize-handle"
+                aria-label="Resize print area"
+              ></button>
+            </div>
+          </div>
+          <div class="mockup-config-editor__empty" data-role="empty-state">
+            Upload a base image or save the template once to use the visual editor.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mockup-config-editor__sidebar">
+      <div class="mockup-config-editor__section">
+        <h4>Current Placement</h4>
+        <div class="mockup-config-editor__grid">
+          <label>X<input type="number" step="1" data-role="field-x" /></label>
+          <label>Y<input type="number" step="1" data-role="field-y" /></label>
+          <label>Width<input type="number" step="1" data-role="field-width" /></label>
+          <label>Height<input type="number" step="1" data-role="field-height" /></label>
+          <label>Corner Radius<input type="number" step="1" data-role="field-corner-radius" /></label>
+        </div>
+      </div>
+
+      <div class="mockup-config-editor__section">
+        <h4>Sample Placements</h4>
+        <p class="mockup-config-editor__hint">
+          Save multiple positions and sizes for shop/gallery sample generation.
+        </p>
+        <div class="mockup-config-editor__sample-actions">
+          <input
+            type="text"
+            data-role="sample-label"
+            placeholder="Placement label"
+          />
+          <button type="button" class="button" data-role="add-sample">Add Current Placement</button>
+        </div>
+        <div class="mockup-config-editor__sample-list" data-role="sample-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="mockup-config-editor__json">
+    <details>
+      <summary>Advanced JSON</summary>
+      <div class="mockup-config-editor__textarea">
+        <textarea
+          name="{{ widget.name }}"{% include "django/forms/widgets/attrs.html" %}>{{ widget.value|default:'' }}</textarea>
+      </div>
+    </details>
+  </div>
+</div>

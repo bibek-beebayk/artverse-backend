@@ -1,3 +1,5 @@
+import json
+
 from django import forms
 from django.contrib import admin
 from django.core.exceptions import ValidationError
@@ -8,6 +10,68 @@ from .services import (
     hydrate_source_design_asset,
     resolve_source_asset_fingerprint,
 )
+
+
+class MockupConfigEditorWidget(forms.Textarea):
+    template_name = "admin/generator/widgets/mockup_config_editor.html"
+
+    class Media:
+        css = {
+            "all": ("generator/admin/mockup_config_editor.css",),
+        }
+        js = ("generator/admin/mockup_config_editor.js",)
+
+    def __init__(self, attrs=None):
+        super().__init__(attrs)
+        self.base_image_url = ""
+
+    def get_context(self, name, value, attrs):
+        context = super().get_context(name, value, attrs)
+        context["widget"]["base_image_url"] = self.base_image_url
+        context["widget"]["empty_config"] = json.dumps(
+            {
+                "placement": {
+                    "x": 100,
+                    "y": 100,
+                    "width": 300,
+                    "height": 300,
+                    "fit": "contain",
+                    "rotation": 0,
+                    "opacity": 1,
+                    "corner_radius": 0,
+                },
+                "sample_placements": [],
+            }
+        )
+        return context
+
+
+class MockupTemplateAdminForm(forms.ModelForm):
+    class Meta:
+        model = MockupTemplate
+        fields = "__all__"
+        widgets = {
+            "config": MockupConfigEditorWidget(
+                attrs={
+                    "rows": 16,
+                    "class": "vLargeTextField",
+                }
+            ),
+        }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        widget = self.fields["config"].widget
+        if isinstance(widget, MockupConfigEditorWidget):
+            if self.instance.pk and self.instance.base_image:
+                try:
+                    widget.base_image_url = self.instance.base_image.url
+                except Exception:
+                    widget.base_image_url = ""
+            self.fields["config"].help_text = (
+                "Use the visual placement editor below to drag and resize the print area. "
+                "The JSON stays available for advanced tuning."
+            )
 
 
 class SourceDesignAssetAdminForm(forms.ModelForm):
@@ -61,6 +125,7 @@ class GeneratedImageAdmin(admin.ModelAdmin):
 
 @admin.register(MockupTemplate)
 class MockupTemplateAdmin(admin.ModelAdmin):
+    form = MockupTemplateAdminForm
     list_display = ("id", "name", "product_type", "template_version", "is_active", "updated_at")
     list_filter = ("product_type", "is_active")
     search_fields = ("name", "slug")
