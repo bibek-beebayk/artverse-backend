@@ -529,6 +529,8 @@ def _draw_text_elements(image: Image.Image, text_elements: list) -> Image.Image:
         x = float(elem.get("x", 0))
         y = float(elem.get("y", 0))
         rotation = float(elem.get("rotation", 0))
+        is_bold = bool(elem.get("isBold", False))
+        is_italic = bool(elem.get("isItalic", False))
         
         font_path = os.path.join(settings.BASE_DIR, "fonts", f"{font_family}.ttf")
         try:
@@ -539,15 +541,44 @@ def _draw_text_elements(image: Image.Image, text_elements: list) -> Image.Image:
             except OSError:
                 font = ImageFont.load_default()
                 
-        left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
-        text_width = right - left
-        text_height = bottom - top
+        stroke_width = max(1, font_size // 25) if is_bold else 0
+        letter_spacing = float(elem.get("letterSpacing", 0))
+
+        if letter_spacing == 0:
+            left, top, right, bottom = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+            text_width = right - left
+            text_height = bottom - top
+            
+            # Add extra padding for italic skew
+            padding = 10 + (int(text_height * 0.3) if is_italic else 0)
+            txt_layer = Image.new("RGBA", (int(text_width) + padding*2, int(text_height) + padding*2), (0,0,0,0))
+            txt_draw = ImageDraw.Draw(txt_layer)
+            txt_draw.text((-left + padding, -top + padding), text, font=font, fill=color, stroke_width=stroke_width, stroke_fill=color if is_bold else None)
+        else:
+            # Measure max height
+            left, top, right, bottom = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+            text_height = bottom - top
+            
+            total_width = sum(draw.textlength(c, font=font) for c in text) + letter_spacing * max(0, len(text) - 1)
+            padding = 10 + (int(text_height * 0.3) if is_italic else 0)
+            txt_layer = Image.new("RGBA", (int(total_width) + padding*2, int(text_height) + padding*2), (0,0,0,0))
+            txt_draw = ImageDraw.Draw(txt_layer)
+            
+            current_x = padding
+            for char in text:
+                c_left, c_top, c_right, c_bottom = draw.textbbox((0, 0), char, font=font, stroke_width=stroke_width)
+                txt_draw.text((current_x - c_left, -top + padding), char, font=font, fill=color, stroke_width=stroke_width, stroke_fill=color if is_bold else None)
+                current_x += draw.textlength(char, font=font) + letter_spacing
         
-        padding = 10
-        txt_layer = Image.new("RGBA", (int(text_width) + padding*2, int(text_height) + padding*2), (0,0,0,0))
-        txt_draw = ImageDraw.Draw(txt_layer)
-        txt_draw.text((-left + padding, -top + padding), text, font=font, fill=color)
-        
+        if is_italic:
+            # Skew transform matrix for italic: (1, 0.3, 0, 0, 1, 0)
+            txt_layer = txt_layer.transform(
+                (txt_layer.width + int(text_height * 0.3), txt_layer.height),
+                Image.AFFINE,
+                (1, 0.3, 0, 0, 1, 0),
+                resample=Image.Resampling.BICUBIC
+            )
+
         if rotation != 0:
             txt_layer = txt_layer.rotate(rotation, expand=True, resample=Image.Resampling.BICUBIC)
             
