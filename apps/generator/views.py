@@ -4,6 +4,8 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.shortcuts import get_object_or_404
+import json
+import hashlib
 
 from apps.gallery.models import Artwork
 
@@ -116,6 +118,7 @@ class MockupRenderListCreateView(APIView):
         variant_size = serializer.validated_data.get("variant_size", "").strip()
         placement_override = serializer.validated_data.get("placement_override", {}) or {}
         crop_override = serializer.validated_data.get("crop_override", {}) or {}
+        text_elements = serializer.validated_data.get("text_elements", []) or []
 
         source_fingerprint = resolve_source_fingerprint(
             generated_image=generated_image,
@@ -138,6 +141,9 @@ class MockupRenderListCreateView(APIView):
             placement_override=placement_override,
             crop_override=crop_override,
         )
+        cache_key = hashlib.sha256(
+            (cache_key + json.dumps(text_elements, sort_keys=True)).encode("utf-8")
+        ).hexdigest()
 
         mockup_render, created = MockupRender.objects.get_or_create(
             cache_key=cache_key,
@@ -154,6 +160,7 @@ class MockupRenderListCreateView(APIView):
                 "variant_size": variant_size,
                 "placement_override": placement_override,
                 "crop_override": crop_override,
+                "text_elements": text_elements,
                 "processing_notes": {
                     "pipeline": "backend-mockup",
                     "next_step": "Run async compositing worker",
@@ -177,6 +184,9 @@ class MockupRenderListCreateView(APIView):
         if mockup_render.crop_override != crop_override:
             mockup_render.crop_override = crop_override
             changed_fields.append("crop_override")
+        if mockup_render.text_elements != text_elements:
+            mockup_render.text_elements = text_elements
+            changed_fields.append("text_elements")
         if changed_fields:
             changed_fields.append("updated_at")
             mockup_render.save(update_fields=changed_fields)

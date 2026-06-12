@@ -107,6 +107,7 @@ class MockupRenderSerializer(serializers.ModelSerializer):
             "variant_size",
             "placement_override",
             "crop_override",
+            "text_elements",
             "status",
             "cache_key",
             "output_image",
@@ -136,8 +137,11 @@ class MockupRenderCreateSerializer(serializers.Serializer):
     template_id = serializers.IntegerField()
     variant_color = serializers.CharField(required=False, allow_blank=True, max_length=120)
     variant_size = serializers.CharField(required=False, allow_blank=True, max_length=120)
-    placement_override = serializers.JSONField(required=False)
-    crop_override = serializers.JSONField(required=False)
+    placement_override = serializers.DictField(required=False, allow_null=True)
+    crop_override = serializers.DictField(required=False, allow_null=True)
+    text_elements = serializers.ListField(
+        child=serializers.DictField(), required=False, allow_null=True
+    )
 
     def validate(self, attrs):
         generated_image_id = attrs.get("generated_image_id")

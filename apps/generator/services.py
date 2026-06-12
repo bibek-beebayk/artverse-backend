@@ -8,7 +8,8 @@ from urllib.request import Request, urlopen
 
 from django.core.files.base import ContentFile
 from django.utils import timezone
-from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
+from django.conf import settings
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, ImageFont
 
 from apps.gallery.models import Artwork
 
@@ -510,6 +511,53 @@ def _apply_displacement_map(
     result.alpha_composite(warped_crop, dest=(left, top))
     return result
 
+import os
+
+def _draw_text_elements(image: Image.Image, text_elements: list) -> Image.Image:
+    if not text_elements:
+        return image
+    
+    draw = ImageDraw.Draw(image)
+    for elem in text_elements:
+        text = str(elem.get("text", ""))
+        if not text:
+            continue
+            
+        color = str(elem.get("color", "#FFFFFF"))
+        font_size = int(elem.get("fontSize", 48))
+        font_family = str(elem.get("fontFamily", "Roboto"))
+        x = float(elem.get("x", 0))
+        y = float(elem.get("y", 0))
+        rotation = float(elem.get("rotation", 0))
+        
+        font_path = os.path.join(settings.BASE_DIR, "fonts", f"{font_family}.ttf")
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+        except OSError:
+            try:
+                font = ImageFont.truetype(os.path.join(settings.BASE_DIR, "fonts", "Roboto.ttf"), font_size)
+            except OSError:
+                font = ImageFont.load_default()
+                
+        left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+        text_width = right - left
+        text_height = bottom - top
+        
+        padding = 10
+        txt_layer = Image.new("RGBA", (int(text_width) + padding*2, int(text_height) + padding*2), (0,0,0,0))
+        txt_draw = ImageDraw.Draw(txt_layer)
+        txt_draw.text((-left + padding, -top + padding), text, font=font, fill=color)
+        
+        if rotation != 0:
+            txt_layer = txt_layer.rotate(rotation, expand=True, resample=Image.Resampling.BICUBIC)
+            
+        paste_x = int(x - txt_layer.width / 2)
+        paste_y = int(y - txt_layer.height / 2)
+        
+        image.alpha_composite(txt_layer, dest=(paste_x, paste_y))
+        
+    return image
+
 
 def render_mockup_to_image(render) -> Image.Image:
     template = render.template
@@ -536,6 +584,8 @@ def render_mockup_to_image(render) -> Image.Image:
     paste_x = x + max(0, (target_width - prepared_design.width) // 2)
     paste_y = y + max(0, (target_height - prepared_design.height) // 2)
     design_layer.alpha_composite(prepared_design, dest=(paste_x, paste_y))
+
+    design_layer = _draw_text_elements(design_layer, render.text_elements)
 
     mask_image = _load_storage_image(template.mask_image)
     displacement_map = _load_storage_image(template.displacement_map)

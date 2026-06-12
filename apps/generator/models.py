@@ -160,6 +160,7 @@ class MockupRender(models.Model):
     variant_size = models.CharField(max_length=120, blank=True)
     placement_override = models.JSONField(default=dict, blank=True)
     crop_override = models.JSONField(default=dict, blank=True)
+    text_elements = models.JSONField(default=list, blank=True)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
     cache_key = models.CharField(max_length=255, unique=True)
     output_image = models.ImageField(upload_to="mockup-renders/", blank=True, null=True)
