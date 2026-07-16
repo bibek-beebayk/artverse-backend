@@ -5,7 +5,17 @@ from django.contrib import admin
 from django.core.exceptions import ValidationError
 from PIL import Image
 
-from .models import GeneratedImage, GenerationRequest, MockupRender, MockupTemplate, SourceDesignAsset
+from .models import (
+    DesignPlacement,
+    DesignProject,
+    GeneratedImage,
+    GenerationRequest,
+    MockupRender,
+    MockupTemplate,
+    MockupTemplatePart,
+    ProductVariant,
+    SourceDesignAsset,
+)
 from .services import (
     hydrate_source_design_asset,
     resolve_source_asset_fingerprint,
@@ -74,6 +84,53 @@ class MockupTemplateAdminForm(forms.ModelForm):
             )
 
 
+class MockupTemplatePartForm(forms.ModelForm):
+    class Meta:
+        model = MockupTemplatePart
+        fields = "__all__"
+        widgets = {
+            "config": MockupConfigEditorWidget(
+                attrs={
+                    "rows": 16,
+                    "class": "vLargeTextField",
+                }
+            ),
+        }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        widget = self.fields["config"].widget
+        if isinstance(widget, MockupConfigEditorWidget):
+            if self.instance.pk and self.instance.base_image:
+                try:
+                    widget.base_image_url = self.instance.base_image.url
+                except Exception:
+                    widget.base_image_url = ""
+            self.fields["config"].help_text = (
+                "Use the visual placement editor below to drag and resize the print area for this part."
+            )
+
+
+class MockupTemplatePartInline(admin.StackedInline):
+    model = MockupTemplatePart
+    form = MockupTemplatePartForm
+    extra = 0
+
+
+class ProductVariantInline(admin.TabularInline):
+    model = ProductVariant
+    extra = 0
+    fields = (
+        "colour",
+        "size",
+        "print_provider",
+        "base_cost",
+        "retail_price",
+        "is_available",
+        "printify_variant_id",
+    )
+
+
 class SourceDesignAssetAdminForm(forms.ModelForm):
     class Meta:
         model = SourceDesignAsset
@@ -130,6 +187,7 @@ class MockupTemplateAdmin(admin.ModelAdmin):
     list_filter = ("product_type", "is_active")
     search_fields = ("name", "slug")
     prepopulated_fields = {"slug": ("name",)}
+    inlines = [MockupTemplatePartInline, ProductVariantInline]
     fields = (
         "name",
         "slug",
@@ -145,6 +203,9 @@ class MockupTemplateAdmin(admin.ModelAdmin):
         "config",
         "supported_colors",
         "supported_sizes",
+        "canvas_width",
+        "canvas_height",
+        "supported_file_formats",
     )
 
 
@@ -215,3 +276,33 @@ class MockupRenderAdmin(admin.ModelAdmin):
         "source_image_url",
         "cache_key",
     )
+
+
+@admin.register(ProductVariant)
+class ProductVariantAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "template",
+        "colour",
+        "size",
+        "print_provider",
+        "retail_price",
+        "is_available",
+        "updated_at",
+    )
+    list_filter = ("is_available", "template__product_type", "print_provider")
+    search_fields = ("template__name", "colour", "size", "printify_variant_id")
+
+
+class DesignPlacementInline(admin.StackedInline):
+    model = DesignPlacement
+    extra = 0
+
+
+@admin.register(DesignProject)
+class DesignProjectAdmin(admin.ModelAdmin):
+    list_display = ("id", "name", "user", "template", "status", "selected_colour", "updated_at")
+    list_filter = ("status", "template__product_type")
+    search_fields = ("name", "user__email", "template__name")
+    readonly_fields = ("created_at", "updated_at")
+    inlines = [DesignPlacementInline]

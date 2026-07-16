@@ -9,13 +9,16 @@ import hashlib
 
 from apps.gallery.models import Artwork
 
-from .models import GeneratedImage, GenerationRequest, MockupRender, MockupTemplate
+from .models import DesignPlacement, DesignProject, GeneratedImage, GenerationRequest, MockupRender, MockupTemplate, ProductVariant
 from .serializers import (
+    DesignProjectSerializer,
+    DesignProjectWriteSerializer,
     GeneratedImageSerializer,
     GenerationRequestSerializer,
     MockupRenderCreateSerializer,
     MockupRenderSerializer,
     MockupTemplateSerializer,
+    ProductVariantSerializer,
 )
 from .services import (
     build_mockup_cache_key,
@@ -73,6 +76,18 @@ class MockupTemplateListView(ListAPIView):
         return queryset
 
 
+class ProductVariantListView(ListAPIView):
+    serializer_class = ProductVariantSerializer
+    permission_classes = [AllowAny]
+
+    def get_queryset(self):
+        queryset = ProductVariant.objects.filter(is_available=True).select_related("template")
+        template_id = self.request.query_params.get("template_id")
+        if template_id:
+            queryset = queryset.filter(template_id=template_id)
+        return queryset
+
+
 class MockupRenderListCreateView(APIView):
     permission_classes = [AllowAny]
 
@@ -114,6 +129,12 @@ class MockupRenderListCreateView(APIView):
         source_image_url = serializer.validated_data.get("source_image_url", "").strip()
         persisted_source_image_url = "" if source_image_url.startswith("data:image/") else source_image_url
         source_prompt = serializer.validated_data.get("source_prompt", "").strip()
+        part_name = serializer.validated_data.get("part_name", "").strip()
+        if part_name and not template.parts.filter(name=part_name).exists():
+            return Response(
+                {"part_name": [f"Template '{template.slug}' has no part named '{part_name}'."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         variant_color = serializer.validated_data.get("variant_color", "").strip()
         variant_size = serializer.validated_data.get("variant_size", "").strip()
         placement_override = serializer.validated_data.get("placement_override", {}) or {}
@@ -136,6 +157,7 @@ class MockupRenderListCreateView(APIView):
         cache_key = build_mockup_cache_key(
             template=template,
             source_fingerprint=source_fingerprint,
+            part_name=part_name,
             variant_color=variant_color,
             variant_size=variant_size,
             placement_override=placement_override,
@@ -156,6 +178,7 @@ class MockupRenderListCreateView(APIView):
                 "source_prompt": source_prompt or getattr(generated_image, "prompt", "") or getattr(artwork, "title", ""),
                 "source_fingerprint": source_fingerprint,
                 "template": template,
+                "part_name": part_name,
                 "variant_color": variant_color,
                 "variant_size": variant_size,
                 "placement_override": placement_override,
@@ -224,3 +247,100 @@ class MockupRenderDetailView(RetrieveAPIView):
     queryset = MockupRender.objects.select_related("template", "generated_image")
     serializer_class = MockupRenderSerializer
     permission_classes = [AllowAny]
+
+
+class DesignProjectListCreateView(APIView):
+    """List the current user's saved design projects, or save a new one."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        queryset = (
+            DesignProject.objects.filter(user=request.user)
+            .select_related("template", "selected_variant")
+            .prefetch_related("placements")
+        )
+        status_filter = request.query_params.get("status")
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+        serializer = DesignProjectSerializer(queryset, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        serializer = DesignProjectWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        design_project = serializer.save(user=request.user, status=DesignProject.Status.SAVED)
+        response_serializer = DesignProjectSerializer(design_project)
+        return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+
+
+class DesignProjectDetailView(APIView):
+    """Reopen, rename/update, or delete a single saved design project. Owner-only."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get_object(self, request, pk):
+        return get_object_or_404(
+            DesignProject.objects.select_related("template", "selected_variant").prefetch_related("placements"),
+            pk=pk,
+            user=request.user,
+        )
+
+    def get(self, request, pk):
+        design_project = self.get_object(request, pk)
+        serializer = DesignProjectSerializer(design_project)
+        return Response(serializer.data)
+
+    def patch(self, request, pk):
+        design_project = self.get_object(request, pk)
+        serializer = DesignProjectWriteSerializer(design_project, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        response_serializer = DesignProjectSerializer(design_project)
+        return Response(response_serializer.data)
+
+    def delete(self, request, pk):
+        design_project = self.get_object(request, pk)
+        design_project.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class DesignProjectDuplicateView(APIView):
+    """Clone a saved design project (and all its placements) into a new draft. Owner-only."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        source = get_object_or_404(
+            DesignProject.objects.prefetch_related("placements"),
+            pk=pk,
+            user=request.user,
+        )
+        duplicate = DesignProject.objects.create(
+            user=request.user,
+            name=f"{source.name} (Copy)" if source.name else "",
+            template=source.template,
+            selected_colour=source.selected_colour,
+            selected_variant=source.selected_variant,
+            status=DesignProject.Status.DRAFT,
+        )
+        for placement in source.placements.all():
+            DesignPlacement.objects.create(
+                design_project=duplicate,
+                product_part=placement.product_part,
+                artwork=placement.artwork,
+                generated_image=placement.generated_image,
+                x_position=placement.x_position,
+                y_position=placement.y_position,
+                width=placement.width,
+                height=placement.height,
+                rotation=placement.rotation,
+                opacity=placement.opacity,
+                crop_data=placement.crop_data,
+                corner_radius=placement.corner_radius,
+                text_settings=placement.text_settings,
+                preview_url=placement.preview_url,
+                print_file_url=placement.print_file_url,
+            )
+        serializer = DesignProjectSerializer(duplicate)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)

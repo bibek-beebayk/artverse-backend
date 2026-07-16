@@ -74,6 +74,7 @@ def build_mockup_cache_key(
     *,
     template: MockupTemplate,
     source_fingerprint: str,
+    part_name: str = "",
     variant_color: str = "",
     variant_size: str = "",
     placement_override: dict | None = None,
@@ -85,6 +86,7 @@ def build_mockup_cache_key(
         [
             template.slug,
             str(template.template_version),
+            part_name.strip().lower(),
             source_fingerprint,
             variant_color.strip().lower(),
             variant_size.strip().lower(),
@@ -592,12 +594,19 @@ def _draw_text_elements(image: Image.Image, text_elements: list) -> Image.Image:
 
 def render_mockup_to_image(render) -> Image.Image:
     template = render.template
-    base_image = _load_storage_image(template.base_image)
+    part = None
+    if render.part_name:
+        part = template.parts.filter(name=render.part_name).first()
+
+    base_image_source = part.base_image if part else template.base_image
+    
+    base_image = _load_storage_image(base_image_source)
     if base_image is None:
-        raise ValueError("Mockup template base image is missing.")
+        raise ValueError(f"Mockup template base image is missing for {template.name} ({render.part_name or 'root'}).")
 
     source_image = _load_source_image(render)
-    config = template.config or {}
+    config = part.config if part else template.config
+    config = config or {}
     placement = {
         **(config.get("placement") or {}),
         **_sanitize_placement_override(render.placement_override),
@@ -618,19 +627,24 @@ def render_mockup_to_image(render) -> Image.Image:
 
     design_layer = _draw_text_elements(design_layer, render.text_elements)
 
-    mask_image = _load_storage_image(template.mask_image)
-    displacement_map = _load_storage_image(template.displacement_map)
+    mask_image_source = part.mask_image if part else template.mask_image
+    displacement_map_source = part.displacement_map if part else template.displacement_map
+    
+    mask_image = _load_storage_image(mask_image_source)
+    displacement_map = _load_storage_image(displacement_map_source)
     design_layer = _apply_displacement_map(design_layer, displacement_map, config)
     design_layer = _apply_design_mask(design_layer, mask_image)
 
     composite = base_image.copy()
     composite.alpha_composite(design_layer)
 
-    shadow_layer = _load_storage_image(template.shadow_layer)
+    shadow_layer_source = part.shadow_layer if part else template.shadow_layer
+    shadow_layer = _load_storage_image(shadow_layer_source)
     if shadow_layer is not None:
         composite.alpha_composite(shadow_layer.resize(base_image.size, Image.Resampling.LANCZOS))
 
-    highlight_layer = _load_storage_image(template.highlight_layer)
+    highlight_layer_source = part.highlight_layer if part else template.highlight_layer
+    highlight_layer = _load_storage_image(highlight_layer_source)
     if highlight_layer is not None:
         composite.alpha_composite(highlight_layer.resize(base_image.size, Image.Resampling.LANCZOS))
 
