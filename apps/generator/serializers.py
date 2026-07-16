@@ -1,5 +1,7 @@
 from rest_framework import serializers
 
+from apps.shop.models import Product
+
 from .models import (
     DesignPlacement,
     DesignProject,
@@ -95,21 +97,32 @@ class MockupTemplatePartSerializer(serializers.ModelSerializer):
 
 class ProductVariantSerializer(serializers.ModelSerializer):
     image = serializers.SerializerMethodField()
+    product_id = serializers.SerializerMethodField()
+    template_id = serializers.IntegerField(read_only=True)
+    price = serializers.DecimalField(source="retail_price", max_digits=10, decimal_places=2, read_only=True)
+
+    def get_product_id(self, obj: ProductVariant):
+        return obj.product_id
 
     class Meta:
         model = ProductVariant
         fields = (
             "id",
-            "template",
-            "colour",
+            "product_id",
+            "template_id",
+            "sku",
+            "name",
+            "color_name",
+            "color_hex",
             "size",
-            "print_provider",
+            "price",
             "base_cost",
-            "retail_price",
+            "inventory",
             "is_available",
-            "printify_variant_id",
-            "image",
             "supported_print_areas",
+            "external_provider",
+            "external_variant_id",
+            "image",
             "updated_at",
         )
 
@@ -280,45 +293,219 @@ class MockupRenderCreateSerializer(serializers.Serializer):
         return attrs
 
 
+class ProductSummarySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Product
+        fields = ("id", "name", "slug", "mockup_template")
+
+
+class PlacementOverrideSerializer(serializers.Serializer):
+    """Maps to/from DesignPlacement.x/y/width/height/rotation/opacity/corner_radius/fit.
+    Coordinates are template-pixel space, matching MockupTemplate(Part).config['placement']."""
+
+    x = serializers.FloatField(required=False, default=0)
+    y = serializers.FloatField(required=False, default=0)
+    width = serializers.FloatField(required=False, default=0, min_value=0)
+    height = serializers.FloatField(required=False, default=0, min_value=0)
+    rotation = serializers.FloatField(required=False, default=0)
+    opacity = serializers.FloatField(required=False, default=1, min_value=0, max_value=1)
+    corner_radius = serializers.FloatField(required=False, default=0, min_value=0)
+    fit = serializers.ChoiceField(choices=DesignPlacement.Fit.choices, required=False, default=DesignPlacement.Fit.CONTAIN)
+
+
+class CropOverrideSerializer(serializers.Serializer):
+    """Maps to/from DesignPlacement.crop_left/crop_top/crop_width/crop_height. Values are
+    percentages (0-100) of the source design image, matching services._sanitize_crop_override."""
+
+    left = serializers.FloatField(required=False, default=0)
+    top = serializers.FloatField(required=False, default=0)
+    width = serializers.FloatField(required=False, default=100, min_value=0.01)
+    height = serializers.FloatField(required=False, default=100, min_value=0.01)
+
+
 class DesignPlacementSerializer(serializers.ModelSerializer):
+    """Read serializer. Composes placement_override/crop_override to match the same
+    nested shape the frontend already sends to /mockup-renders/, instead of exposing the
+    8 underlying flat columns individually."""
+
+    placement_override = serializers.SerializerMethodField()
+    crop_override = serializers.SerializerMethodField()
+    preview_render_id = serializers.IntegerField(read_only=True)
+    source_artwork_id = serializers.IntegerField(read_only=True)
+    source_generated_image_id = serializers.IntegerField(read_only=True)
+    template_part_id = serializers.IntegerField(read_only=True)
+
     class Meta:
         model = DesignPlacement
         fields = (
             "id",
-            "product_part",
-            "artwork",
-            "generated_image",
-            "x_position",
-            "y_position",
-            "width",
-            "height",
-            "rotation",
-            "opacity",
-            "crop_data",
-            "corner_radius",
-            "text_settings",
+            "part_name",
+            "template_part_id",
+            "source_artwork_id",
+            "source_generated_image_id",
+            "source_image_url",
+            "source_prompt",
+            "placement_override",
+            "crop_override",
+            "text_elements",
+            "preview_render_id",
             "preview_url",
             "print_file_url",
+            "metadata",
+            "created_at",
             "updated_at",
         )
 
+    def get_placement_override(self, obj: DesignPlacement):
+        return {
+            "x": obj.x,
+            "y": obj.y,
+            "width": obj.width,
+            "height": obj.height,
+            "rotation": obj.rotation,
+            "opacity": obj.opacity,
+            "corner_radius": obj.corner_radius,
+            "fit": obj.fit,
+        }
 
-class DesignProjectSerializer(serializers.ModelSerializer):
-    placements = DesignPlacementSerializer(many=True, read_only=True)
-    template_detail = MockupTemplateSerializer(source="template", read_only=True)
-    thumbnail = serializers.SerializerMethodField()
+    def get_crop_override(self, obj: DesignPlacement):
+        return {
+            "left": obj.crop_left,
+            "top": obj.crop_top,
+            "width": obj.crop_width,
+            "height": obj.crop_height,
+        }
+
+
+class DesignPlacementWriteSerializer(serializers.Serializer):
+    """Per-item validation for a placement inside a design-project write payload. Cross-field
+    validation that needs the parent project's template/variant (part-vs-template consistency,
+    generated-image ownership) happens in DesignProjectWriteSerializer.validate(), which has
+    the request context and the other fields needed to check against."""
+
+    part_name = serializers.ChoiceField(choices=MockupTemplatePart.PartName.choices)
+    source_artwork_id = serializers.IntegerField(required=False, allow_null=True)
+    source_generated_image_id = serializers.IntegerField(required=False, allow_null=True)
+    source_image_url = serializers.CharField(required=False, allow_blank=True, default="")
+    source_prompt = serializers.CharField(required=False, allow_blank=True, default="")
+    placement_override = PlacementOverrideSerializer(required=False)
+    crop_override = CropOverrideSerializer(required=False)
+    text_elements = serializers.ListField(child=serializers.DictField(), required=False, default=list)
+    preview_render_id = serializers.IntegerField(required=False, allow_null=True)
+    preview_url = serializers.CharField(required=False, allow_blank=True, default="")
+    print_file_url = serializers.CharField(required=False, allow_blank=True, default="")
+    metadata = serializers.DictField(required=False, default=dict)
+
+
+def _placement_write_data_to_model_fields(item: dict) -> dict:
+    """Flattens a validated DesignPlacementWriteSerializer item into DesignPlacement model
+    field kwargs (excluding design_project/template_part, which the caller resolves)."""
+
+    placement = item.get("placement_override") or {}
+    crop = item.get("crop_override") or {}
+    return {
+        "part_name": item["part_name"],
+        "source_artwork_id": item.get("source_artwork_id"),
+        "source_generated_image_id": item.get("source_generated_image_id"),
+        "source_image_url": item.get("source_image_url", ""),
+        "source_prompt": item.get("source_prompt", ""),
+        "x": placement.get("x", 0),
+        "y": placement.get("y", 0),
+        "width": placement.get("width", 0),
+        "height": placement.get("height", 0),
+        "rotation": placement.get("rotation", 0),
+        "opacity": placement.get("opacity", 1),
+        "corner_radius": placement.get("corner_radius", 0),
+        "fit": placement.get("fit", DesignPlacement.Fit.CONTAIN),
+        "crop_left": crop.get("left", 0),
+        "crop_top": crop.get("top", 0),
+        "crop_width": crop.get("width", 100),
+        "crop_height": crop.get("height", 100),
+        "text_elements": item.get("text_elements", []),
+        "preview_render_id": item.get("preview_render_id"),
+        "preview_url": item.get("preview_url", ""),
+        "print_file_url": item.get("print_file_url", ""),
+        "metadata": item.get("metadata", {}),
+    }
+
+
+class DesignProjectListSerializer(serializers.ModelSerializer):
+    """Lightweight summary for the list endpoint — no nested placements."""
+
+    product = ProductSummarySerializer(read_only=True)
+    template = serializers.SerializerMethodField()
+    selected_variant = ProductVariantSerializer(read_only=True)
+    thumbnail_url = serializers.SerializerMethodField()
+    placement_count = serializers.SerializerMethodField()
 
     class Meta:
         model = DesignProject
         fields = (
             "id",
             "name",
-            "template",
-            "template_detail",
-            "selected_colour",
-            "selected_variant",
             "status",
+            "product",
+            "template",
+            "selected_variant",
+            "selected_color",
+            "selected_size",
+            "thumbnail_url",
+            "placement_count",
+            "created_at",
+            "updated_at",
+        )
+
+    def get_template(self, obj: DesignProject):
+        return {
+            "id": obj.mockup_template_id,
+            "name": obj.mockup_template.name,
+            "product_type": obj.mockup_template.product_type,
+        }
+
+    def get_placement_count(self, obj: DesignProject):
+        # The list view annotates this to avoid a per-row COUNT query; fall back to a live
+        # count if the serializer is used somewhere that didn't apply that annotation.
+        annotated = getattr(obj, "placement_count_annotated", None)
+        return annotated if annotated is not None else obj.placements.count()
+
+    def get_thumbnail_url(self, obj: DesignProject):
+        if obj.thumbnail:
+            try:
+                return obj.thumbnail.url
+            except Exception:
+                pass
+        return obj.thumbnail_url or None
+
+
+class DesignProjectSerializer(serializers.ModelSerializer):
+    """Full detail — everything required to rebuild the editor."""
+
+    placements = DesignPlacementSerializer(many=True, read_only=True)
+    product = ProductSummarySerializer(read_only=True)
+    mockup_template = MockupTemplateSerializer(read_only=True)
+    selected_variant = ProductVariantSerializer(read_only=True)
+    thumbnail = serializers.SerializerMethodField()
+    source_artwork_id = serializers.IntegerField(read_only=True)
+    source_generated_image_id = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = DesignProject
+        fields = (
+            "id",
+            "name",
+            "product",
+            "mockup_template",
+            "selected_variant",
+            "selected_color",
+            "selected_size",
+            "status",
+            "source_artwork_id",
+            "source_generated_image_id",
+            "source_image_url",
+            "source_prompt",
             "thumbnail",
+            "thumbnail_url",
+            "metadata",
             "placements",
             "created_at",
             "updated_at",
@@ -334,59 +521,149 @@ class DesignProjectSerializer(serializers.ModelSerializer):
             return None
 
 
-class DesignProjectWriteSerializer(serializers.ModelSerializer):
-    placements = DesignPlacementSerializer(many=True, required=False)
+class DesignProjectWriteSerializer(serializers.Serializer):
+    """Plain Serializer (not ModelSerializer) so create/update/nested-placement semantics can
+    be controlled explicitly by the view (transactions, PATCH-vs-PUT), matching the existing
+    MockupRenderCreateSerializer pattern in this file rather than fighting DRF's automatic
+    nested-write machinery."""
 
-    class Meta:
-        model = DesignProject
-        fields = (
-            "id",
-            "name",
-            "template",
-            "selected_colour",
-            "selected_variant",
-            "placements",
-        )
+    # No `default=` on any of these: for a partial (PATCH) update we need to tell whether a
+    # key was actually present in the request vs merely absent, so validate() can fall back to
+    # the existing instance's value for anything the client didn't send. `default=` would make
+    # DRF populate the key unconditionally and defeat that. Create-time fallbacks (e.g. "" for
+    # an omitted optional text field) are applied explicitly in the view instead.
+    name = serializers.CharField(required=False, allow_blank=True)
+    product_id = serializers.IntegerField(required=False, allow_null=True)
+    mockup_template_id = serializers.IntegerField(required=False)
+    selected_variant_id = serializers.IntegerField(required=False, allow_null=True)
+    selected_color = serializers.CharField(required=False, allow_blank=True)
+    selected_size = serializers.CharField(required=False, allow_blank=True)
+    source_artwork_id = serializers.IntegerField(required=False, allow_null=True)
+    source_generated_image_id = serializers.IntegerField(required=False, allow_null=True)
+    source_image_url = serializers.CharField(required=False, allow_blank=True)
+    source_prompt = serializers.CharField(required=False, allow_blank=True)
+    thumbnail_url = serializers.CharField(required=False, allow_blank=True)
+    metadata = serializers.DictField(required=False)
+    placements = DesignPlacementWriteSerializer(many=True, required=False)
+
+    def validate_thumbnail_url(self, value):
+        if value.strip().startswith("data:"):
+            raise serializers.ValidationError("thumbnail_url must be a URL, not inline base64 data.")
+        return value
 
     def validate_placements(self, value):
         seen_parts = set()
         for placement in value:
-            part = placement.get("product_part")
+            part = placement.get("part_name")
             if part in seen_parts:
-                raise serializers.ValidationError(f"Duplicate placement for product_part '{part}'.")
+                raise serializers.ValidationError(f"Duplicate placement for part_name '{part}'.")
             seen_parts.add(part)
         return value
 
-    def create(self, validated_data):
-        placements_data = validated_data.pop("placements", [])
-        design_project = DesignProject.objects.create(**validated_data)
-        for placement_data in placements_data:
-            DesignPlacement.objects.create(design_project=design_project, **placement_data)
-        return design_project
+    def validate(self, attrs):
+        request = self.context["request"]
+        instance: DesignProject | None = self.instance
+        errors = {}
 
-    def update(self, instance, validated_data):
-        placements_data = validated_data.pop("placements", None)
+        # --- mockup_template: required on create; falls back to the existing value on update ---
+        if "mockup_template_id" in attrs:
+            template = MockupTemplate.objects.filter(pk=attrs["mockup_template_id"], is_active=True).first()
+            if not template:
+                errors["mockup_template_id"] = "No active mockup template with this id."
+        elif instance is not None:
+            template = instance.mockup_template
+        else:
+            template = None
+            errors["mockup_template_id"] = "This field is required."
+        attrs["_template"] = template
 
-        for attr, value in validated_data.items():
-            setattr(instance, attr, value)
-        instance.save()
+        # --- product: optional; falls back to the existing value on update ---
+        if "product_id" in attrs:
+            product_id = attrs["product_id"]
+            if product_id is None:
+                product = None
+            else:
+                product = Product.objects.filter(pk=product_id, is_active=True).select_related("mockup_template").first()
+                if not product:
+                    errors["product_id"] = "No active product with this id."
+                elif template and product.mockup_template_id and product.mockup_template_id != template.id:
+                    errors["product_id"] = "This product is not linked to the selected mockup_template."
+        elif instance is not None:
+            product = instance.product
+        else:
+            product = None
+        attrs["_product"] = product
 
-        if placements_data is not None:
-            existing_by_part = {placement.product_part: placement for placement in instance.placements.all()}
-            seen_parts = set()
-            for placement_data in placements_data:
-                part = placement_data.get("product_part")
-                seen_parts.add(part)
-                existing = existing_by_part.get(part)
-                if existing:
-                    for attr, value in placement_data.items():
-                        setattr(existing, attr, value)
-                    existing.save()
+        # --- variant: optional; falls back to the existing value on update ---
+        if "selected_variant_id" in attrs:
+            variant_id = attrs["selected_variant_id"]
+            if variant_id is None:
+                variant = None
+            else:
+                variant = ProductVariant.objects.filter(pk=variant_id).first()
+                if not variant:
+                    errors["selected_variant_id"] = "No product variant with this id."
                 else:
-                    DesignPlacement.objects.create(design_project=instance, **placement_data)
+                    if template and variant.template_id != template.id:
+                        errors["selected_variant_id"] = "This variant does not belong to the selected mockup_template."
+                    if product and variant.product_id and variant.product_id != product.id:
+                        errors["selected_variant_id"] = "This variant does not belong to the selected product."
+                    if not variant.is_available:
+                        errors["selected_variant_id"] = "This variant is not available."
+        elif instance is not None:
+            variant = instance.selected_variant
+        else:
+            variant = None
+        attrs["_variant"] = variant
 
-            for part, placement in existing_by_part.items():
-                if part not in seen_parts:
-                    placement.delete()
+        if variant:
+            attrs.setdefault("selected_color", variant.color_name)
+            attrs.setdefault("selected_size", variant.size)
 
-        return instance
+        if "source_generated_image_id" in attrs and attrs["source_generated_image_id"] is not None:
+            owned = GeneratedImage.objects.filter(pk=attrs["source_generated_image_id"], user=request.user).exists()
+            if not owned:
+                errors["source_generated_image_id"] = "This generated image does not belong to you."
+
+        template_parts_by_name = {part.name: part for part in template.parts.all()} if template else {}
+
+        placement_errors = []
+        for placement in attrs.get("placements", []):
+            item_errors = {}
+            part_name = placement["part_name"]
+
+            if template_parts_by_name:
+                matched_part = template_parts_by_name.get(part_name)
+                if not matched_part:
+                    item_errors["part_name"] = f"Template '{template.slug}' has no part named '{part_name}'."
+                placement["_template_part"] = matched_part
+            else:
+                if part_name != MockupTemplatePart.PartName.FRONT:
+                    item_errors["part_name"] = (
+                        "This template has no configured parts; only 'front' is a valid part_name."
+                    )
+                placement["_template_part"] = None
+
+            if variant and variant.supported_print_areas and part_name not in variant.supported_print_areas:
+                item_errors["part_name"] = f"The selected variant does not support printing on '{part_name}'."
+
+            image_id = placement.get("source_generated_image_id")
+            if image_id is not None:
+                owned = GeneratedImage.objects.filter(pk=image_id, user=request.user).exists()
+                if not owned:
+                    item_errors["source_generated_image_id"] = "This generated image does not belong to you."
+
+            preview_render_id = placement.get("preview_render_id")
+            if preview_render_id is not None:
+                if not MockupRender.objects.filter(pk=preview_render_id).exists():
+                    item_errors["preview_render_id"] = "No mockup render with this id."
+
+            placement_errors.append(item_errors)
+
+        if any(placement_errors):
+            errors["placements"] = placement_errors
+
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        return attrs

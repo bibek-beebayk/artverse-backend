@@ -17,7 +17,9 @@ class ProductListView(ListAPIView):
     serializer_class = ProductSerializer
 
     def get_queryset(self):
-        queryset = Product.objects.filter(is_active=True).select_related("category")
+        queryset = Product.objects.filter(is_active=True).select_related("category", "mockup_template").prefetch_related(
+            "variants"
+        )
         category_slug = self.request.query_params.get("category")
         if category_slug and category_slug.lower() != "all":
             queryset = queryset.filter(category__slug=category_slug)
@@ -25,7 +27,9 @@ class ProductListView(ListAPIView):
 
 
 class ProductDetailView(RetrieveAPIView):
-    queryset = Product.objects.filter(is_active=True).select_related("category")
+    queryset = Product.objects.filter(is_active=True).select_related("category", "mockup_template").prefetch_related(
+        "variants"
+    )
     serializer_class = ProductSerializer
     lookup_field = "slug"
 

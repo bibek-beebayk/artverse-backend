@@ -3,6 +3,8 @@ from rest_framework.generics import ListAPIView, RetrieveAPIView
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from django.db import transaction
+from django.db.models import Count, Prefetch
 from django.shortcuts import get_object_or_404
 import json
 import hashlib
@@ -11,6 +13,7 @@ from apps.gallery.models import Artwork
 
 from .models import DesignPlacement, DesignProject, GeneratedImage, GenerationRequest, MockupRender, MockupTemplate, ProductVariant
 from .serializers import (
+    DesignProjectListSerializer,
     DesignProjectSerializer,
     DesignProjectWriteSerializer,
     GeneratedImageSerializer,
@@ -19,6 +22,7 @@ from .serializers import (
     MockupRenderSerializer,
     MockupTemplateSerializer,
     ProductVariantSerializer,
+    _placement_write_data_to_model_fields,
 )
 from .services import (
     build_mockup_cache_key,
@@ -26,6 +30,61 @@ from .services import (
     process_mockup_render,
     resolve_source_fingerprint,
 )
+
+
+ALLOWED_DESIGN_PROJECT_ORDERING = {"updated_at", "-updated_at", "created_at", "-created_at", "name", "-name"}
+
+
+def _placements_prefetch():
+    return Prefetch(
+        "placements",
+        queryset=DesignPlacement.objects.select_related(
+            "template_part", "source_artwork", "source_generated_image", "preview_render"
+        ),
+    )
+
+
+def _sync_design_placements(design_project: DesignProject, placements_data: list, *, replace: bool) -> None:
+    """Create/update DesignPlacement rows from validated write-serializer data.
+
+    replace=True  (PUT):   the given list is authoritative — parts omitted from it are deleted.
+    replace=False (PATCH): only touches the parts present in the list; other parts are untouched.
+    """
+
+    existing_by_part = {placement.part_name: placement for placement in design_project.placements.all()}
+    seen_parts = set()
+
+    for item in placements_data:
+        part_name = item["part_name"]
+        seen_parts.add(part_name)
+        fields = _placement_write_data_to_model_fields(item)
+        template_part = item.get("_template_part")
+
+        existing = existing_by_part.get(part_name)
+        if existing:
+            for attr, value in fields.items():
+                setattr(existing, attr, value)
+            existing.template_part = template_part
+            existing.save()
+        else:
+            DesignPlacement.objects.create(design_project=design_project, template_part=template_part, **fields)
+
+    if replace:
+        for part_name, placement in existing_by_part.items():
+            if part_name not in seen_parts:
+                placement.delete()
+
+
+def _generate_duplicate_name(user, base_name: str) -> str:
+    base_name = (base_name or "Untitled Design").strip() or "Untitled Design"
+    candidate = f"{base_name} Copy"
+    if not DesignProject.objects.filter(user=user, name=candidate).exists():
+        return candidate
+
+    counter = 2
+    while DesignProject.objects.filter(user=user, name=f"{candidate} {counter}").exists():
+        counter += 1
+    return f"{candidate} {counter}"
 
 
 class GenerationRequestListCreateView(APIView):
@@ -81,10 +140,13 @@ class ProductVariantListView(ListAPIView):
     permission_classes = [AllowAny]
 
     def get_queryset(self):
-        queryset = ProductVariant.objects.filter(is_available=True).select_related("template")
+        queryset = ProductVariant.objects.filter(is_available=True).select_related("template", "product")
         template_id = self.request.query_params.get("template_id")
         if template_id:
             queryset = queryset.filter(template_id=template_id)
+        product_id = self.request.query_params.get("product_id")
+        if product_id:
+            queryset = queryset.filter(product_id=product_id)
         return queryset
 
 
@@ -257,31 +319,72 @@ class DesignProjectListCreateView(APIView):
     def get(self, request):
         queryset = (
             DesignProject.objects.filter(user=request.user)
-            .select_related("template", "selected_variant")
-            .prefetch_related("placements")
+            .select_related("product", "mockup_template", "selected_variant")
+            .annotate(placement_count_annotated=Count("placements", distinct=True))
         )
+
         status_filter = request.query_params.get("status")
         if status_filter:
             queryset = queryset.filter(status=status_filter)
-        serializer = DesignProjectSerializer(queryset, many=True)
+
+        search = request.query_params.get("search")
+        if search:
+            queryset = queryset.filter(name__icontains=search)
+
+        product_id = request.query_params.get("product")
+        if product_id:
+            queryset = queryset.filter(product_id=product_id)
+
+        template_id = request.query_params.get("template")
+        if template_id:
+            queryset = queryset.filter(mockup_template_id=template_id)
+
+        ordering = request.query_params.get("ordering")
+        if ordering in ALLOWED_DESIGN_PROJECT_ORDERING:
+            queryset = queryset.order_by(ordering)
+
+        serializer = DesignProjectListSerializer(queryset, many=True)
         return Response(serializer.data)
 
     def post(self, request):
-        serializer = DesignProjectWriteSerializer(data=request.data)
+        serializer = DesignProjectWriteSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
-        design_project = serializer.save(user=request.user, status=DesignProject.Status.SAVED)
+        data = serializer.validated_data
+
+        with transaction.atomic():
+            design_project = DesignProject.objects.create(
+                user=request.user,
+                name=data.get("name", ""),
+                product=data["_product"],
+                mockup_template=data["_template"],
+                selected_variant=data["_variant"],
+                selected_color=data.get("selected_color", ""),
+                selected_size=data.get("selected_size", ""),
+                source_artwork_id=data.get("source_artwork_id"),
+                source_generated_image_id=data.get("source_generated_image_id"),
+                source_image_url=data.get("source_image_url", ""),
+                source_prompt=data.get("source_prompt", ""),
+                thumbnail_url=data.get("thumbnail_url", ""),
+                metadata={**data.get("metadata", {}), "schema_version": 1},
+                status=DesignProject.Status.DRAFT,
+            )
+            _sync_design_placements(design_project, data.get("placements", []), replace=True)
+
         response_serializer = DesignProjectSerializer(design_project)
         return Response(response_serializer.data, status=status.HTTP_201_CREATED)
 
 
 class DesignProjectDetailView(APIView):
-    """Reopen, rename/update, or delete a single saved design project. Owner-only."""
+    """Reopen, rename/update (PUT = full replace, PATCH = partial), or delete a single saved
+    design project. Owner-only (404, not 403, for another user's project)."""
 
     permission_classes = [IsAuthenticated]
 
     def get_object(self, request, pk):
         return get_object_or_404(
-            DesignProject.objects.select_related("template", "selected_variant").prefetch_related("placements"),
+            DesignProject.objects.select_related(
+                "user", "product", "mockup_template", "selected_variant"
+            ).prefetch_related(_placements_prefetch()),
             pk=pk,
             user=request.user,
         )
@@ -291,13 +394,58 @@ class DesignProjectDetailView(APIView):
         serializer = DesignProjectSerializer(design_project)
         return Response(serializer.data)
 
-    def patch(self, request, pk):
+    def _write(self, request, pk, *, partial: bool):
         design_project = self.get_object(request, pk)
-        serializer = DesignProjectWriteSerializer(design_project, data=request.data, partial=True)
+        serializer = DesignProjectWriteSerializer(
+            instance=design_project, data=request.data, partial=partial, context={"request": request}
+        )
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        data = serializer.validated_data
+
+        with transaction.atomic():
+            if "name" in data:
+                design_project.name = data["name"]
+            design_project.product = data["_product"]
+            design_project.mockup_template = data["_template"]
+            design_project.selected_variant = data["_variant"]
+            if "selected_color" in data:
+                design_project.selected_color = data["selected_color"]
+            if "selected_size" in data:
+                design_project.selected_size = data["selected_size"]
+            if "source_artwork_id" in data:
+                design_project.source_artwork_id = data["source_artwork_id"]
+            if "source_generated_image_id" in data:
+                design_project.source_generated_image_id = data["source_generated_image_id"]
+            if "source_image_url" in data:
+                design_project.source_image_url = data["source_image_url"]
+            if "source_prompt" in data:
+                design_project.source_prompt = data["source_prompt"]
+            if "thumbnail_url" in data:
+                design_project.thumbnail_url = data["thumbnail_url"]
+            if "metadata" in data:
+                design_project.metadata = {**data["metadata"], "schema_version": 1}
+            design_project.save()
+
+            if "placements" in data:
+                _sync_design_placements(design_project, data["placements"], replace=not partial)
+                # get_object() prefetched `placements` before this method mutated some of those
+                # same rows in place (.save()/.delete()); bust the cache so the response below
+                # re-queries fresh instead of serializing the stale pre-mutation snapshot.
+                design_project._prefetched_objects_cache.pop("placements", None)
+
         response_serializer = DesignProjectSerializer(design_project)
         return Response(response_serializer.data)
+
+    def put(self, request, pk):
+        """Full replacement: the supplied placements array is authoritative — placements for
+        parts omitted from it are deleted."""
+        return self._write(request, pk, partial=False)
+
+    def patch(self, request, pk):
+        """Partial update: supplied placements are upserted; placements for parts NOT present
+        in the payload are left untouched (a PATCH touching only 'front' must not delete
+        'back'/sleeve placements)."""
+        return self._write(request, pk, partial=True)
 
     def delete(self, request, pk):
         design_project = self.get_object(request, pk)
@@ -312,35 +460,55 @@ class DesignProjectDuplicateView(APIView):
 
     def post(self, request, pk):
         source = get_object_or_404(
-            DesignProject.objects.prefetch_related("placements"),
+            DesignProject.objects.prefetch_related(_placements_prefetch()),
             pk=pk,
             user=request.user,
         )
-        duplicate = DesignProject.objects.create(
-            user=request.user,
-            name=f"{source.name} (Copy)" if source.name else "",
-            template=source.template,
-            selected_colour=source.selected_colour,
-            selected_variant=source.selected_variant,
-            status=DesignProject.Status.DRAFT,
-        )
-        for placement in source.placements.all():
-            DesignPlacement.objects.create(
-                design_project=duplicate,
-                product_part=placement.product_part,
-                artwork=placement.artwork,
-                generated_image=placement.generated_image,
-                x_position=placement.x_position,
-                y_position=placement.y_position,
-                width=placement.width,
-                height=placement.height,
-                rotation=placement.rotation,
-                opacity=placement.opacity,
-                crop_data=placement.crop_data,
-                corner_radius=placement.corner_radius,
-                text_settings=placement.text_settings,
-                preview_url=placement.preview_url,
-                print_file_url=placement.print_file_url,
+
+        with transaction.atomic():
+            duplicate = DesignProject.objects.create(
+                user=request.user,
+                name=_generate_duplicate_name(request.user, source.name),
+                product=source.product,
+                mockup_template=source.mockup_template,
+                selected_variant=source.selected_variant,
+                selected_color=source.selected_color,
+                selected_size=source.selected_size,
+                source_artwork=source.source_artwork,
+                source_generated_image=source.source_generated_image,
+                source_image_url=source.source_image_url,
+                source_prompt=source.source_prompt,
+                thumbnail_url=source.thumbnail_url,
+                metadata=dict(source.metadata),
+                status=DesignProject.Status.DRAFT,
             )
+            for placement in source.placements.all():
+                DesignPlacement.objects.create(
+                    design_project=duplicate,
+                    part_name=placement.part_name,
+                    template_part=placement.template_part,
+                    source_artwork=placement.source_artwork,
+                    source_generated_image=placement.source_generated_image,
+                    source_image_url=placement.source_image_url,
+                    source_prompt=placement.source_prompt,
+                    x=placement.x,
+                    y=placement.y,
+                    width=placement.width,
+                    height=placement.height,
+                    rotation=placement.rotation,
+                    opacity=placement.opacity,
+                    corner_radius=placement.corner_radius,
+                    fit=placement.fit,
+                    crop_left=placement.crop_left,
+                    crop_top=placement.crop_top,
+                    crop_width=placement.crop_width,
+                    crop_height=placement.crop_height,
+                    text_elements=placement.text_elements,
+                    preview_render=placement.preview_render,
+                    preview_url=placement.preview_url,
+                    print_file_url=placement.print_file_url,
+                    metadata=dict(placement.metadata),
+                )
+
         serializer = DesignProjectSerializer(duplicate)
         return Response(serializer.data, status=status.HTTP_201_CREATED)

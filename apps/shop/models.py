@@ -26,6 +26,14 @@ class Product(models.Model):
     image_url = models.URLField(blank=True)
     is_active = models.BooleanField(default=True)
     inventory = models.PositiveIntegerField(default=0)
+    mockup_template = models.ForeignKey(
+        "generator.MockupTemplate",
+        on_delete=models.SET_NULL,
+        related_name="shop_products",
+        null=True,
+        blank=True,
+        help_text="The customizable mockup template used to render this product's previews and print files.",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

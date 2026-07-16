@@ -120,14 +120,19 @@ class MockupTemplatePartInline(admin.StackedInline):
 class ProductVariantInline(admin.TabularInline):
     model = ProductVariant
     extra = 0
+    fk_name = "template"
     fields = (
-        "colour",
+        "product",
+        "sku",
+        "color_name",
+        "color_hex",
         "size",
-        "print_provider",
         "base_cost",
         "retail_price",
+        "inventory",
         "is_available",
-        "printify_variant_id",
+        "external_provider",
+        "external_variant_id",
     )
 
 
@@ -282,27 +287,42 @@ class MockupRenderAdmin(admin.ModelAdmin):
 class ProductVariantAdmin(admin.ModelAdmin):
     list_display = (
         "id",
+        "product",
         "template",
-        "colour",
+        "sku",
+        "color_name",
         "size",
-        "print_provider",
+        "base_cost",
         "retail_price",
+        "inventory",
         "is_available",
         "updated_at",
     )
-    list_filter = ("is_available", "template__product_type", "print_provider")
-    search_fields = ("template__name", "colour", "size", "printify_variant_id")
+    list_filter = ("is_available", "template__product_type", "external_provider")
+    search_fields = ("template__name", "product__name", "sku", "color_name", "size", "external_variant_id")
+    list_select_related = ("product", "template")
 
 
 class DesignPlacementInline(admin.StackedInline):
     model = DesignPlacement
     extra = 0
+    fk_name = "design_project"
 
 
 @admin.register(DesignProject)
 class DesignProjectAdmin(admin.ModelAdmin):
-    list_display = ("id", "name", "user", "template", "status", "selected_colour", "updated_at")
-    list_filter = ("status", "template__product_type")
-    search_fields = ("name", "user__email", "template__name")
+    list_display = (
+        "id",
+        "name",
+        "user",
+        "product",
+        "mockup_template",
+        "selected_variant",
+        "status",
+        "updated_at",
+    )
+    list_filter = ("status", "mockup_template__product_type")
+    search_fields = ("name", "user__email", "mockup_template__name", "product__name")
     readonly_fields = ("created_at", "updated_at")
+    list_select_related = ("user", "product", "mockup_template", "selected_variant")
     inlines = [DesignPlacementInline]

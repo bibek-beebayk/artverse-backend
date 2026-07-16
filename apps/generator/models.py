@@ -166,16 +166,31 @@ class MockupTemplatePart(models.Model):
 
 
 class ProductVariant(models.Model):
-    """A specific purchasable colour/size combination of a MockupTemplate."""
+    """A specific purchasable colour/size combination, belonging to both a storefront
+    Product (what customers browse/buy) and the MockupTemplate that renders it (what the
+    customization editor and renderer use). `product` is nullable so a variant can exist
+    ahead of the storefront listing being wired up; `template` is required since rendering
+    always needs it."""
 
-    template = models.ForeignKey(MockupTemplate, on_delete=models.CASCADE, related_name="variants")
-    colour = models.CharField(max_length=120, blank=True)
+    product = models.ForeignKey(
+        "shop.Product",
+        on_delete=models.CASCADE,
+        related_name="variants",
+        null=True,
+        blank=True,
+    )
+    template = models.ForeignKey(MockupTemplate, on_delete=models.PROTECT, related_name="variants")
+    sku = models.CharField(max_length=64, blank=True)
+    name = models.CharField(max_length=255, blank=True, help_text="Display name for this variant, e.g. 'Midnight Black / M'.")
+    color_name = models.CharField(max_length=120, blank=True)
+    color_hex = models.CharField(max_length=7, blank=True, help_text="e.g. #1a1a1a")
     size = models.CharField(max_length=120, blank=True)
-    print_provider = models.CharField(max_length=120, blank=True)
+    external_provider = models.CharField(max_length=120, blank=True, help_text="Fulfilment provider name, e.g. Printify.")
+    external_variant_id = models.CharField(max_length=64, blank=True, help_text="Provider-side variant ID.")
     base_cost = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     retail_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    inventory = models.PositiveIntegerField(default=0)
     is_available = models.BooleanField(default=True)
-    printify_variant_id = models.CharField(max_length=64, blank=True)
     image = models.ImageField(upload_to="product-variants/", blank=True, null=True)
     supported_print_areas = models.JSONField(
         default=list,
@@ -186,27 +201,53 @@ class ProductVariant(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ("template", "colour", "size")
-        unique_together = (("template", "colour", "size"),)
+        ordering = ("template", "color_name", "size")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["template", "color_name", "size"],
+                name="unique_template_color_size",
+            ),
+        ]
 
     def __str__(self) -> str:
-        label = " / ".join(part for part in (self.colour, self.size) if part)
+        label = " / ".join(part for part in (self.color_name, self.size) if part)
         return f"{self.template.name} - {label}" if label else self.template.name
+
+    def clean(self):
+        from django.core.exceptions import ValidationError
+
+        if self.product_id and self.product.mockup_template_id and self.product.mockup_template_id != self.template_id:
+            raise ValidationError(
+                "This variant's template must match its product's configured mockup_template."
+            )
 
 
 class DesignProject(models.Model):
-    """A customer's saved, reopenable customization of a MockupTemplate."""
+    """A customer's saved, reopenable customization of a storefront Product / MockupTemplate.
+
+    Coordinate convention (see also DesignPlacement below): placement x/y/width/height are in
+    the same template-pixel space as MockupTemplate/MockupTemplatePart.config['placement']
+    (i.e. pixel offsets into the template's base image canvas). Crop left/top/width/height are
+    percentages (0-100) of the *source design image*, matching services._sanitize_crop_override.
+    Both conventions were already established by MockupRender.placement_override /
+    crop_override before this model existed, and are preserved here unchanged.
+    """
 
     class Status(models.TextChoices):
         DRAFT = "draft", "Draft"
-        SAVED = "saved", "Saved"
-        ORDERED = "ordered", "Ordered"
+        READY = "ready", "Ready"
         ARCHIVED = "archived", "Archived"
 
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="design_projects")
     name = models.CharField(max_length=255, blank=True)
-    template = models.ForeignKey(MockupTemplate, on_delete=models.PROTECT, related_name="design_projects")
-    selected_colour = models.CharField(max_length=120, blank=True)
+    product = models.ForeignKey(
+        "shop.Product",
+        on_delete=models.SET_NULL,
+        related_name="design_projects",
+        null=True,
+        blank=True,
+    )
+    mockup_template = models.ForeignKey(MockupTemplate, on_delete=models.PROTECT, related_name="design_projects")
     selected_variant = models.ForeignKey(
         ProductVariant,
         on_delete=models.SET_NULL,
@@ -214,61 +255,138 @@ class DesignProject(models.Model):
         null=True,
         blank=True,
     )
+    selected_color = models.CharField(max_length=120, blank=True, help_text="Snapshot of the chosen colour at save time.")
+    selected_size = models.CharField(max_length=120, blank=True, help_text="Snapshot of the chosen size at save time.")
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+
+    source_artwork = models.ForeignKey(
+        "gallery.Artwork",
+        on_delete=models.SET_NULL,
+        related_name="design_projects",
+        null=True,
+        blank=True,
+        help_text="The primary design this project started from, if any.",
+    )
+    source_generated_image = models.ForeignKey(
+        "generator.GeneratedImage",
+        on_delete=models.SET_NULL,
+        related_name="design_projects",
+        null=True,
+        blank=True,
+    )
+    source_image_url = models.TextField(blank=True)
+    source_prompt = models.TextField(blank=True)
+
     thumbnail = models.ImageField(upload_to="design-projects/thumbnails/", blank=True, null=True)
+    thumbnail_url = models.TextField(
+        blank=True,
+        help_text="URL of an already-rendered preview to use as the thumbnail. Never store base64 data here.",
+    )
+    metadata = models.JSONField(default=dict, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ("-updated_at",)
+        indexes = [
+            models.Index(fields=["user", "updated_at"], name="designproj_user_updated_idx"),
+            models.Index(fields=["user", "status"], name="designproj_user_status_idx"),
+            models.Index(fields=["product"], name="designproj_product_idx"),
+            models.Index(fields=["mockup_template"], name="designproj_template_idx"),
+        ]
 
     def __str__(self) -> str:
         return self.name or f"Design Project #{self.pk}"
 
+    def save(self, *args, **kwargs):
+        if not self.name:
+            product_label = self.mockup_template.get_product_type_display() if self.mockup_template_id else "Design"
+            self.name = f"Untitled {product_label} Design"
+        super().save(*args, **kwargs)
+
 
 class DesignPlacement(models.Model):
-    """A single print area's design placement within a DesignProject, stored independently per part."""
+    """A single print area's design placement within a DesignProject, stored independently
+    per part. See DesignProject's docstring for the placement/crop coordinate convention."""
+
+    class Fit(models.TextChoices):
+        CONTAIN = "contain", "Contain"
+        COVER = "cover", "Cover"
 
     design_project = models.ForeignKey(DesignProject, on_delete=models.CASCADE, related_name="placements")
-    product_part = models.CharField(
+    part_name = models.CharField(
         max_length=30,
         choices=MockupTemplatePart.PartName.choices,
         default=MockupTemplatePart.PartName.FRONT,
     )
-    artwork = models.ForeignKey(
+    template_part = models.ForeignKey(
+        MockupTemplatePart,
+        on_delete=models.SET_NULL,
+        related_name="design_placements",
+        null=True,
+        blank=True,
+        help_text="The exact template part this placement targets, when the template has parts configured.",
+    )
+
+    source_artwork = models.ForeignKey(
         "gallery.Artwork",
         on_delete=models.SET_NULL,
         related_name="design_placements",
         null=True,
         blank=True,
     )
-    generated_image = models.ForeignKey(
+    source_generated_image = models.ForeignKey(
         "generator.GeneratedImage",
         on_delete=models.SET_NULL,
         related_name="design_placements",
         null=True,
         blank=True,
     )
-    x_position = models.FloatField(default=0)
-    y_position = models.FloatField(default=0)
+    source_image_url = models.TextField(blank=True)
+    source_prompt = models.TextField(blank=True)
+
+    x = models.FloatField(default=0)
+    y = models.FloatField(default=0)
     width = models.FloatField(default=0)
     height = models.FloatField(default=0)
     rotation = models.FloatField(default=0)
     opacity = models.FloatField(default=1)
-    crop_data = models.JSONField(default=dict, blank=True)
     corner_radius = models.FloatField(default=0)
-    text_settings = models.JSONField(default=list, blank=True)
+    fit = models.CharField(max_length=10, choices=Fit.choices, default=Fit.CONTAIN)
+
+    crop_left = models.FloatField(default=0)
+    crop_top = models.FloatField(default=0)
+    crop_width = models.FloatField(default=100)
+    crop_height = models.FloatField(default=100)
+
+    text_elements = models.JSONField(default=list, blank=True)
+
+    preview_render = models.ForeignKey(
+        "generator.MockupRender",
+        on_delete=models.SET_NULL,
+        related_name="design_placements",
+        null=True,
+        blank=True,
+    )
     preview_url = models.TextField(blank=True)
     print_file_url = models.TextField(blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ("design_project", "product_part")
-        unique_together = (("design_project", "product_part"),)
+        ordering = ("design_project", "part_name")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["design_project", "part_name"],
+                name="unique_design_project_part",
+            ),
+        ]
 
     def __str__(self) -> str:
-        return f"{self.design_project} - {self.product_part}"
+        return f"{self.design_project} - {self.part_name}"
 
 
 class MockupRender(models.Model):
