@@ -1,6 +1,7 @@
-from django.contrib import admin
+from django.contrib import admin, messages
 
 from apps.generator.models import ProductVariant
+from apps.printify.services import PrintifyError, sync_product_variants_from_printify
 
 from .models import NotificationSubscription, Product, ProductCategory
 
@@ -35,6 +36,22 @@ class ProductAdmin(admin.ModelAdmin):
     prepopulated_fields = {"slug": ("name",)}
     search_fields = ("name",)
     inlines = [ShopProductVariantInline]
+    actions = ["sync_variants_from_printify"]
+
+    @admin.action(description="Sync variants from mapped Printify print provider")
+    def sync_variants_from_printify(self, request, queryset):
+        for product in queryset:
+            try:
+                summary = sync_product_variants_from_printify(product)
+            except PrintifyError as exc:
+                self.message_user(request, f"{product.name}: {exc}", level=messages.ERROR)
+                continue
+            self.message_user(
+                request,
+                f"{product.name}: {summary['created']} created, {summary['updated']} updated, "
+                f"{summary['marked_unavailable']} marked unavailable.",
+                level=messages.SUCCESS,
+            )
 
 
 @admin.register(NotificationSubscription)

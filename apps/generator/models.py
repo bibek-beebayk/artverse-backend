@@ -112,6 +112,14 @@ class MockupTemplate(models.Model):
     supported_file_formats = models.JSONField(
         default=list, blank=True, help_text="Accepted print-file formats, e.g. ['png', 'pdf']."
     )
+    selected_print_provider = models.ForeignKey(
+        "printify.PrintifyPrintProvider",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="mockup_templates",
+        help_text="Which synced Printify print provider fulfils this template's variants, if mapped.",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -153,6 +161,17 @@ class MockupTemplatePart(models.Model):
     )
     print_file_height = models.PositiveIntegerField(
         null=True, blank=True, help_text="Required print-file height in pixels at the target DPI."
+    )
+    printify_placeholder_position = models.CharField(
+        max_length=30,
+        blank=True,
+        help_text="Printify's placeholder position key for this print area (e.g. 'front', 'sleeve_left') "
+        "if it differs from `name` — Printify's naming doesn't always match ours 1:1. Falls back to `name` when blank.",
+    )
+    printify_placeholder_config = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Raw placeholder dimensions/config for this print area from the mapped Printify print provider's variant response.",
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

@@ -29,6 +29,12 @@ SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "artverse-dev-secret-key")
 DEBUG = os.getenv("DJANGO_DEBUG", "true").lower() == "true"
 MAINTENANCE_TOKEN_MAX_AGE = int(os.getenv("DJANGO_MAINTENANCE_TOKEN_MAX_AGE", "86400"))
 
+# Printify catalogue integration (Priority 3). Token/shop ID are secrets — never expose them to
+# the frontend; all Printify requests go through apps.printify.services on the backend only.
+PRINTIFY_API_TOKEN = os.getenv("PRINTIFY_API_TOKEN", "").strip()
+PRINTIFY_SHOP_ID = os.getenv("PRINTIFY_SHOP_ID", "").strip()
+PRINTIFY_API_BASE_URL = os.getenv("PRINTIFY_API_BASE_URL", "https://api.printify.com/v1").rstrip("/")
+
 ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", "127.0.0.1,localhost")
 
 CORS_ALLOWED_ORIGINS = env_list(
@@ -56,6 +62,7 @@ INSTALLED_APPS = [
     "apps.gallery",
     "apps.shop",
     "apps.generator",
+    "apps.printify",
 ]
 
 MIDDLEWARE = [

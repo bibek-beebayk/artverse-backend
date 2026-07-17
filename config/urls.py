@@ -13,6 +13,7 @@ urlpatterns = [
     path("api/gallery/", include("apps.gallery.urls")),
     path("api/shop/", include("apps.shop.urls")),
     path("api/generator/", include("apps.generator.urls")),
+    path("api/printify/", include("apps.printify.urls")),
 ]
 
 if settings.DEBUG:
