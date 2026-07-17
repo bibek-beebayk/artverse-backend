@@ -3,8 +3,9 @@ from io import BytesIO
 
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connection, transaction
 from django.test import TestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from PIL import Image
 from rest_framework import status
 from rest_framework.test import APITestCase
@@ -310,6 +311,41 @@ class DesignProjectDetailAndListPayloadTests(APITestCase):
         self.assertNotIn("placements", row)
         self.assertIn("placement_count", row)
         self.assertEqual(row["placement_count"], 2)
+
+    def test_list_endpoint_query_count_does_not_scale_with_project_count(self):
+        with CaptureQueriesContext(connection) as baseline:
+            response = self.client.get("/api/generator/design-projects/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        baseline_query_count = len(baseline.captured_queries)
+
+        for i in range(5):
+            create_response = self.client.post(
+                "/api/generator/design-projects/",
+                {
+                    "name": f"Extra {i}",
+                    "mockup_template_id": self.template.id,
+                    "placements": [
+                        {"part_name": "front", "placement_override": {"x": 1, "y": 2, "width": 3, "height": 4}},
+                        {"part_name": "back", "placement_override": {"x": 5, "y": 6, "width": 7, "height": 8}},
+                    ],
+                },
+                format="json",
+            )
+            self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
+
+        with CaptureQueriesContext(connection) as scaled:
+            response = self.client.get("/api/generator/design-projects/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 6)
+        scaled_query_count = len(scaled.captured_queries)
+
+        self.assertEqual(
+            baseline_query_count,
+            scaled_query_count,
+            "List endpoint issued more queries as project count grew (N+1 regression): "
+            f"{baseline_query_count} queries for 1 project vs {scaled_query_count} queries for 6 projects.",
+        )
 
 
 class DesignProjectUpdateTests(APITestCase):
@@ -754,6 +790,26 @@ class ProductVariantUniquenessTests(TestCase):
         # Should not raise — different product, same template/colour/size.
         make_variant(self.template, product=product_b, color_name="Black", size="M")
         self.assertEqual(ProductVariant.objects.filter(color_name="Black", size="M").count(), 2)
+
+    def test_same_template_colour_size_variants_remain_distinct_rows_per_product(self):
+        product_a = make_shop_product(self.template, slug="brand-e")
+        product_b = make_shop_product(self.template, slug="brand-f")
+        variant_a = make_variant(self.template, product=product_a, color_name="Black", size="M")
+        variant_b = make_variant(self.template, product=product_b, color_name="Black", size="M")
+
+        # Distinct primary keys — these are two separate rows, not a deduplicated single variant.
+        self.assertNotEqual(variant_a.id, variant_b.id)
+
+        # Each row remains correctly and exclusively associated with its own product.
+        refreshed_a = ProductVariant.objects.get(pk=variant_a.id)
+        refreshed_b = ProductVariant.objects.get(pk=variant_b.id)
+        self.assertEqual(refreshed_a.product_id, product_a.id)
+        self.assertEqual(refreshed_b.product_id, product_b.id)
+        self.assertNotEqual(refreshed_a.product_id, refreshed_b.product_id)
+
+        # Fetching by product scopes to exactly one variant each, never both.
+        self.assertEqual(list(ProductVariant.objects.filter(product=product_a).values_list("id", flat=True)), [variant_a.id])
+        self.assertEqual(list(ProductVariant.objects.filter(product=product_b).values_list("id", flat=True)), [variant_b.id])
 
     def test_same_product_cannot_have_duplicate_black_m(self):
         product = make_shop_product(self.template, slug="brand-c")
