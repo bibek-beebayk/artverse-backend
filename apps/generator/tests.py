@@ -1,5 +1,11 @@
+import tempfile
+from io import BytesIO
+
+from django.core.exceptions import ValidationError
+from django.core.files.base import ContentFile
 from django.db import IntegrityError, transaction
-from django.test import TestCase
+from django.test import TestCase, override_settings
+from PIL import Image
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -16,6 +22,12 @@ from .models import (
     MockupTemplatePart,
     ProductVariant,
 )
+
+
+def attach_image(field_file, filename="test.png"):
+    buffer = BytesIO()
+    Image.new("RGBA", (4, 4), (0, 0, 0, 0)).save(buffer, format="PNG")
+    field_file.save(filename, ContentFile(buffer.getvalue()), save=True)
 
 
 def make_template(slug="tshirt-test", with_parts=True, **overrides):
@@ -254,6 +266,52 @@ class DesignProjectNestedCreateTests(APITestCase):
         self.assertEqual(front.preview_url, "https://example.com/p.png")
 
 
+class DesignProjectDetailAndListPayloadTests(APITestCase):
+    def setUp(self):
+        self.user = make_user()
+        self.template = make_template()
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post(
+            "/api/generator/design-projects/",
+            {
+                "name": "Dragon Tee",
+                "mockup_template_id": self.template.id,
+                "placements": [
+                    {"part_name": "front", "placement_override": {"x": 1, "y": 2, "width": 3, "height": 4}},
+                    {"part_name": "back", "placement_override": {"x": 5, "y": 6, "width": 7, "height": 8}},
+                ],
+            },
+            format="json",
+        )
+        self.project_id = response.data["id"]
+
+    def test_detail_is_sufficient_to_reconstruct_all_parts(self):
+        response = self.client.get(f"/api/generator/design-projects/{self.project_id}/")
+        self.assertEqual(response.status_code, 200)
+        data = response.data
+
+        self.assertIn("mockup_template", data)
+        self.assertIn("parts", data["mockup_template"])
+        self.assertEqual(
+            {p["name"] for p in data["mockup_template"]["parts"]}, {"front", "back"}
+        )
+
+        self.assertEqual(len(data["placements"]), 2)
+        front = next(p for p in data["placements"] if p["part_name"] == "front")
+        self.assertEqual(front["placement_override"], {"x": 1, "y": 2, "width": 3, "height": 4, "rotation": 0, "opacity": 1, "corner_radius": 0, "fit": "contain"})
+        self.assertIn("crop_override", front)
+        self.assertIn("text_elements", front)
+        self.assertIn("template_part_id", front)
+
+    def test_list_does_not_serialize_full_placement_collection(self):
+        response = self.client.get("/api/generator/design-projects/")
+        self.assertEqual(response.status_code, 200)
+        row = next(r for r in response.data if r["id"] == self.project_id)
+        self.assertNotIn("placements", row)
+        self.assertIn("placement_count", row)
+        self.assertEqual(row["placement_count"], 2)
+
+
 class DesignProjectUpdateTests(APITestCase):
     def setUp(self):
         self.user = make_user()
@@ -314,6 +372,35 @@ class DesignProjectUpdateTests(APITestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(DesignProject.objects.get(pk=self.project_id).name, "Renamed")
+
+    def test_patch_name_only_does_not_remove_any_placement(self):
+        response = self.client.patch(
+            f"/api/generator/design-projects/{self.project_id}/", {"name": "Renamed Again"}, format="json"
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        project = DesignProject.objects.get(pk=self.project_id)
+        self.assertEqual(
+            set(project.placements.values_list("part_name", flat=True)), {"front", "back"}
+        )
+
+    def test_invalid_put_rolls_back_all_changes(self):
+        response = self.client.put(
+            f"/api/generator/design-projects/{self.project_id}/",
+            {
+                "name": "Should Not Apply",
+                "mockup_template_id": self.template.id,
+                "placements": [
+                    {"part_name": "front", "placement_override": {"x": 1, "y": 1, "width": 10, "height": 10, "opacity": 5}},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        project = DesignProject.objects.get(pk=self.project_id)
+        self.assertEqual(project.name, "Original")
+        self.assertEqual(
+            set(project.placements.values_list("part_name", flat=True)), {"front", "back"}
+        )
 
     def test_change_variant_updates_color_and_size_snapshot(self):
         product = make_shop_product(self.template, slug="variant-product")
@@ -575,3 +662,117 @@ class ProductAndVariantAPITests(APITestCase):
 
         response = self.client.get(f"/api/generator/product-variants/?template_id={self.template.id}")
         self.assertEqual([v["id"] for v in response.data], [variant.id])
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(prefix="artverse-test-media-"))
+class DesignProjectThumbnailTests(TestCase):
+    """Uses a temp MEDIA_ROOT: TestCase rolls back DB rows per test but not filesystem writes,
+    so image uploads here would otherwise leave stray files behind in the real media/ folder."""
+
+    def setUp(self):
+        self.user = make_user()
+        self.template = make_template()
+
+    def _project(self, **overrides):
+        return DesignProject.objects.create(user=self.user, mockup_template=self.template, **overrides)
+
+    def _resolved(self, project):
+        from .serializers import resolve_display_thumbnail_url
+
+        # Mirror the prefetch the list view applies, so this exercises the same code path.
+        project = DesignProject.objects.select_related("mockup_template").prefetch_related("placements").get(
+            pk=project.pk
+        )
+        return resolve_display_thumbnail_url(project)
+
+    def test_uploaded_thumbnail_wins_over_everything(self):
+        project = self._project(thumbnail_url="https://example.com/from-url.png")
+        attach_image(project.thumbnail)
+        DesignPlacement.objects.create(design_project=project, part_name="front", preview_url="https://example.com/front.png")
+        # Storage may suffix the filename to avoid a collision, so just check it's the
+        # uploaded-thumbnail path (design-projects/thumbnails/...), not the thumbnail_url or
+        # any placement preview.
+        self.assertIn("design-projects/thumbnails/", self._resolved(project))
+
+    def test_thumbnail_url_used_when_no_uploaded_thumbnail(self):
+        project = self._project(thumbnail_url="https://example.com/from-url.png")
+        DesignPlacement.objects.create(design_project=project, part_name="front", preview_url="https://example.com/front.png")
+        self.assertEqual(self._resolved(project), "https://example.com/from-url.png")
+
+    def test_front_placement_preview_used_next(self):
+        project = self._project()
+        DesignPlacement.objects.create(design_project=project, part_name="back", preview_url="https://example.com/back.png")
+        DesignPlacement.objects.create(design_project=project, part_name="front", preview_url="https://example.com/front.png")
+        self.assertEqual(self._resolved(project), "https://example.com/front.png")
+
+    def test_front_preferred_over_back_explicitly(self):
+        project = self._project()
+        DesignPlacement.objects.create(design_project=project, part_name="front", preview_url="https://example.com/front.png")
+        DesignPlacement.objects.create(design_project=project, part_name="back", preview_url="https://example.com/back.png")
+        self.assertEqual(self._resolved(project), "https://example.com/front.png")
+
+    def test_first_non_front_preview_used_when_front_has_none(self):
+        project = self._project()
+        DesignPlacement.objects.create(design_project=project, part_name="front", preview_url="")
+        DesignPlacement.objects.create(design_project=project, part_name="back", preview_url="https://example.com/back.png")
+        self.assertEqual(self._resolved(project), "https://example.com/back.png")
+
+    def test_template_base_image_used_when_no_previews(self):
+        attach_image(self.template.base_image, "template-base.png")
+        project = self._project()
+        DesignPlacement.objects.create(design_project=project, part_name="front", preview_url="")
+        self.assertIn("mockup-templates/base/", self._resolved(project))
+
+    def test_empty_when_nothing_available(self):
+        project = self._project()
+        DesignPlacement.objects.create(design_project=project, part_name="front", preview_url="")
+        self.assertEqual(self._resolved(project), "")
+
+    def test_list_endpoint_exposes_both_thumbnail_fields(self):
+        client_user = make_user("thumb_api_user")
+        project = DesignProject.objects.create(user=client_user, mockup_template=self.template, thumbnail_url="https://example.com/x.png")
+        from rest_framework.test import APIClient
+
+        client = APIClient()
+        client.force_authenticate(user=client_user)
+        response = client.get("/api/generator/design-projects/")
+        self.assertEqual(response.status_code, 200)
+        row = next(r for r in response.data if r["id"] == project.id)
+        self.assertIn("thumbnail_url", row)
+        self.assertIn("display_thumbnail_url", row)
+        self.assertEqual(row["display_thumbnail_url"], "https://example.com/x.png")
+
+
+class ProductVariantUniquenessTests(TestCase):
+    def setUp(self):
+        self.template = make_template()
+
+    def test_two_different_products_may_share_black_m_on_one_template(self):
+        product_a = make_shop_product(self.template, slug="brand-a")
+        product_b = make_shop_product(self.template, slug="brand-b")
+        make_variant(self.template, product=product_a, color_name="Black", size="M")
+        # Should not raise — different product, same template/colour/size.
+        make_variant(self.template, product=product_b, color_name="Black", size="M")
+        self.assertEqual(ProductVariant.objects.filter(color_name="Black", size="M").count(), 2)
+
+    def test_same_product_cannot_have_duplicate_black_m(self):
+        product = make_shop_product(self.template, slug="brand-c")
+        make_variant(self.template, product=product, color_name="Black", size="M")
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                make_variant(self.template, product=product, color_name="Black", size="M")
+
+    def test_template_only_variants_still_cannot_duplicate(self):
+        make_variant(self.template, product=None, color_name="Black", size="M")
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                make_variant(self.template, product=None, color_name="Black", size="M")
+
+    def test_product_template_mismatch_still_rejected_by_model_clean(self):
+        other_template = make_template(slug="other-template")
+        product = make_shop_product(self.template, slug="brand-d")
+        mismatched = ProductVariant(
+            template=other_template, product=product, color_name="Black", size="M", retail_price="19.99"
+        )
+        with self.assertRaises(ValidationError):
+            mismatched.full_clean()

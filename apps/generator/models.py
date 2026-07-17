@@ -203,9 +203,20 @@ class ProductVariant(models.Model):
     class Meta:
         ordering = ("template", "color_name", "size")
         constraints = [
+            # Two different storefront products may legitimately share one template (e.g. two
+            # brands both selling off the same "Starter T-Shirt" template) and each needs to be
+            # able to offer "Black / M" independently — so uniqueness for product-linked variants
+            # is scoped per-product, not just per-template. Variants with no product yet (created
+            # ahead of the storefront listing) fall back to the old template-only uniqueness.
+            models.UniqueConstraint(
+                fields=["product", "template", "color_name", "size"],
+                condition=models.Q(product__isnull=False),
+                name="unique_product_template_color_size",
+            ),
             models.UniqueConstraint(
                 fields=["template", "color_name", "size"],
-                name="unique_template_color_size",
+                condition=models.Q(product__isnull=True),
+                name="unique_template_color_size_without_product",
             ),
         ]
 

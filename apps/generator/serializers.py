@@ -136,6 +136,12 @@ class ProductVariantSerializer(serializers.ModelSerializer):
 
 
 class MockupTemplateSerializer(serializers.ModelSerializer):
+    """Note: deliberately does NOT embed `variants` — that used to return every variant for
+    every template regardless of which storefront product asked, which balloons payload size
+    for templates shared across many products. Fetch variants for a specific product/template
+    via GET /api/generator/product-variants/?product_id=&template_id= instead (see
+    ProductVariantListView), or shop.ProductSerializer.variants for a specific product."""
+
     base_image = serializers.SerializerMethodField()
     mask_image = serializers.SerializerMethodField()
     displacement_map = serializers.SerializerMethodField()
@@ -143,7 +149,6 @@ class MockupTemplateSerializer(serializers.ModelSerializer):
     highlight_layer = serializers.SerializerMethodField()
     product_type_display = serializers.CharField(source="get_product_type_display", read_only=True)
     parts = MockupTemplatePartSerializer(many=True, read_only=True)
-    variants = ProductVariantSerializer(many=True, read_only=True)
 
     class Meta:
         model = MockupTemplate
@@ -168,7 +173,6 @@ class MockupTemplateSerializer(serializers.ModelSerializer):
             "canvas_height",
             "supported_file_formats",
             "parts",
-            "variants",
             "updated_at",
         )
 
@@ -429,6 +433,43 @@ def _placement_write_data_to_model_fields(item: dict) -> dict:
     }
 
 
+def resolve_display_thumbnail_url(project: "DesignProject") -> str:
+    """The one authoritative thumbnail for a design project, in fallback order:
+    1. uploaded project thumbnail, 2. project.thumbnail_url, 3. the 'front' placement's
+    preview_url, 4. the first placement (in any order) with a preview_url, 5. the mockup
+    template's base image, 6. empty string (frontend shows a neutral placeholder).
+
+    Expects `project.placements.all()` to already be prefetched by the caller — this walks
+    the prefetched list in Python rather than issuing new queries.
+    """
+    if project.thumbnail:
+        try:
+            return project.thumbnail.url
+        except Exception:
+            pass
+
+    if project.thumbnail_url:
+        return project.thumbnail_url
+
+    placements = list(project.placements.all())
+
+    front = next((p for p in placements if p.part_name == "front" and p.preview_url), None)
+    if front:
+        return front.preview_url
+
+    first_with_preview = next((p for p in placements if p.preview_url), None)
+    if first_with_preview:
+        return first_with_preview.preview_url
+
+    if project.mockup_template_id and project.mockup_template.base_image:
+        try:
+            return project.mockup_template.base_image.url
+        except Exception:
+            pass
+
+    return ""
+
+
 class DesignProjectListSerializer(serializers.ModelSerializer):
     """Lightweight summary for the list endpoint — no nested placements."""
 
@@ -436,6 +477,7 @@ class DesignProjectListSerializer(serializers.ModelSerializer):
     template = serializers.SerializerMethodField()
     selected_variant = ProductVariantSerializer(read_only=True)
     thumbnail_url = serializers.SerializerMethodField()
+    display_thumbnail_url = serializers.SerializerMethodField()
     placement_count = serializers.SerializerMethodField()
 
     class Meta:
@@ -450,6 +492,7 @@ class DesignProjectListSerializer(serializers.ModelSerializer):
             "selected_color",
             "selected_size",
             "thumbnail_url",
+            "display_thumbnail_url",
             "placement_count",
             "created_at",
             "updated_at",
@@ -475,6 +518,9 @@ class DesignProjectListSerializer(serializers.ModelSerializer):
             except Exception:
                 pass
         return obj.thumbnail_url or None
+
+    def get_display_thumbnail_url(self, obj: DesignProject):
+        return resolve_display_thumbnail_url(obj)
 
 
 class DesignProjectSerializer(serializers.ModelSerializer):

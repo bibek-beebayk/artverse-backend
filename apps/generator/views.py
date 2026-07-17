@@ -321,6 +321,12 @@ class DesignProjectListCreateView(APIView):
             DesignProject.objects.filter(user=request.user)
             .select_related("product", "mockup_template", "selected_variant")
             .annotate(placement_count_annotated=Count("placements", distinct=True))
+            .prefetch_related(
+                Prefetch(
+                    "placements",
+                    queryset=DesignPlacement.objects.only("id", "design_project_id", "part_name", "preview_url"),
+                )
+            )
         )
 
         status_filter = request.query_params.get("status")
