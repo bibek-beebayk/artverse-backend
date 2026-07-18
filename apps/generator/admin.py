@@ -82,6 +82,22 @@ class MockupTemplateAdminForm(forms.ModelForm):
                 "Use the visual placement editor below to drag and resize the print area. "
                 "The JSON stays available for advanced tuning."
             )
+        if "selected_print_provider" in self.fields:
+            from apps.printify.models import PrintifyPrintProvider
+
+            # Narrow the dropdown to providers of blueprint(s) actually mapped to this template
+            # — server-side validation (MockupTemplate.clean()) is still the real enforcement,
+            # this is just so the UI doesn't offer an obviously-wrong choice in the first place.
+            if self.instance.pk:
+                self.fields["selected_print_provider"].queryset = PrintifyPrintProvider.objects.filter(
+                    blueprint__mockup_template=self.instance
+                )
+            else:
+                self.fields["selected_print_provider"].queryset = PrintifyPrintProvider.objects.none()
+            self.fields["selected_print_provider"].help_text = (
+                "Only providers belonging to a Printify blueprint mapped to this template are listed. "
+                "Map a blueprint (Printify → Blueprints) first if this list is empty."
+            )
 
 
 class MockupTemplatePartForm(forms.ModelForm):
@@ -211,6 +227,7 @@ class MockupTemplateAdmin(admin.ModelAdmin):
         "canvas_width",
         "canvas_height",
         "supported_file_formats",
+        "selected_print_provider",
     )
 
 

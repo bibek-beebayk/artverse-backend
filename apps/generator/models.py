@@ -129,6 +129,18 @@ class MockupTemplate(models.Model):
     def __str__(self) -> str:
         return f"{self.name} ({self.get_product_type_display()})"
 
+    def clean(self):
+        super().clean()
+        if self.selected_print_provider_id:
+            from django.core.exceptions import ValidationError
+
+            from apps.printify.validation import validate_provider_matches_template_blueprint
+
+            try:
+                validate_provider_matches_template_blueprint(self.pk, self.selected_print_provider)
+            except ValueError as exc:
+                raise ValidationError({"selected_print_provider": str(exc)}) from exc
+
 
 class MockupTemplatePart(models.Model):
     class PartName(models.TextChoices):
@@ -182,6 +194,20 @@ class MockupTemplatePart(models.Model):
 
     def __str__(self) -> str:
         return f"{self.template.name} - {self.get_name_display()}"
+
+    def clean(self):
+        super().clean()
+        # Blank is always allowed — it means this part isn't mapped to a Printify placeholder
+        # yet, not that it's invalid. Only validate an explicit, non-blank override.
+        if self.printify_placeholder_position and self.template_id:
+            from django.core.exceptions import ValidationError
+
+            from apps.printify.validation import validate_placeholder_position
+
+            try:
+                validate_placeholder_position(self.printify_placeholder_position, self.template.selected_print_provider)
+            except ValueError as exc:
+                raise ValidationError({"printify_placeholder_position": str(exc)}) from exc
 
 
 class ProductVariant(models.Model):

@@ -37,6 +37,13 @@ class PrintifyBlueprintListSerializer(serializers.ModelSerializer):
         return obj.mockup_template_id is not None
 
     def get_provider_count(self, obj: PrintifyBlueprint) -> int:
+        # Views annotate `provider_count_value` via Count("print_providers") so the list/detail
+        # endpoints don't issue one COUNT query per row. Fall back to a direct query only when
+        # this serializer is used against a non-annotated object (e.g. PrintifyBlueprintMapView,
+        # which fetches a single blueprint by pk without annotating it).
+        annotated = getattr(obj, "provider_count_value", None)
+        if annotated is not None:
+            return annotated
         return obj.print_providers.count()
 
 

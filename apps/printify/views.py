@@ -1,3 +1,4 @@
+from django.db.models import Count
 from rest_framework import status
 from rest_framework.generics import ListAPIView, RetrieveAPIView
 from rest_framework.permissions import IsAdminUser
@@ -11,24 +12,46 @@ from .serializers import (
     PrintifyBlueprintMapSerializer,
     PrintifySyncRunSerializer,
 )
-from .services import is_printify_configured, sync_blueprints, sync_print_providers_for_blueprint
+from .services import PrintifyError, is_printify_configured, sync_blueprints, sync_print_providers_for_blueprint, validate_configured_shop
 
 
 class PrintifyConnectionStatusView(APIView):
-    """Admin-only: is Printify configured, and what happened during the last sync? This is the
-    "connection status" the roadmap asks for — the actual credentials live only in env vars."""
+    """Admin-only: is Printify configured, and is it *actually* reachable right now? A token
+    string being present in settings isn't the same as a working connection — this performs a
+    real (but cheap, single-request) shop lookup so "connected" reflects reality, not just
+    "someone typed a token in once". Always 200 — a disconnected integration is a normal admin-
+    UI state to display, not a server error."""
 
     permission_classes = [IsAdminUser]
 
     def get(self, request):
         last_run = PrintifySyncRun.objects.order_by("-started_at").first()
+
+        configured = is_printify_configured()
+        connected = False
+        shop = None
+        error = None
+
+        if not is_printify_configured():
+            error = "PRINTIFY_API_TOKEN is not configured (or PRINTIFY_ENABLED is false)."
+        else:
+            try:
+                shop = validate_configured_shop()
+                connected = True
+            except PrintifyError as exc:
+                error = str(exc)
+
         return Response(
             {
-                "is_configured": is_printify_configured(),
+                "configured": configured,
+                "connected": connected,
+                "shop": shop,
+                "error": error,
                 "blueprint_count": PrintifyBlueprint.objects.count(),
                 "mapped_blueprint_count": PrintifyBlueprint.objects.filter(mockup_template__isnull=False).count(),
                 "last_sync_run": PrintifySyncRunSerializer(last_run).data if last_run else None,
-            }
+            },
+            status=status.HTTP_200_OK,
         )
 
 
@@ -37,7 +60,7 @@ class PrintifyBlueprintListView(ListAPIView):
     permission_classes = [IsAdminUser]
 
     def get_queryset(self):
-        queryset = PrintifyBlueprint.objects.all()
+        queryset = PrintifyBlueprint.objects.annotate(provider_count_value=Count("print_providers", distinct=True))
         is_mapped = self.request.query_params.get("is_mapped")
         if is_mapped == "true":
             queryset = queryset.filter(mockup_template__isnull=False)
@@ -47,7 +70,9 @@ class PrintifyBlueprintListView(ListAPIView):
 
 
 class PrintifyBlueprintDetailView(RetrieveAPIView):
-    queryset = PrintifyBlueprint.objects.prefetch_related("print_providers")
+    queryset = PrintifyBlueprint.objects.prefetch_related("print_providers").annotate(
+        provider_count_value=Count("print_providers", distinct=True)
+    )
     serializer_class = PrintifyBlueprintDetailSerializer
     permission_classes = [IsAdminUser]
 

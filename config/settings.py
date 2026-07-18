@@ -30,10 +30,16 @@ DEBUG = os.getenv("DJANGO_DEBUG", "true").lower() == "true"
 MAINTENANCE_TOKEN_MAX_AGE = int(os.getenv("DJANGO_MAINTENANCE_TOKEN_MAX_AGE", "86400"))
 
 # Printify catalogue integration (Priority 3). Token/shop ID are secrets — never expose them to
-# the frontend; all Printify requests go through apps.printify.services on the backend only.
+# the frontend, never surface them in Django admin; all Printify requests go through
+# apps.printify.services on the backend only.
 PRINTIFY_API_TOKEN = os.getenv("PRINTIFY_API_TOKEN", "").strip()
 PRINTIFY_SHOP_ID = os.getenv("PRINTIFY_SHOP_ID", "").strip()
 PRINTIFY_API_BASE_URL = os.getenv("PRINTIFY_API_BASE_URL", "https://api.printify.com/v1").rstrip("/")
+PRINTIFY_USER_AGENT = os.getenv("PRINTIFY_USER_AGENT", "Artverse/1.0")
+PRINTIFY_REQUEST_TIMEOUT = int(os.getenv("PRINTIFY_REQUEST_TIMEOUT", "30"))
+# Explicit kill switch, independent of whether a token happens to be set — lets an operator
+# disable the integration (e.g. during an incident) without removing credentials from .env.
+PRINTIFY_ENABLED = env_bool("PRINTIFY_ENABLED", False)
 
 ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", "127.0.0.1,localhost")
 

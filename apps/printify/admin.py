@@ -49,7 +49,8 @@ class PrintifyBlueprintAdmin(admin.ModelAdmin):
             if run.status == PrintifySyncRun.Status.SUCCESS:
                 self.message_user(
                     request,
-                    f"{blueprint.title}: synced {run.providers_synced} provider(s), {run.variants_synced} variant(s).",
+                    f"{blueprint.title}: {run.providers_created} created, {run.providers_updated} updated "
+                    f"({run.providers_synced} provider(s), {run.variants_synced} variant(s)).",
                     level=messages.SUCCESS,
                 )
             else:

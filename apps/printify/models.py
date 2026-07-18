@@ -89,7 +89,11 @@ class PrintifySyncRun(models.Model):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="printify_sync_runs"
     )
     blueprints_synced = models.PositiveIntegerField(default=0)
+    blueprints_created = models.PositiveIntegerField(default=0)
+    blueprints_updated = models.PositiveIntegerField(default=0)
     providers_synced = models.PositiveIntegerField(default=0)
+    providers_created = models.PositiveIntegerField(default=0)
+    providers_updated = models.PositiveIntegerField(default=0)
     variants_synced = models.PositiveIntegerField(default=0)
     error_message = models.TextField(blank=True)
     started_at = models.DateTimeField(auto_now_add=True)

@@ -1,5 +1,9 @@
+from io import StringIO
 from unittest.mock import Mock, patch
 
+from django.core.exceptions import ValidationError
+from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.test import TestCase, override_settings
 from rest_framework import status
 from rest_framework.test import APITestCase
@@ -13,11 +17,20 @@ from .services import (
     PrintifyAPIError,
     PrintifyClient,
     PrintifyNotConfiguredError,
+    PrintifyResponseError,
+    PrintifyShopNotFoundError,
     fetch_print_provider_location,
     fetch_print_provider_variants,
+    fetch_shops,
     sync_blueprints,
     sync_print_providers_for_blueprint,
     sync_product_variants_from_printify,
+    validate_configured_shop,
+)
+from .validation import (
+    get_provider_placeholder_positions,
+    validate_placeholder_position,
+    validate_provider_matches_template_blueprint,
 )
 
 
@@ -53,7 +66,7 @@ def mock_response(status_code=200, json_data=None, headers=None):
     return response
 
 
-@override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345")
+@override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345", PRINTIFY_ENABLED=True)
 class PrintifyClientTests(TestCase):
     def test_missing_token_raises_not_configured(self):
         with self.assertRaises(PrintifyNotConfiguredError):
@@ -94,7 +107,7 @@ class PrintifyClientTests(TestCase):
         self.assertEqual(mock_request.call_count, 3)
 
 
-@override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345")
+@override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345", PRINTIFY_ENABLED=True)
 class FetchHelpersTests(TestCase):
     """Printify's real catalogue API has no boolean "in stock" field on a variant — availability
     is expressed purely by whether the variant is present at all when `show-out-of-stock` is
@@ -141,7 +154,7 @@ class FetchHelpersTests(TestCase):
         self.assertIn("/catalog/print_providers/402.json", called_url)
 
 
-@override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345")
+@override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345", PRINTIFY_ENABLED=True)
 class SyncBlueprintsTests(TestCase):
     @patch("apps.printify.services.fetch_blueprints")
     def test_sync_blueprints_creates_rows(self, mock_fetch):
@@ -185,7 +198,7 @@ class SyncBlueprintsTests(TestCase):
         self.assertEqual(PrintifyBlueprint.objects.count(), 0)
 
 
-@override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345")
+@override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345", PRINTIFY_ENABLED=True)
 class SyncPrintProvidersTests(TestCase):
     def setUp(self):
         self.blueprint = PrintifyBlueprint.objects.create(blueprint_id=1, title="Unisex Tee")
@@ -282,8 +295,32 @@ class ProductVariantSyncTests(TestCase):
         self.assertEqual(new_variant.external_variant_id, "101")
         self.assertTrue(new_variant.is_available)
 
+    def test_sync_preserves_manually_configured_retail_price(self):
+        # Pricing is treated as local, admin-owned data — Printify's catalogue doesn't return
+        # retail-ready cost data, so the sync must never overwrite what an admin already set.
+        existing_match = ProductVariant.objects.create(
+            product=self.product,
+            template=self.template,
+            color_name="Black",
+            size="M",
+            retail_price="49.99",
+            base_cost="12.00",
+        )
+        sync_product_variants_from_printify(self.product)
+        existing_match.refresh_from_db()
+        self.assertEqual(str(existing_match.retail_price), "49.99")
+        self.assertEqual(str(existing_match.base_cost), "12.00")
+        # Non-pricing fields still update normally.
+        self.assertEqual(existing_match.external_variant_id, "100")
 
-@override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345")
+    def test_sync_does_not_invent_a_price_for_newly_created_variants(self):
+        sync_product_variants_from_printify(self.product)
+        new_variant = ProductVariant.objects.get(product=self.product, color_name="Black", size="M")
+        self.assertIsNone(new_variant.retail_price)
+        self.assertIsNone(new_variant.base_cost)
+
+
+@override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345", PRINTIFY_ENABLED=True)
 class PrintifyAdminAPITests(APITestCase):
     def setUp(self):
         self.staff = make_user("staff", is_staff=True)
@@ -298,16 +335,59 @@ class PrintifyAdminAPITests(APITestCase):
         response = self.client.get("/api/printify/status/")
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
+    @patch("apps.printify.services.fetch_shops")
+    def test_status_endpoint_connected(self, mock_fetch_shops):
+        mock_fetch_shops.return_value = [{"id": 12345, "title": "Test Shop", "sales_channel": "disconnected"}]
         self.client.force_authenticate(user=self.staff)
         response = self.client.get("/api/printify/status/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertTrue(response.data["is_configured"])
+        self.assertTrue(response.data["configured"])
+        self.assertTrue(response.data["connected"])
+        self.assertEqual(response.data["shop"], {"id": 12345, "title": "Test Shop", "sales_channel": "disconnected"})
+        self.assertIsNone(response.data["error"])
         self.assertEqual(response.data["blueprint_count"], 1)
 
     def test_blueprint_list_requires_admin(self):
         self.client.force_authenticate(user=self.regular)
         response = self.client.get("/api/printify/blueprints/")
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_blueprint_list_provider_count_query_does_not_scale_with_blueprint_count(self):
+        # provider_count is served from an annotation (Count("print_providers")), not a
+        # per-row obj.print_providers.count() call — query count must stay flat as rows grow.
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        for i in range(3):
+            blueprint = PrintifyBlueprint.objects.create(blueprint_id=100 + i, title=f"Extra {i}")
+            PrintifyPrintProvider.objects.create(blueprint=blueprint, provider_id=200 + i, title="Provider")
+
+        self.client.force_authenticate(user=self.staff)
+
+        with CaptureQueriesContext(connection) as baseline:
+            response = self.client.get("/api/printify/blueprints/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 4)  # self.blueprint (setUp) + 3 just created
+        baseline_count = len(baseline.captured_queries)
+
+        for i in range(3, 8):
+            blueprint = PrintifyBlueprint.objects.create(blueprint_id=100 + i, title=f"Extra {i}")
+            PrintifyPrintProvider.objects.create(blueprint=blueprint, provider_id=200 + i, title="Provider")
+
+        with CaptureQueriesContext(connection) as scaled:
+            response = self.client.get("/api/printify/blueprints/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 9)
+        scaled_count = len(scaled.captured_queries)
+
+        self.assertEqual(
+            baseline_count,
+            scaled_count,
+            f"Blueprint list query count grew with row count (N+1): {baseline_count} vs {scaled_count}.",
+        )
+        # Sanity check the annotation actually drives the value, not a coincidental match.
+        extra_row = next(r for r in response.data if r["blueprint_id"] == 107)
+        self.assertEqual(extra_row["provider_count"], 1)
 
     def test_map_and_unmap_blueprint_to_template(self):
         template = make_template()
@@ -334,6 +414,39 @@ class PrintifyAdminAPITests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    @override_settings(PRINTIFY_API_TOKEN="", PRINTIFY_ENABLED=True)
+    def test_status_endpoint_missing_configuration(self):
+        self.client.force_authenticate(user=self.staff)
+        response = self.client.get("/api/printify/status/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["configured"])
+        self.assertFalse(response.data["connected"])
+        self.assertIsNone(response.data["shop"])
+        self.assertIn("PRINTIFY_API_TOKEN", response.data["error"])
+
+    @patch("apps.printify.services.fetch_shops")
+    def test_status_endpoint_invalid_integration(self, mock_fetch_shops):
+        mock_fetch_shops.side_effect = PrintifyAPIError("Printify API returned 401", status_code=401)
+        self.client.force_authenticate(user=self.staff)
+        response = self.client.get("/api/printify/status/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data["configured"])
+        self.assertFalse(response.data["connected"])
+        self.assertIsNone(response.data["shop"])
+        self.assertIsNotNone(response.data["error"])
+
+    @patch("apps.printify.services.fetch_shops")
+    def test_status_endpoint_stable_shape_and_no_token_exposure(self, mock_fetch_shops):
+        mock_fetch_shops.return_value = [{"id": 12345, "title": "Test Shop", "sales_channel": "disconnected"}]
+        self.client.force_authenticate(user=self.staff)
+        response = self.client.get("/api/printify/status/")
+        self.assertEqual(
+            set(response.data.keys()),
+            {"configured", "connected", "shop", "error", "blueprint_count", "mapped_blueprint_count", "last_sync_run"},
+        )
+        self.assertNotIn("test-token", str(response.data))
+        self.assertNotIn("Authorization", str(response.data))
+
     @patch("apps.printify.services.fetch_blueprints")
     def test_sync_blueprints_endpoint(self, mock_fetch):
         mock_fetch.return_value = [{"id": 2, "title": "New Blueprint", "brand": "", "model": "", "images": []}]
@@ -342,3 +455,468 @@ class PrintifyAdminAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertEqual(response.data["status"], "success")
         self.assertTrue(PrintifyBlueprint.objects.filter(blueprint_id=2).exists())
+
+
+@override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345", PRINTIFY_ENABLED=True)
+class FetchShopsTests(TestCase):
+    @patch("requests.Session.request")
+    def test_successful_list_response(self, mock_request):
+        mock_request.return_value = mock_response(200, [{"id": 1, "title": "Shop A"}])
+        client = PrintifyClient()
+        shops = fetch_shops(client)
+        self.assertEqual(shops, [{"id": 1, "title": "Shop A"}])
+
+    @patch("requests.Session.request")
+    def test_unexpected_non_list_response_raises(self, mock_request):
+        mock_request.return_value = mock_response(200, {"error": "not a list"})
+        client = PrintifyClient()
+        with self.assertRaises(PrintifyResponseError):
+            fetch_shops(client)
+
+    @patch("requests.Session.request")
+    def test_empty_shop_list(self, mock_request):
+        mock_request.return_value = mock_response(200, [])
+        client = PrintifyClient()
+        self.assertEqual(fetch_shops(client), [])
+
+    @patch("requests.Session.request")
+    def test_api_error_propagates(self, mock_request):
+        mock_request.return_value = mock_response(401, {"error": "invalid token"})
+        client = PrintifyClient()
+        with self.assertRaises(PrintifyAPIError) as ctx:
+            fetch_shops(client)
+        self.assertEqual(ctx.exception.status_code, 401)
+
+    @patch("time.sleep", return_value=None)
+    @patch("requests.Session.request")
+    def test_network_timeout_propagates_as_api_error(self, mock_request, mock_sleep):
+        import requests as requests_module
+
+        mock_request.side_effect = requests_module.exceptions.Timeout("timed out")
+        client = PrintifyClient()
+        with self.assertRaises(PrintifyAPIError):
+            fetch_shops(client)
+
+
+@override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345", PRINTIFY_ENABLED=True)
+class ValidateConfiguredShopTests(TestCase):
+    @patch("apps.printify.services.fetch_shops")
+    def test_configured_shop_found_integer_id(self, mock_fetch):
+        mock_fetch.return_value = [{"id": 12345, "title": "Artverse API Store", "sales_channel": "disconnected"}]
+        shop = validate_configured_shop()
+        self.assertEqual(shop, {"id": 12345, "title": "Artverse API Store", "sales_channel": "disconnected"})
+
+    @patch("apps.printify.services.fetch_shops")
+    def test_configured_shop_found_string_id(self, mock_fetch):
+        # PRINTIFY_SHOP_ID is "12345" (a string, as all env vars are); Printify's real API
+        # returns numeric IDs — this proves the string/int normalization actually matches.
+        mock_fetch.return_value = [{"id": "12345", "title": "Artverse API Store", "sales_channel": ""}]
+        shop = validate_configured_shop()
+        self.assertEqual(shop["id"], "12345")
+
+    @patch("apps.printify.services.fetch_shops")
+    def test_configured_shop_not_found(self, mock_fetch):
+        mock_fetch.return_value = [{"id": 99999, "title": "Someone Else's Shop", "sales_channel": ""}]
+        with self.assertRaises(PrintifyShopNotFoundError):
+            validate_configured_shop()
+
+    @override_settings(PRINTIFY_SHOP_ID="")
+    def test_missing_shop_id_raises_not_configured(self):
+        with self.assertRaises(PrintifyNotConfiguredError) as ctx:
+            validate_configured_shop()
+        self.assertIn("PRINTIFY_SHOP_ID", str(ctx.exception))
+
+    @override_settings(PRINTIFY_API_TOKEN="")
+    def test_missing_token_raises_not_configured(self):
+        with self.assertRaises(PrintifyNotConfiguredError) as ctx:
+            validate_configured_shop()
+        self.assertIn("PRINTIFY_API_TOKEN", str(ctx.exception))
+
+    @patch("apps.printify.services.fetch_shops")
+    def test_invalid_credentials_propagates(self, mock_fetch):
+        mock_fetch.side_effect = PrintifyAPIError("Printify API returned 401", status_code=401)
+        with self.assertRaises(PrintifyAPIError):
+            validate_configured_shop()
+
+    @patch("apps.printify.services.fetch_shops")
+    def test_inaccessible_shop_is_shop_not_found(self, mock_fetch):
+        # A token that's valid but can't see the configured shop looks the same to us as a
+        # shop that doesn't exist — Printify's shops.json only ever lists what the token can see.
+        mock_fetch.return_value = []
+        with self.assertRaises(PrintifyShopNotFoundError):
+            validate_configured_shop()
+
+
+@override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345", PRINTIFY_ENABLED=True)
+class PrintifyTestConnectionCommandTests(TestCase):
+    @patch("apps.printify.services.fetch_shops")
+    def test_successful_output(self, mock_fetch):
+        mock_fetch.return_value = [{"id": 12345, "title": "Artverse API Store", "sales_channel": "disconnected"}]
+        out = StringIO()
+        call_command("printify_test_connection", stdout=out)
+        output = out.getvalue()
+        self.assertIn("Printify connection successful.", output)
+        self.assertIn("Artverse API Store", output)
+        self.assertIn("12345", output)
+        self.assertIn("disconnected", output)
+        self.assertNotIn("test-token", output)
+
+    @override_settings(PRINTIFY_API_TOKEN="")
+    def test_missing_configuration_raises_command_error(self):
+        with self.assertRaises(CommandError) as ctx:
+            call_command("printify_test_connection", stdout=StringIO())
+        self.assertIn("PRINTIFY_API_TOKEN", str(ctx.exception))
+
+    @patch("apps.printify.services.fetch_shops")
+    def test_invalid_token_raises_command_error(self, mock_fetch):
+        mock_fetch.side_effect = PrintifyAPIError("Printify API returned 401", status_code=401)
+        with self.assertRaises(CommandError):
+            call_command("printify_test_connection", stdout=StringIO())
+
+    @patch("apps.printify.services.fetch_shops")
+    def test_shop_not_found_raises_command_error(self, mock_fetch):
+        mock_fetch.return_value = [{"id": 1, "title": "Other Shop"}]
+        with self.assertRaises(CommandError) as ctx:
+            call_command("printify_test_connection", stdout=StringIO())
+        self.assertIn("12345", str(ctx.exception))
+
+    @patch("apps.printify.services.fetch_shops")
+    def test_token_never_appears_in_output_even_on_success(self, mock_fetch):
+        mock_fetch.return_value = [{"id": 12345, "title": "Store", "sales_channel": ""}]
+        out = StringIO()
+        call_command("printify_test_connection", stdout=out)
+        self.assertNotIn("test-token", out.getvalue())
+        self.assertNotIn("Bearer", out.getvalue())
+
+
+class ProviderBlueprintConsistencyTests(TestCase):
+    def setUp(self):
+        self.template = make_template()
+        self.blueprint = PrintifyBlueprint.objects.create(
+            blueprint_id=1, title="Unisex Tee", mockup_template=self.template
+        )
+        self.matching_provider = PrintifyPrintProvider.objects.create(
+            blueprint=self.blueprint, provider_id=10, title="Matching Provider"
+        )
+        self.other_blueprint = PrintifyBlueprint.objects.create(blueprint_id=2, title="Hoodie")
+        self.mismatched_provider = PrintifyPrintProvider.objects.create(
+            blueprint=self.other_blueprint, provider_id=20, title="Mismatched Provider"
+        )
+
+    def test_template_can_select_provider_from_mapped_blueprint(self):
+        self.template.selected_print_provider = self.matching_provider
+        self.template.full_clean()  # should not raise
+
+    def test_template_cannot_select_provider_from_another_blueprint(self):
+        self.template.selected_print_provider = self.mismatched_provider
+        with self.assertRaises(ValidationError) as ctx:
+            self.template.full_clean()
+        self.assertIn("selected_print_provider", ctx.exception.message_dict)
+
+    def test_no_constraint_when_template_has_no_mapped_blueprint(self):
+        unmapped_template = make_template(slug="unmapped-template")
+        unmapped_template.selected_print_provider = self.mismatched_provider
+        unmapped_template.full_clean()  # no mapped blueprint yet — nothing to validate against
+
+    def test_validate_provider_matches_template_blueprint_helper_directly(self):
+        validate_provider_matches_template_blueprint(self.template.pk, self.matching_provider)
+        with self.assertRaises(ValueError):
+            validate_provider_matches_template_blueprint(self.template.pk, self.mismatched_provider)
+
+    def test_local_variant_sync_rejects_mismatched_provider(self):
+        # Force an inconsistent state the way a bulk update or fixture load could, bypassing
+        # model.clean() entirely — the sync service must catch this independently.
+        self.template.selected_print_provider = self.mismatched_provider
+        self.template.save(update_fields=["selected_print_provider"])
+        product = make_shop_product(self.template, slug="mismatched-product")
+        with self.assertRaises(Exception):
+            sync_product_variants_from_printify(product)
+
+    def test_changing_blueprint_invalidates_unrelated_selected_provider(self):
+        self.template.selected_print_provider = self.matching_provider
+        self.template.full_clean()
+        self.template.save()
+
+        # Re-map the template to a different blueprint — the previously-valid provider now
+        # belongs to a blueprint that's no longer mapped here.
+        self.blueprint.mockup_template = None
+        self.blueprint.save(update_fields=["mockup_template"])
+        self.other_blueprint.mockup_template = self.template
+        self.other_blueprint.save(update_fields=["mockup_template"])
+
+        self.template.refresh_from_db()
+        # selected_print_provider (matching_provider, blueprint 1) is now inconsistent with the
+        # newly-mapped blueprint (blueprint 2) — full_clean() must reveal this.
+        with self.assertRaises(ValidationError):
+            self.template.full_clean()
+
+    def test_admin_form_rejects_inconsistent_provider_mapping(self):
+        from apps.generator.admin import MockupTemplateAdminForm
+
+        form = MockupTemplateAdminForm(
+            data={
+                "name": self.template.name,
+                "slug": self.template.slug,
+                "product_type": self.template.product_type,
+                "description": "",
+                "is_active": True,
+                "template_version": 1,
+                "config": "{}",
+                "supported_colors": "[]",
+                "supported_sizes": "[]",
+                "supported_file_formats": "[]",
+                "selected_print_provider": self.mismatched_provider.pk,
+            },
+            instance=self.template,
+        )
+        # The form's own queryset filtering already excludes the mismatched provider, so this
+        # should fail as an invalid choice (not a silent pass) — proving the dropdown is scoped,
+        # not just decorative.
+        self.assertFalse(form.is_valid())
+        self.assertIn("selected_print_provider", form.errors)
+
+    def test_valid_selected_provider_survives_catalogue_resync(self):
+        self.template.selected_print_provider = self.matching_provider
+        self.template.full_clean()
+        self.template.save()
+
+        with patch("apps.printify.services.fetch_print_providers") as mock_providers, patch(
+            "apps.printify.services.fetch_print_provider_variants"
+        ) as mock_variants, patch("apps.printify.services.fetch_print_provider_location") as mock_location, override_settings(
+            PRINTIFY_API_TOKEN="test-token", PRINTIFY_ENABLED=True
+        ):
+            mock_providers.return_value = [{"id": 10, "title": "Matching Provider (renamed)"}]
+            mock_variants.return_value = {"variants": []}
+            mock_location.return_value = {}
+            run = sync_print_providers_for_blueprint(self.blueprint)
+
+        self.assertEqual(run.status, PrintifySyncRun.Status.SUCCESS)
+        self.template.refresh_from_db()
+        self.assertEqual(self.template.selected_print_provider_id, self.matching_provider.pk)
+
+
+class PlaceholderValidationTests(TestCase):
+    def setUp(self):
+        self.template = make_template()
+        self.blueprint = PrintifyBlueprint.objects.create(
+            blueprint_id=1, title="Unisex Tee", mockup_template=self.template
+        )
+        self.provider = PrintifyPrintProvider.objects.create(
+            blueprint=self.blueprint,
+            provider_id=10,
+            title="Provider A",
+            variants=[
+                {
+                    "id": 100,
+                    "options": {"color": "Black", "size": "M"},
+                    "placeholders": [
+                        {"position": "front", "width": 4200, "height": 4800},
+                        {"position": "back", "width": 4200, "height": 4800},
+                    ],
+                },
+                {
+                    "id": 101,
+                    "options": {"color": "Black", "size": "L"},
+                    "placeholders": [{"position": "left_sleeve", "width": 1181, "height": 1181}],
+                },
+            ],
+        )
+        self.template.selected_print_provider = self.provider
+        self.template.save(update_fields=["selected_print_provider"])
+
+    def test_get_provider_placeholder_positions(self):
+        self.assertEqual(
+            get_provider_placeholder_positions(self.provider), {"front", "back", "left_sleeve"}
+        )
+
+    def test_valid_front_mapping(self):
+        validate_placeholder_position("front", self.provider)  # should not raise
+
+    def test_valid_back_mapping(self):
+        validate_placeholder_position("back", self.provider)  # should not raise
+
+    def test_valid_sleeve_mapping(self):
+        validate_placeholder_position("left_sleeve", self.provider)  # should not raise
+
+    def test_blank_mapping_always_allowed(self):
+        validate_placeholder_position("", self.provider)  # no-op, should not raise
+        part = MockupTemplatePart(template=self.template, name=MockupTemplatePart.PartName.BACK)
+        part.full_clean(exclude=["base_image"])  # blank printify_placeholder_position, should not raise
+
+    def test_invalid_placeholder_position_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_placeholder_position("inside_label", self.provider)
+
+    def test_placeholder_not_offered_by_selected_provider_rejected_via_model(self):
+        part = MockupTemplatePart(
+            template=self.template,
+            name=MockupTemplatePart.PartName.RIGHT_SLEEVE,
+            printify_placeholder_position="right_sleeve",  # not in this provider's catalogue
+        )
+        with self.assertRaises(ValidationError) as ctx:
+            part.full_clean(exclude=["base_image"])
+        self.assertIn("printify_placeholder_position", ctx.exception.message_dict)
+
+    def test_provider_change_makes_existing_placeholder_invalid(self):
+        part = MockupTemplatePart.objects.create(
+            template=self.template, name=MockupTemplatePart.PartName.LEFT_SLEEVE, printify_placeholder_position="left_sleeve"
+        )
+        part.full_clean(exclude=["base_image"])  # valid against the current provider
+
+        other_provider = PrintifyPrintProvider.objects.create(
+            blueprint=self.blueprint,
+            provider_id=11,
+            title="Provider B (no sleeve printing)",
+            variants=[{"id": 200, "options": {"color": "Black", "size": "M"}, "placeholders": [{"position": "front"}]}],
+        )
+        self.template.selected_print_provider = other_provider
+        self.template.save(update_fields=["selected_print_provider"])
+
+        part.refresh_from_db()
+        with self.assertRaises(ValidationError):
+            part.full_clean(exclude=["base_image"])
+
+    def test_missing_placeholders_array_tolerated(self):
+        provider = PrintifyPrintProvider.objects.create(
+            blueprint=self.blueprint,
+            provider_id=12,
+            title="Provider C",
+            variants=[{"id": 300, "options": {"color": "Black", "size": "M"}}],  # no "placeholders" key at all
+        )
+        self.assertEqual(get_provider_placeholder_positions(provider), set())
+
+    def test_duplicate_placeholder_data_handled_safely(self):
+        provider = PrintifyPrintProvider.objects.create(
+            blueprint=self.blueprint,
+            provider_id=13,
+            title="Provider D",
+            variants=[
+                {"id": 400, "options": {"color": "Black", "size": "M"}, "placeholders": [{"position": "front"}]},
+                {"id": 401, "options": {"color": "Black", "size": "L"}, "placeholders": [{"position": "front"}]},
+                {"id": 402, "options": {"color": "Red", "size": "M"}, "placeholders": [{"position": "front"}]},
+            ],
+        )
+        # Three variants all offering "front" — the result is still just {"front"}, not inflated.
+        self.assertEqual(get_provider_placeholder_positions(provider), {"front"})
+
+
+class TransactionAndFailureStateTests(TestCase):
+    @override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345", PRINTIFY_ENABLED=True)
+    @patch("apps.printify.services.PrintifyBlueprint.objects.update_or_create")
+    @patch("apps.printify.services.fetch_blueprints")
+    def test_blueprint_persistence_rolls_back_on_database_failure(self, mock_fetch, mock_upsert):
+        mock_fetch.return_value = [
+            {"id": 1, "title": "A", "brand": "", "model": "", "images": []},
+            {"id": 2, "title": "B", "brand": "", "model": "", "images": []},
+        ]
+        mock_upsert.side_effect = [(Mock(), True), RuntimeError("db exploded")]
+
+        with self.assertRaises(RuntimeError):
+            sync_blueprints()
+
+        self.assertEqual(PrintifyBlueprint.objects.count(), 0)
+
+    @override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345", PRINTIFY_ENABLED=True)
+    @patch("apps.printify.services.PrintifyPrintProvider.objects.update_or_create")
+    @patch("apps.printify.services.fetch_print_provider_location")
+    @patch("apps.printify.services.fetch_print_provider_variants")
+    @patch("apps.printify.services.fetch_print_providers")
+    def test_provider_persistence_rolls_back_on_database_failure(
+        self, mock_providers, mock_variants, mock_location, mock_upsert
+    ):
+        blueprint = PrintifyBlueprint.objects.create(blueprint_id=1, title="Unisex Tee")
+        mock_providers.return_value = [{"id": 10, "title": "A"}, {"id": 11, "title": "B"}]
+        mock_variants.return_value = {"variants": []}
+        mock_location.return_value = {}
+        mock_upsert.side_effect = [(Mock(), True), RuntimeError("db exploded")]
+
+        with self.assertRaises(RuntimeError):
+            sync_print_providers_for_blueprint(blueprint)
+
+        self.assertEqual(PrintifyPrintProvider.objects.filter(blueprint=blueprint).count(), 0)
+
+    @patch("apps.generator.models.ProductVariant.objects.create")
+    def test_local_variant_sync_rolls_back_on_failure(self, mock_create):
+        template = make_template()
+        product = make_shop_product(template)
+        blueprint = PrintifyBlueprint.objects.create(blueprint_id=1, title="Unisex Tee", mockup_template=template)
+        provider = PrintifyPrintProvider.objects.create(
+            blueprint=blueprint,
+            provider_id=10,
+            title="Provider A",
+            variants=[
+                {"id": 100, "options": {"color": "Black", "size": "M"}, "is_enabled": True},
+                {"id": 101, "options": {"color": "Red", "size": "L"}, "is_enabled": True},
+            ],
+        )
+        template.selected_print_provider = provider
+        template.save(update_fields=["selected_print_provider"])
+
+        mock_create.side_effect = RuntimeError("disk full")
+
+        with self.assertRaises(RuntimeError):
+            sync_product_variants_from_printify(product)
+
+        self.assertEqual(ProductVariant.objects.filter(product=product).count(), 0)
+
+    @override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345", PRINTIFY_ENABLED=True)
+    @patch("apps.printify.services.fetch_blueprints")
+    def test_unexpected_exception_marks_run_failed_and_reraises(self, mock_fetch):
+        mock_fetch.side_effect = KeyError("boom")
+
+        with self.assertRaises(KeyError):
+            sync_blueprints()
+
+        run = PrintifySyncRun.objects.latest("started_at")
+        self.assertEqual(run.status, PrintifySyncRun.Status.FAILED)
+        self.assertIsNotNone(run.finished_at)
+        self.assertIn("KeyError", run.error_message)
+
+    @override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345", PRINTIFY_ENABLED=True)
+    @patch("apps.printify.services.fetch_print_providers")
+    def test_unexpected_exception_in_provider_sync_marks_run_failed_and_reraises(self, mock_fetch):
+        blueprint = PrintifyBlueprint.objects.create(blueprint_id=1, title="Unisex Tee")
+        mock_fetch.side_effect = TypeError("unexpected shape")
+
+        with self.assertRaises(TypeError):
+            sync_print_providers_for_blueprint(blueprint)
+
+        run = PrintifySyncRun.objects.filter(blueprint=blueprint).latest("started_at")
+        self.assertEqual(run.status, PrintifySyncRun.Status.FAILED)
+        self.assertIsNotNone(run.finished_at)
+
+    @override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345", PRINTIFY_ENABLED=True)
+    @patch("apps.printify.services.fetch_blueprints")
+    def test_known_printify_error_marks_run_failed_without_reraising(self, mock_fetch):
+        mock_fetch.side_effect = PrintifyAPIError("boom", status_code=500)
+
+        run = sync_blueprints()  # does not raise — existing callers rely on this
+
+        self.assertEqual(run.status, PrintifySyncRun.Status.FAILED)
+        self.assertIsNotNone(run.finished_at)
+
+    @override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345", PRINTIFY_ENABLED=True)
+    @patch("apps.printify.services.fetch_blueprints")
+    def test_successful_run_marked_success_with_finished_at(self, mock_fetch):
+        mock_fetch.return_value = [{"id": 1, "title": "A", "brand": "", "model": "", "images": []}]
+
+        run = sync_blueprints()
+
+        self.assertEqual(run.status, PrintifySyncRun.Status.SUCCESS)
+        self.assertIsNotNone(run.finished_at)
+
+    @override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345", PRINTIFY_ENABLED=True)
+    @patch("apps.printify.services.fetch_blueprints")
+    def test_no_run_remains_in_running_state_after_any_outcome(self, mock_fetch):
+        # Success, known failure, and unexpected failure — none should leave a row "running".
+        mock_fetch.return_value = [{"id": 1, "title": "A", "brand": "", "model": "", "images": []}]
+        sync_blueprints()
+
+        mock_fetch.side_effect = PrintifyAPIError("boom")
+        sync_blueprints()
+
+        mock_fetch.side_effect = ValueError("boom")
+        with self.assertRaises(ValueError):
+            sync_blueprints()
+
+        self.assertEqual(PrintifySyncRun.objects.filter(status=PrintifySyncRun.Status.RUNNING).count(), 0)

@@ -6,13 +6,13 @@ import time
 
 import requests
 from django.conf import settings
+from django.db import transaction
 from django.utils import timezone
 
 from .models import PrintifyBlueprint, PrintifyPrintProvider, PrintifySyncRun
 
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 MAX_ATTEMPTS = 3
-REQUEST_TIMEOUT_SECONDS = 15
 
 
 class PrintifyError(Exception):
@@ -20,7 +20,8 @@ class PrintifyError(Exception):
 
 
 class PrintifyNotConfiguredError(PrintifyError):
-    """Raised when PRINTIFY_API_TOKEN (or, for shop-scoped calls, PRINTIFY_SHOP_ID) is not set."""
+    """Raised when Printify isn't usable yet: PRINTIFY_ENABLED is false, or PRINTIFY_API_TOKEN
+    (or, for shop-scoped calls, PRINTIFY_SHOP_ID) is not set."""
 
 
 class PrintifyAPIError(PrintifyError):
@@ -30,8 +31,31 @@ class PrintifyAPIError(PrintifyError):
         self.payload = payload
 
 
+class PrintifyResponseError(PrintifyError):
+    """Raised when Printify returns a response in a shape this integration doesn't understand
+    (e.g. an object where a list was expected) — distinct from PrintifyAPIError so callers can
+    tell "Printify said no" apart from "Printify said something we can't parse"."""
+
+
+class PrintifyShopNotFoundError(PrintifyError):
+    """Raised when the configured PRINTIFY_SHOP_ID doesn't match any shop the configured token
+    can access — a token being valid doesn't mean it can see *this* shop."""
+
+
 def is_printify_configured() -> bool:
-    return bool(settings.PRINTIFY_API_TOKEN)
+    """A token string being present isn't enough to call the integration configured — it must
+    also be explicitly turned on via PRINTIFY_ENABLED, a kill switch independent of credentials."""
+    return bool(settings.PRINTIFY_ENABLED) and bool(settings.PRINTIFY_API_TOKEN)
+
+
+def safe_error_message(exc: Exception) -> str:
+    """A message safe to persist on a PrintifySyncRun / show an admin — never the exception's
+    raw args for unexpected exception types, since those could (in principle) echo back request
+    internals. PrintifyError messages are already hand-written and safe; everything else is
+    reduced to just its class name plus a generic note."""
+    if isinstance(exc, PrintifyError):
+        return str(exc)
+    return f"Unexpected error during Printify sync: {exc.__class__.__name__}"
 
 
 class PrintifyClient:
@@ -39,9 +63,14 @@ class PrintifyClient:
     exponential backoff (respecting a Retry-After header when present)."""
 
     def __init__(self, api_token: str | None = None, base_url: str | None = None, shop_id: str | None = None):
+        if not settings.PRINTIFY_ENABLED and api_token is None:
+            raise PrintifyNotConfiguredError(
+                "Printify integration is disabled (PRINTIFY_ENABLED is not set). Enable it in .env to use catalogue sync."
+            )
         self.api_token = api_token if api_token is not None else settings.PRINTIFY_API_TOKEN
         self.base_url = (base_url if base_url is not None else settings.PRINTIFY_API_BASE_URL).rstrip("/")
         self.shop_id = shop_id if shop_id is not None else settings.PRINTIFY_SHOP_ID
+        self.timeout = getattr(settings, "PRINTIFY_REQUEST_TIMEOUT", 30)
         if not self.api_token:
             raise PrintifyNotConfiguredError(
                 "PRINTIFY_API_TOKEN is not set. Add it to your .env to enable catalogue sync."
@@ -50,7 +79,7 @@ class PrintifyClient:
         self._session.headers.update(
             {
                 "Authorization": f"Bearer {self.api_token}",
-                "User-Agent": "Artverse/1.0 (+printify-integration)",
+                "User-Agent": getattr(settings, "PRINTIFY_USER_AGENT", "Artverse/1.0"),
                 "Accept": "application/json",
             }
         )
@@ -64,7 +93,7 @@ class PrintifyClient:
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
-                response = self._session.request(method, url, timeout=REQUEST_TIMEOUT_SECONDS, **kwargs)
+                response = self._session.request(method, url, timeout=self.timeout, **kwargs)
             except requests.RequestException as exc:
                 last_error = exc
                 if attempt == MAX_ATTEMPTS:
@@ -96,6 +125,46 @@ class PrintifyClient:
         # Unreachable in practice — the loop above always returns or raises — but keeps type
         # checkers happy and fails loudly instead of returning None if it ever is reached.
         raise PrintifyAPIError(f"Printify request failed after {MAX_ATTEMPTS} attempts: {last_error}")
+
+
+def fetch_shops(client: PrintifyClient | None = None) -> list[dict]:
+    client = client or PrintifyClient()
+    response = client.get("/shops.json")
+    if not isinstance(response, list):
+        raise PrintifyResponseError("Printify shops response must be a list.")
+    return response
+
+
+def validate_configured_shop() -> dict:
+    """Confirm PRINTIFY_API_TOKEN + PRINTIFY_SHOP_ID are configured *and* that the configured
+    shop is actually reachable with that token — a token string being present isn't enough to
+    call the integration "connected." Returns {"id", "title", "sales_channel"} for the matched
+    shop. Raises PrintifyNotConfiguredError / PrintifyAPIError / PrintifyResponseError /
+    PrintifyShopNotFoundError — callers that just want a boolean can catch PrintifyError."""
+    if not settings.PRINTIFY_API_TOKEN:
+        raise PrintifyNotConfiguredError("PRINTIFY_API_TOKEN is not configured.")
+    if not settings.PRINTIFY_SHOP_ID:
+        raise PrintifyNotConfiguredError("PRINTIFY_SHOP_ID is not configured.")
+
+    client = PrintifyClient()
+    shops = fetch_shops(client)
+
+    # Settings arrive as strings; Printify returns numeric IDs — normalize both sides before
+    # comparing so "28270298" (from .env) matches 28270298 (from the API).
+    configured_id = str(settings.PRINTIFY_SHOP_ID).strip()
+    for shop in shops:
+        shop_id = shop.get("id")
+        if shop_id is not None and str(shop_id).strip() == configured_id:
+            return {
+                "id": shop_id,
+                "title": shop.get("title", ""),
+                "sales_channel": shop.get("sales_channel", ""),
+            }
+
+    raise PrintifyShopNotFoundError(
+        f"Configured PRINTIFY_SHOP_ID ({configured_id}) was not found among the {len(shops)} "
+        "shop(s) accessible with this API token. Check the token's permissions and the shop ID."
+    )
 
 
 def fetch_blueprints(client: PrintifyClient) -> list[dict]:
@@ -146,84 +215,127 @@ def fetch_print_provider_variants(client: PrintifyClient, blueprint_id: int, pro
 
 def sync_blueprints(triggered_by=None) -> PrintifySyncRun:
     """Pull the full Printify blueprint catalogue and upsert local PrintifyBlueprint rows.
-    Existing rows keep their `mockup_template` mapping — only the synced fields are overwritten."""
+    Existing rows keep their `mockup_template` mapping — only the synced fields are overwritten.
+
+    Network calls (fetch_blueprints) happen before the transaction opens; all of the upserts
+    happen inside one transaction.atomic() block so a mid-sync failure can't leave a half-synced
+    catalogue, and so the fetch's (uncontrolled) latency doesn't hold DB locks.
+
+    Known integration failures (PrintifyError) are recorded on the run and swallowed — existing
+    callers (views, admin actions, the management command) rely on this and just check
+    `run.status`. Genuinely unexpected exceptions are also recorded on the run, but re-raised —
+    swallowing an unknown bug would leave both the run AND the underlying problem invisible."""
     run = PrintifySyncRun.objects.create(kind=PrintifySyncRun.Kind.BLUEPRINTS, triggered_by=triggered_by)
     try:
         client = PrintifyClient()
         blueprints = fetch_blueprints(client)
 
-        synced_count = 0
-        for entry in blueprints:
-            blueprint_id = entry.get("id")
-            if blueprint_id is None:
-                continue
-            PrintifyBlueprint.objects.update_or_create(
-                blueprint_id=blueprint_id,
-                defaults={
-                    "title": entry.get("title", ""),
-                    "brand": entry.get("brand", ""),
-                    "model": entry.get("model", ""),
-                    "description": entry.get("description", ""),
-                    "images": entry.get("images", []),
-                    "raw_data": entry,
-                },
-            )
-            synced_count += 1
-
-        run.status = PrintifySyncRun.Status.SUCCESS
-        run.blueprints_synced = synced_count
+        created_count = updated_count = 0
+        with transaction.atomic():
+            for entry in blueprints:
+                blueprint_id = entry.get("id")
+                if blueprint_id is None:
+                    continue
+                _, created = PrintifyBlueprint.objects.update_or_create(
+                    blueprint_id=blueprint_id,
+                    defaults={
+                        "title": entry.get("title", ""),
+                        "brand": entry.get("brand", ""),
+                        "model": entry.get("model", ""),
+                        "description": entry.get("description", ""),
+                        "images": entry.get("images", []),
+                        "raw_data": entry,
+                    },
+                )
+                created_count += int(created)
+                updated_count += int(not created)
     except PrintifyError as exc:
         run.status = PrintifySyncRun.Status.FAILED
-        run.error_message = str(exc)
-    finally:
+        run.error_message = safe_error_message(exc)
+        run.finished_at = timezone.now()
+        run.save(update_fields=["status", "error_message", "finished_at"])
+        return run
+    except Exception as exc:
+        run.status = PrintifySyncRun.Status.FAILED
+        run.error_message = safe_error_message(exc)
+        run.finished_at = timezone.now()
+        run.save(update_fields=["status", "error_message", "finished_at"])
+        raise
+    else:
+        run.status = PrintifySyncRun.Status.SUCCESS
+        run.blueprints_synced = created_count + updated_count
+        run.blueprints_created = created_count
+        run.blueprints_updated = updated_count
         run.finished_at = timezone.now()
         run.save()
-    return run
+        return run
 
 
-def sync_print_providers_for_blueprint(blueprint: PrintifyBlueprint, triggered_by=None) -> PrintifySyncRun:
-    """Pull print providers + their variant/placeholder catalogue for one blueprint and upsert
-    local PrintifyPrintProvider rows."""
+def sync_print_providers_for_blueprint(blueprint: PrintifyBlueprint, provider_id: int | None = None, triggered_by=None) -> PrintifySyncRun:
+    """Pull print providers + their variant/placeholder catalogue for one blueprint (or, with
+    `provider_id`, just one specific provider) and upsert local PrintifyPrintProvider rows.
+
+    Same fetch-then-persist split as sync_blueprints(): all Printify requests happen first, then
+    all upserts happen inside one transaction.atomic() block, so a failure partway through
+    (e.g. the 3rd of 22 providers) rolls back the whole blueprint's provider sync rather than
+    leaving it half-updated, and the transaction never sits open across the network calls."""
     run = PrintifySyncRun.objects.create(
         kind=PrintifySyncRun.Kind.PROVIDERS, blueprint=blueprint, triggered_by=triggered_by
     )
     try:
         client = PrintifyClient()
         providers = fetch_print_providers(client, blueprint.blueprint_id)
+        if provider_id is not None:
+            providers = [p for p in providers if p.get("id") == provider_id]
 
-        provider_count = 0
-        variant_count = 0
+        fetched = []
         for provider_entry in providers:
-            provider_id = provider_entry.get("id")
-            if provider_id is None:
+            pid = provider_entry.get("id")
+            if pid is None:
                 continue
-            variant_data = fetch_print_provider_variants(client, blueprint.blueprint_id, provider_id)
-            variants = variant_data.get("variants", []) if isinstance(variant_data, dict) else []
-            location = fetch_print_provider_location(client, provider_id)
+            variant_data = fetch_print_provider_variants(client, blueprint.blueprint_id, pid)
+            location = fetch_print_provider_location(client, pid)
+            fetched.append((provider_entry, pid, variant_data, location))
 
-            PrintifyPrintProvider.objects.update_or_create(
-                blueprint=blueprint,
-                provider_id=provider_id,
-                defaults={
-                    "title": provider_entry.get("title", ""),
-                    "location": location,
-                    "variants": variants,
-                    "raw_data": {"provider": provider_entry, "variants_response": variant_data},
-                },
-            )
-            provider_count += 1
-            variant_count += len(variants)
-
-        run.status = PrintifySyncRun.Status.SUCCESS
-        run.providers_synced = provider_count
-        run.variants_synced = variant_count
+        created_count = updated_count = 0
+        variant_count = 0
+        with transaction.atomic():
+            for provider_entry, pid, variant_data, location in fetched:
+                variants = variant_data.get("variants", []) if isinstance(variant_data, dict) else []
+                _, created = PrintifyPrintProvider.objects.update_or_create(
+                    blueprint=blueprint,
+                    provider_id=pid,
+                    defaults={
+                        "title": provider_entry.get("title", ""),
+                        "location": location,
+                        "variants": variants,
+                        "raw_data": {"provider": provider_entry, "variants_response": variant_data},
+                    },
+                )
+                created_count += int(created)
+                updated_count += int(not created)
+                variant_count += len(variants)
     except PrintifyError as exc:
         run.status = PrintifySyncRun.Status.FAILED
-        run.error_message = str(exc)
-    finally:
+        run.error_message = safe_error_message(exc)
+        run.finished_at = timezone.now()
+        run.save(update_fields=["status", "error_message", "finished_at"])
+        return run
+    except Exception as exc:
+        run.status = PrintifySyncRun.Status.FAILED
+        run.error_message = safe_error_message(exc)
+        run.finished_at = timezone.now()
+        run.save(update_fields=["status", "error_message", "finished_at"])
+        raise
+    else:
+        run.status = PrintifySyncRun.Status.SUCCESS
+        run.providers_synced = created_count + updated_count
+        run.providers_created = created_count
+        run.providers_updated = updated_count
+        run.variants_synced = variant_count
         run.finished_at = timezone.now()
         run.save()
-    return run
+        return run
 
 
 def sync_product_variants_from_printify(product) -> dict:
@@ -233,8 +345,13 @@ def sync_product_variants_from_printify(product) -> dict:
     and cart references stay valid. Pricing (base_cost/retail_price) is intentionally left for
     an admin to review and set — Printify's catalogue endpoint doesn't reliably return retail-
     ready cost data, so silently writing a guessed number would be worse than leaving it blank.
-    Returns a summary dict: {created, updated, marked_unavailable}."""
+    Returns a summary dict: {created, updated, marked_unavailable}.
+
+    All writes happen inside one transaction.atomic() block — no network calls are made here
+    (the provider's variant catalogue is already-synced local data), so this is pure DB work."""
     from apps.generator.models import ProductVariant
+
+    from .validation import validate_provider_matches_template_blueprint
 
     template = product.mockup_template
     provider = template.selected_print_provider if template else None
@@ -244,6 +361,14 @@ def sync_product_variants_from_printify(product) -> dict:
             "map a blueprint and select a provider first."
         )
 
+    # Re-verify the provider→blueprint→template chain at sync time, independent of whatever the
+    # model already enforced at save time — a bulk update, fixture load, or a blueprint remap
+    # after the provider was selected could have made this inconsistent since then.
+    try:
+        validate_provider_matches_template_blueprint(template.pk, provider)
+    except ValueError as exc:
+        raise PrintifyError(str(exc)) from exc
+
     provider_variants = provider.variants or []
     by_color_size: dict[tuple[str, str], dict] = {}
     for entry in provider_variants:
@@ -251,46 +376,52 @@ def sync_product_variants_from_printify(product) -> dict:
         key = (str(options.get("color", "")).strip(), str(options.get("size", "")).strip())
         by_color_size[key] = entry
 
-    existing = {
-        (variant.color_name.strip(), variant.size.strip()): variant
-        for variant in ProductVariant.objects.filter(product=product)
-    }
-
     created = updated = marked_unavailable = 0
 
-    for key, entry in by_color_size.items():
-        color_name, size = key
-        is_enabled = bool(entry.get("is_enabled", True))
-        external_variant_id = str(entry.get("id", ""))
-        variant = existing.get(key)
-        if variant is None:
-            ProductVariant.objects.create(
-                product=product,
-                template=template,
-                color_name=color_name,
-                size=size,
-                name=entry.get("title", "") or f"{color_name} / {size}".strip(" /"),
-                external_provider="Printify",
-                external_variant_id=external_variant_id,
-                is_available=is_enabled,
-                supported_print_areas=[p.get("position") for p in entry.get("placeholders", []) if p.get("position")],
-            )
-            created += 1
-        else:
-            variant.external_provider = "Printify"
-            variant.external_variant_id = external_variant_id
-            variant.is_available = is_enabled
-            variant.supported_print_areas = [
-                p.get("position") for p in entry.get("placeholders", []) if p.get("position")
-            ]
-            variant.save(update_fields=["external_provider", "external_variant_id", "is_available", "supported_print_areas"])
-            updated += 1
+    with transaction.atomic():
+        existing = {
+            (variant.color_name.strip(), variant.size.strip()): variant
+            for variant in ProductVariant.objects.filter(product=product)
+        }
 
-    # Anything local that the provider no longer lists gets disabled, not deleted.
-    for key, variant in existing.items():
-        if key not in by_color_size and variant.is_available:
-            variant.is_available = False
-            variant.save(update_fields=["is_available"])
-            marked_unavailable += 1
+        for key, entry in by_color_size.items():
+            color_name, size = key
+            is_enabled = bool(entry.get("is_enabled", True))
+            external_variant_id = str(entry.get("id", ""))
+            variant = existing.get(key)
+            if variant is None:
+                ProductVariant.objects.create(
+                    product=product,
+                    template=template,
+                    color_name=color_name,
+                    size=size,
+                    name=entry.get("title", "") or f"{color_name} / {size}".strip(" /"),
+                    external_provider="Printify",
+                    external_variant_id=external_variant_id,
+                    is_available=is_enabled,
+                    supported_print_areas=[
+                        p.get("position") for p in entry.get("placeholders", []) if p.get("position")
+                    ],
+                )
+                created += 1
+            else:
+                # Deliberately not touching base_cost/retail_price — see docstring.
+                variant.external_provider = "Printify"
+                variant.external_variant_id = external_variant_id
+                variant.is_available = is_enabled
+                variant.supported_print_areas = [
+                    p.get("position") for p in entry.get("placeholders", []) if p.get("position")
+                ]
+                variant.save(
+                    update_fields=["external_provider", "external_variant_id", "is_available", "supported_print_areas"]
+                )
+                updated += 1
+
+        # Anything local that the provider no longer lists gets disabled, not deleted.
+        for key, variant in existing.items():
+            if key not in by_color_size and variant.is_available:
+                variant.is_available = False
+                variant.save(update_fields=["is_available"])
+                marked_unavailable += 1
 
     return {"created": created, "updated": updated, "marked_unavailable": marked_unavailable}
