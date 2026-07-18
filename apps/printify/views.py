@@ -136,18 +136,30 @@ class PrintifyBlueprintMapView(APIView):
 
 class PrintifySyncBlueprintsView(APIView):
     """Trigger a full blueprint-catalogue sync. Runs synchronously — there is no task queue yet
-    (that's a later roadmap section), so this can take a few seconds for a large catalogue."""
+    (that's a later roadmap section), so this can take a few seconds for a large catalogue.
+
+    Validates the configured shop first, same as the sync_printify_catalogue management command
+    and unconditionally (no dev-only bypass here — this is a production admin API, not a local
+    CLI) — a misconfigured PRINTIFY_SHOP_ID wouldn't actually break the blueprint sync itself
+    (that endpoint isn't shop-scoped), but letting an admin trigger sync after sync without ever
+    surfacing that the configured shop is wrong would be its own kind of silent bypass."""
 
     permission_classes = [IsAdminUser]
 
     def post(self, request):
+        try:
+            validate_configured_shop()
+        except PrintifyError as exc:
+            return Response({"detail": f"Printify connection check failed: {exc}"}, status=status.HTTP_400_BAD_REQUEST)
+
         run = sync_blueprints(triggered_by=request.user)
         response_status = status.HTTP_200_OK if run.status == PrintifySyncRun.Status.SUCCESS else status.HTTP_502_BAD_GATEWAY
         return Response(PrintifySyncRunSerializer(run).data, status=response_status)
 
 
 class PrintifySyncProvidersView(APIView):
-    """Trigger a print-provider + variant sync for one already-synced blueprint."""
+    """Trigger a print-provider + variant sync for one already-synced blueprint. Validates the
+    configured shop first — see PrintifySyncBlueprintsView's docstring for why."""
 
     permission_classes = [IsAdminUser]
 
@@ -156,6 +168,11 @@ class PrintifySyncProvidersView(APIView):
             blueprint = PrintifyBlueprint.objects.get(pk=pk)
         except PrintifyBlueprint.DoesNotExist:
             return Response({"detail": "Blueprint not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            validate_configured_shop()
+        except PrintifyError as exc:
+            return Response({"detail": f"Printify connection check failed: {exc}"}, status=status.HTTP_400_BAD_REQUEST)
 
         run = sync_print_providers_for_blueprint(blueprint, triggered_by=request.user)
         response_status = status.HTTP_200_OK if run.status == PrintifySyncRun.Status.SUCCESS else status.HTTP_502_BAD_GATEWAY

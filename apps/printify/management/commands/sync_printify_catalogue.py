@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
 from apps.printify.models import PrintifyBlueprint, PrintifySyncRun
@@ -41,18 +42,28 @@ class Command(BaseCommand):
         parser.add_argument(
             "--skip-connection-check",
             action="store_true",
-            help="Skip the pre-flight connection/shop validation (not recommended — a bad token or "
-            "shop ID will otherwise fail fast with a clear message before any sync work starts).",
+            help="Skip the pre-flight connection/shop validation. Only available when DEBUG=True "
+            "(local development / automated testing) — a bad token or shop ID will otherwise fail "
+            "fast with a clear message before any sync work starts, and that check is not something "
+            "a production run should ever bypass.",
         )
 
     def handle(self, *args, **options):
         blueprint_id = options.get("blueprint_id")
         provider_id = options.get("provider_id")
+        skip_connection_check = options.get("skip_connection_check")
 
         if provider_id and not blueprint_id:
             raise CommandError("--provider-id requires --blueprint-id.")
 
-        if not options.get("skip_connection_check"):
+        if skip_connection_check and not settings.DEBUG:
+            raise CommandError("--skip-connection-check is only available when DEBUG=True.")
+
+        if skip_connection_check:
+            self.stdout.write(
+                self.style.WARNING("Printify connection validation was skipped because DEBUG=True.")
+            )
+        else:
             self.stdout.write("Validating Printify connection...")
             try:
                 shop = validate_configured_shop()

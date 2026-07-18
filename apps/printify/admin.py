@@ -1,7 +1,7 @@
 from django.contrib import admin, messages
 
 from .models import PrintifyBlueprint, PrintifyPrintProvider, PrintifySyncRun
-from .services import sync_print_providers_for_blueprint
+from .services import PrintifyError, sync_print_providers_for_blueprint, validate_configured_shop
 
 
 class PrintifyPrintProviderInline(admin.TabularInline):
@@ -44,6 +44,12 @@ class PrintifyBlueprintAdmin(admin.ModelAdmin):
 
     @admin.action(description="Sync print providers + variants from Printify for selected blueprints")
     def sync_print_providers(self, request, queryset):
+        try:
+            validate_configured_shop()
+        except PrintifyError as exc:
+            self.message_user(request, f"Printify connection check failed: {exc}", level=messages.ERROR)
+            return
+
         for blueprint in queryset:
             run = sync_print_providers_for_blueprint(blueprint, triggered_by=request.user)
             if run.status == PrintifySyncRun.Status.SUCCESS:

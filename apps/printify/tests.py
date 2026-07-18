@@ -450,13 +450,108 @@ class PrintifyAdminAPITests(APITestCase):
         self.assertNotIn("Authorization", str(response.data))
 
     @patch("apps.printify.services.fetch_blueprints")
-    def test_sync_blueprints_endpoint(self, mock_fetch):
+    @patch("apps.printify.services.fetch_shops")
+    def test_sync_blueprints_endpoint(self, mock_shops, mock_fetch):
+        mock_shops.return_value = [{"id": 12345, "title": "Artverse API Store", "sales_channel": "disconnected"}]
         mock_fetch.return_value = [{"id": 2, "title": "New Blueprint", "brand": "", "model": "", "images": []}]
         self.client.force_authenticate(user=self.staff)
         response = self.client.post("/api/printify/sync-blueprints/")
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertEqual(response.data["status"], "success")
         self.assertTrue(PrintifyBlueprint.objects.filter(blueprint_id=2).exists())
+
+    @patch("apps.printify.services.fetch_blueprints")
+    @patch("apps.printify.services.fetch_shops")
+    def test_sync_blueprints_endpoint_rejects_invalid_shop_before_syncing(self, mock_shops, mock_fetch):
+        mock_shops.side_effect = PrintifyAPIError("Printify API returned 401 for GET /shops.json", status_code=401)
+        self.client.force_authenticate(user=self.staff)
+        response = self.client.post("/api/printify/sync-blueprints/")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+        mock_fetch.assert_not_called()
+
+    @patch("apps.printify.services.fetch_print_provider_location")
+    @patch("apps.printify.services.fetch_print_provider_variants")
+    @patch("apps.printify.services.fetch_print_providers")
+    @patch("apps.printify.services.fetch_shops")
+    def test_sync_providers_endpoint_validates_shop_first(self, mock_shops, mock_providers, mock_variants, mock_location):
+        mock_shops.return_value = [{"id": 12345, "title": "Artverse API Store", "sales_channel": "disconnected"}]
+        mock_providers.return_value = [{"id": 10, "title": "Provider A"}]
+        mock_variants.return_value = {"variants": []}
+        mock_location.return_value = {}
+        self.client.force_authenticate(user=self.staff)
+
+        response = self.client.post(f"/api/printify/blueprints/{self.blueprint.id}/sync-providers/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        mock_shops.assert_called_once()
+
+    @patch("apps.printify.services.fetch_print_providers")
+    @patch("apps.printify.services.fetch_shops")
+    def test_sync_providers_endpoint_rejects_invalid_shop_before_syncing(self, mock_shops, mock_providers):
+        mock_shops.side_effect = PrintifyAPIError("Printify API returned 401 for GET /shops.json", status_code=401)
+        self.client.force_authenticate(user=self.staff)
+
+        response = self.client.post(f"/api/printify/blueprints/{self.blueprint.id}/sync-providers/")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+        mock_providers.assert_not_called()
+
+
+@override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345", PRINTIFY_ENABLED=True)
+class PrintifyAdminActionShopValidationTests(TestCase):
+    """The 'Sync print providers...' Django admin action previously called
+    sync_print_providers_for_blueprint directly with no shop check at all — the same class of
+    bypass the sync_printify_catalogue command and the API views guard against. Exercised via
+    the real admin changelist POST (Django admin uses session auth, not the DRF JWT layer the
+    other API tests use, so this goes through Client.force_login + the actual admin URL)."""
+
+    def setUp(self):
+        self.staff = make_user("admin-action-staff", is_staff=True)
+        self.staff.is_superuser = True
+        self.staff.save(update_fields=["is_superuser"])
+        self.blueprint = PrintifyBlueprint.objects.create(blueprint_id=1, title="Unisex Tee")
+        self.client.force_login(self.staff)
+
+    def _post_action(self):
+        # Deliberately not following the redirect: rendering the resulting changelist page
+        # requires a built static-files manifest, which isn't available in this test
+        # environment and is unrelated to what's being tested here. The 302 itself is Django
+        # admin's normal "action processed" response — enough to prove the action ran (or
+        # didn't) without needing to render the page it redirects to.
+        return self.client.post(
+            "/admin/printify/printifyblueprint/",
+            {
+                "action": "sync_print_providers",
+                "_selected_action": [str(self.blueprint.pk)],
+                "index": "0",
+            },
+        )
+
+    @patch("apps.printify.services.fetch_print_provider_location")
+    @patch("apps.printify.services.fetch_print_provider_variants")
+    @patch("apps.printify.services.fetch_print_providers")
+    @patch("apps.printify.services.fetch_shops")
+    def test_admin_action_validates_shop_first(self, mock_shops, mock_providers, mock_variants, mock_location):
+        mock_shops.return_value = [{"id": 12345, "title": "Artverse API Store", "sales_channel": "disconnected"}]
+        mock_providers.return_value = []
+        mock_variants.return_value = {"variants": []}
+        mock_location.return_value = {}
+
+        response = self._post_action()
+
+        self.assertEqual(response.status_code, 302)  # admin redirects back to the changelist after processing
+        mock_shops.assert_called_once()
+
+    @patch("apps.printify.services.fetch_print_providers")
+    @patch("apps.printify.services.fetch_shops")
+    def test_admin_action_rejects_invalid_shop_before_syncing(self, mock_shops, mock_providers):
+        mock_shops.side_effect = PrintifyAPIError("Printify API returned 401 for GET /shops.json", status_code=401)
+
+        response = self._post_action()
+
+        self.assertEqual(response.status_code, 302)  # admin still redirects; the error is an admin message, not a 500
+        mock_providers.assert_not_called()
+        self.assertEqual(PrintifySyncRun.objects.count(), 0)  # no sync run was ever created
 
 
 @override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345", PRINTIFY_ENABLED=True)
@@ -654,13 +749,49 @@ class SyncPrintifyCatalogueCommandConnectionCheckTests(TestCase):
             self.assertNotIn("test-token", str(exc))
         self.assertNotIn("test-token", out.getvalue())
 
+    @override_settings(DEBUG=True)
     @patch("apps.printify.services.fetch_blueprints")
     @patch("apps.printify.services.fetch_shops")
-    def test_skip_connection_check_flag_bypasses_validation(self, mock_shops, mock_blueprints):
+    def test_skip_connection_check_flag_bypasses_validation_when_debug_true(self, mock_shops, mock_blueprints):
         mock_blueprints.return_value = []
-        call_command("sync_printify_catalogue", "--skip-connection-check", stdout=StringIO())
+        out = StringIO()
+        call_command("sync_printify_catalogue", "--skip-connection-check", stdout=out)
         mock_shops.assert_not_called()
         mock_blueprints.assert_called_once()
+        self.assertIn("Printify connection validation was skipped because DEBUG=True.", out.getvalue())
+
+    @override_settings(DEBUG=False)
+    @patch("apps.printify.services.sync_print_providers_for_blueprint")
+    @patch("apps.printify.services.fetch_blueprints")
+    @patch("apps.printify.services.fetch_shops")
+    def test_skip_connection_check_rejected_when_debug_false(self, mock_shops, mock_blueprints, mock_sync_providers):
+        with self.assertRaises(CommandError) as ctx:
+            call_command("sync_printify_catalogue", "--skip-connection-check", stdout=StringIO())
+        self.assertIn("DEBUG=True", str(ctx.exception))
+        mock_shops.assert_not_called()
+        mock_blueprints.assert_not_called()
+        mock_sync_providers.assert_not_called()
+        self.assertEqual(PrintifySyncRun.objects.count(), 0)  # no partial sync run created
+
+    @override_settings(DEBUG=False)
+    @patch("apps.printify.services.fetch_blueprints")
+    @patch("apps.printify.services.fetch_shops")
+    def test_default_behavior_validates_shop_before_sync_regardless_of_debug(self, mock_shops, mock_blueprints):
+        mock_shops.return_value = [{"id": 12345, "title": "Artverse API Store", "sales_channel": "disconnected"}]
+        mock_blueprints.return_value = []
+        out = StringIO()
+        call_command("sync_printify_catalogue", stdout=out)
+        mock_shops.assert_called_once()
+        mock_blueprints.assert_called_once()
+        self.assertIn("Artverse API Store", out.getvalue())
+        self.assertIn("12345", out.getvalue())
+
+    @override_settings(DEBUG=False)
+    def test_skip_connection_check_error_never_contains_token(self):
+        with self.assertRaises(CommandError) as ctx:
+            call_command("sync_printify_catalogue", "--skip-connection-check", stdout=StringIO())
+        self.assertNotIn("test-token", str(ctx.exception))
+        self.assertNotIn("Bearer", str(ctx.exception))
 
 
 class ProviderBlueprintConsistencyTests(TestCase):
