@@ -545,33 +545,85 @@ def _draw_text_elements(image: Image.Image, text_elements: list) -> Image.Image:
                 
         stroke_width = max(1, font_size // 25) if is_bold else 0
         letter_spacing = float(elem.get("letterSpacing", 0))
+        text_align = str(elem.get("textAlign", "center")).lower()
+        if text_align not in {"left", "center", "right"}:
+            text_align = "center"
+        line_height_multiplier = float(elem.get("lineHeight") or 1.2)
 
-        if letter_spacing == 0:
-            left, top, right, bottom = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
-            text_width = right - left
-            text_height = bottom - top
-            
-            # Add extra padding for italic skew
-            padding = 10 + (int(text_height * 0.3) if is_italic else 0)
-            txt_layer = Image.new("RGBA", (int(text_width) + padding*2, int(text_height) + padding*2), (0,0,0,0))
-            txt_draw = ImageDraw.Draw(txt_layer)
-            txt_draw.text((-left + padding, -top + padding), text, font=font, fill=color, stroke_width=stroke_width, stroke_fill=color if is_bold else None)
+        if "\n" not in text:
+            # Single-line path — unchanged from before multi-line/alignment support was added,
+            # so existing renders keep pixel-identical output regardless of the new fields above.
+            if letter_spacing == 0:
+                left, top, right, bottom = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+                text_width = right - left
+                text_height = bottom - top
+
+                # Add extra padding for italic skew
+                padding = 10 + (int(text_height * 0.3) if is_italic else 0)
+                txt_layer = Image.new("RGBA", (int(text_width) + padding*2, int(text_height) + padding*2), (0,0,0,0))
+                txt_draw = ImageDraw.Draw(txt_layer)
+                txt_draw.text((-left + padding, -top + padding), text, font=font, fill=color, stroke_width=stroke_width, stroke_fill=color if is_bold else None)
+            else:
+                # Measure max height
+                left, top, right, bottom = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+                text_height = bottom - top
+
+                total_width = sum(draw.textlength(c, font=font) for c in text) + letter_spacing * max(0, len(text) - 1)
+                padding = 10 + (int(text_height * 0.3) if is_italic else 0)
+                txt_layer = Image.new("RGBA", (int(total_width) + padding*2, int(text_height) + padding*2), (0,0,0,0))
+                txt_draw = ImageDraw.Draw(txt_layer)
+
+                current_x = padding
+                for char in text:
+                    c_left, c_top, c_right, c_bottom = draw.textbbox((0, 0), char, font=font, stroke_width=stroke_width)
+                    txt_draw.text((current_x - c_left, -top + padding), char, font=font, fill=color, stroke_width=stroke_width, stroke_fill=color if is_bold else None)
+                    current_x += draw.textlength(char, font=font) + letter_spacing
         else:
-            # Measure max height
-            left, top, right, bottom = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
-            text_height = bottom - top
-            
-            total_width = sum(draw.textlength(c, font=font) for c in text) + letter_spacing * max(0, len(text) - 1)
+            # Multi-line path: each line keeps the same per-character/letter-spacing logic as
+            # the single-line path above, laid out top-to-bottom at `lineHeight` * font-metric
+            # spacing and aligned left/center/right within the widest line.
+            lines = text.split("\n")
+
+            def _line_width(line: str) -> float:
+                if not line:
+                    return 0.0
+                if letter_spacing == 0:
+                    l, _, r, _ = draw.textbbox((0, 0), line, font=font, stroke_width=stroke_width)
+                    return r - l
+                return sum(draw.textlength(c, font=font) for c in line) + letter_spacing * max(0, len(line) - 1)
+
+            _, ref_top, _, ref_bottom = draw.textbbox((0, 0), "Ag", font=font, stroke_width=stroke_width)
+            line_step = (ref_bottom - ref_top) * line_height_multiplier
+
+            line_widths = [_line_width(line) for line in lines]
+            max_width = max(line_widths) if line_widths else 0
+            text_height = (ref_bottom - ref_top) + line_step * max(0, len(lines) - 1)
+
             padding = 10 + (int(text_height * 0.3) if is_italic else 0)
-            txt_layer = Image.new("RGBA", (int(total_width) + padding*2, int(text_height) + padding*2), (0,0,0,0))
+            txt_layer = Image.new("RGBA", (int(max_width) + padding*2, int(text_height) + padding*2), (0,0,0,0))
             txt_draw = ImageDraw.Draw(txt_layer)
-            
-            current_x = padding
-            for char in text:
-                c_left, c_top, c_right, c_bottom = draw.textbbox((0, 0), char, font=font, stroke_width=stroke_width)
-                txt_draw.text((current_x - c_left, -top + padding), char, font=font, fill=color, stroke_width=stroke_width, stroke_fill=color if is_bold else None)
-                current_x += draw.textlength(char, font=font) + letter_spacing
-        
+
+            for index, line in enumerate(lines):
+                if not line:
+                    continue
+                line_left, line_top, _, _ = draw.textbbox((0, 0), line, font=font, stroke_width=stroke_width)
+                if text_align == "left":
+                    x_offset = 0.0
+                elif text_align == "right":
+                    x_offset = max_width - line_widths[index]
+                else:
+                    x_offset = (max_width - line_widths[index]) / 2
+                line_y = padding + index * line_step - line_top
+
+                if letter_spacing == 0:
+                    txt_draw.text((padding + x_offset - line_left, line_y), line, font=font, fill=color, stroke_width=stroke_width, stroke_fill=color if is_bold else None)
+                else:
+                    current_x = padding + x_offset
+                    for char in line:
+                        c_left, _, _, _ = draw.textbbox((0, 0), char, font=font, stroke_width=stroke_width)
+                        txt_draw.text((current_x - c_left, line_y), char, font=font, fill=color, stroke_width=stroke_width, stroke_fill=color if is_bold else None)
+                        current_x += draw.textlength(char, font=font) + letter_spacing
+
         if is_italic:
             # Skew transform matrix for italic: (1, 0.3, 0, 0, 1, 0)
             txt_layer = txt_layer.transform(
@@ -651,6 +703,29 @@ def render_mockup_to_image(render) -> Image.Image:
     return composite
 
 
+# This pipeline (render_mockup_to_image / process_mockup_render) produces PREVIEW-QUALITY
+# output only: a mockup photo with the design composited on top, capped at a web-friendly
+# resolution. It intentionally does NOT produce a production print file — no transparent
+# background, no full print DPI, no garment removed — because that's a separate, not-yet-built
+# pipeline (roadmap Section 6, "Generate final print files"). `MockupRender.output_image` must
+# never be submitted to Printify as the actual print file once that pipeline exists; the
+# `processing_notes["quality"] = "preview"` tag below exists specifically so that future
+# order-submission code has something concrete to assert against rather than relying on nobody
+# ever wiring the wrong field into an order by mistake.
+PREVIEW_MAX_DIMENSION = 1600
+
+
+def _downscale_to_preview_resolution(image: Image.Image) -> Image.Image:
+    """Cap the longest edge at PREVIEW_MAX_DIMENSION, preserving aspect ratio. A no-op if the
+    image is already smaller — this only ever shrinks, never upscales, a render."""
+    longest_edge = max(image.width, image.height)
+    if longest_edge <= PREVIEW_MAX_DIMENSION:
+        return image
+    scale = PREVIEW_MAX_DIMENSION / longest_edge
+    new_size = (max(1, round(image.width * scale)), max(1, round(image.height * scale)))
+    return image.resize(new_size, Image.Resampling.LANCZOS)
+
+
 def process_mockup_render(render):
     render.status = render.Status.PROCESSING
     render.render_started_at = timezone.now()
@@ -659,6 +734,7 @@ def process_mockup_render(render):
 
     try:
         output = render_mockup_to_image(render)
+        output = _downscale_to_preview_resolution(output)
         buffer = BytesIO()
         output.save(buffer, format="PNG", optimize=True)
         filename = f"{render.cache_key}.png"
@@ -670,6 +746,8 @@ def process_mockup_render(render):
         render.processing_notes = {
             **(render.processing_notes or {}),
             "engine": "pillow-compositor-v1",
+            "quality": "preview",
+            "preview_max_dimension": PREVIEW_MAX_DIMENSION,
         }
         render.error_message = ""
     except Exception as exc:

@@ -832,3 +832,101 @@ class ProductVariantUniquenessTests(TestCase):
         )
         with self.assertRaises(ValidationError):
             mismatched.full_clean()
+
+
+class PreviewResolutionTests(TestCase):
+    """Roadmap item 11 (separate preview quality from print quality): the render pipeline caps
+    output at a web-friendly resolution and tags every render as preview-only, so a future
+    order-submission pipeline has something concrete to check before ever treating a
+    MockupRender.output_image as a production print file."""
+
+    def test_downscale_shrinks_oversized_image_preserving_aspect_ratio(self):
+        from .services import PREVIEW_MAX_DIMENSION, _downscale_to_preview_resolution
+
+        oversized = Image.new("RGBA", (3200, 1600), (0, 0, 0, 0))
+        result = _downscale_to_preview_resolution(oversized)
+
+        self.assertEqual(max(result.width, result.height), PREVIEW_MAX_DIMENSION)
+        self.assertAlmostEqual(result.width / result.height, 3200 / 1600, places=2)
+
+    def test_downscale_is_a_noop_for_images_already_within_bounds(self):
+        from .services import _downscale_to_preview_resolution
+
+        small = Image.new("RGBA", (800, 600), (0, 0, 0, 0))
+        result = _downscale_to_preview_resolution(small)
+
+        self.assertEqual((result.width, result.height), (800, 600))
+
+    @override_settings(MEDIA_ROOT=tempfile.mkdtemp(prefix="artverse-test-media-"))
+    def test_process_mockup_render_tags_output_as_preview_quality(self):
+        from .services import process_mockup_render
+
+        template = make_template(with_parts=False)
+        attach_image(template.base_image, filename="base.png")
+        attach_image(template.mask_image, filename="mask.png")
+
+        render = MockupRender.objects.create(
+            template=template,
+            source_image_url="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+        )
+
+        result = process_mockup_render(render)
+
+        self.assertEqual(result.status, MockupRender.Status.READY, result.error_message)
+        self.assertEqual(result.processing_notes.get("quality"), "preview")
+        self.assertIn("preview_max_dimension", result.processing_notes)
+
+
+class TextRenderingTests(TestCase):
+    """Roadmap item 15 (proper text editing): multi-line text, alignment, and line spacing.
+    Exercises `_draw_text_elements` directly — a pure function, no DB fixtures needed."""
+
+    def test_single_line_text_still_renders(self):
+        from .services import _draw_text_elements
+
+        image = Image.new("RGBA", (400, 400), (0, 0, 0, 0))
+        result = _draw_text_elements(
+            image, [{"text": "HELLO", "fontSize": 48, "x": 200, "y": 200, "color": "#ffffff"}]
+        )
+        # Something was actually drawn — not a fully-transparent canvas.
+        self.assertTrue(any(pixel[3] > 0 for pixel in result.getdata()))
+
+    def test_multiline_text_with_alignment_and_line_height_renders_without_error(self):
+        from .services import _draw_text_elements
+
+        for align in ("left", "center", "right"):
+            image = Image.new("RGBA", (500, 500), (0, 0, 0, 0))
+            result = _draw_text_elements(
+                image,
+                [
+                    {
+                        "text": "SHORT\nA MUCH LONGER LINE\nMID",
+                        "fontSize": 32,
+                        "x": 250,
+                        "y": 250,
+                        "color": "#ffffff",
+                        "textAlign": align,
+                        "lineHeight": 1.5,
+                    }
+                ],
+            )
+            self.assertTrue(any(pixel[3] > 0 for pixel in result.getdata()), f"nothing drawn for align={align}")
+
+    def test_multiline_text_with_letter_spacing_renders_without_error(self):
+        from .services import _draw_text_elements
+
+        image = Image.new("RGBA", (500, 500), (0, 0, 0, 0))
+        result = _draw_text_elements(
+            image,
+            [{"text": "ONE\nTWO", "fontSize": 32, "x": 250, "y": 250, "color": "#ffffff", "letterSpacing": 6}],
+        )
+        self.assertTrue(any(pixel[3] > 0 for pixel in result.getdata()))
+
+    def test_empty_lines_in_multiline_text_do_not_crash(self):
+        from .services import _draw_text_elements
+
+        image = Image.new("RGBA", (500, 500), (0, 0, 0, 0))
+        result = _draw_text_elements(
+            image, [{"text": "TOP\n\nBOTTOM", "fontSize": 32, "x": 250, "y": 250, "color": "#ffffff"}]
+        )
+        self.assertTrue(any(pixel[3] > 0 for pixel in result.getdata()))
