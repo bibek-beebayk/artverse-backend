@@ -23,15 +23,18 @@ def get_mapped_blueprint_ids(mockup_template_id) -> set[int]:
 
 def validate_provider_matches_template_blueprint(mockup_template_id, provider) -> None:
     """Raise ValueError if `provider` doesn't belong to a Printify blueprint mapped to this
-    template. No-op (allowed) if the template has no mapped blueprint yet, or `provider` is None
-    — see get_mapped_blueprint_ids for why "nothing mapped" isn't itself a failure."""
+    template — including when *no* blueprint is mapped at all. A selected provider always
+    implies a specific blueprint relationship; there's no such thing as a provider that's valid
+    "in general" independent of which blueprint(s) this template is actually mapped to. No-op
+    (allowed) only if `provider` itself is None — nothing to check yet."""
     if provider is None:
         return
     mapped_blueprint_ids = get_mapped_blueprint_ids(mockup_template_id)
-    if mapped_blueprint_ids and provider.blueprint_id not in mapped_blueprint_ids:
+    if provider.blueprint_id not in mapped_blueprint_ids:
         raise ValueError(
             f"Print provider '{provider.title}' belongs to blueprint '{provider.blueprint.title}', "
-            "which is not mapped to this mockup template. Select a provider from the mapped blueprint instead."
+            "which is not mapped to this mockup template. Map that blueprint to this template first, "
+            "or select a provider from a blueprint that's already mapped."
         )
 
 
@@ -57,19 +60,96 @@ def get_provider_placeholder_positions(provider) -> set[str]:
     return positions
 
 
+def provider_has_synced_placeholder_data(provider) -> bool:
+    """True if this provider's synced variant catalogue actually contains placeholder data to
+    validate a mapping against. False for a provider with no variants at all, variants with no
+    `placeholders`, or malformed/empty data — whichever it is, there's nothing to confirm a
+    mapping against, so validate_placeholder_position treats it as "can't verify" rather than
+    "anything goes." (A PrintifyPrintProvider row only ever exists after a successful sync — see
+    sync_print_providers_for_blueprint — so this is really "synced with usable data" vs. "synced
+    but empty/malformed"; there's no separate "never synced" row state to track.)"""
+    return bool(get_provider_placeholder_positions(provider))
+
+
 def validate_placeholder_position(position: str, provider) -> None:
     """Raise ValueError if `position` isn't a placeholder position offered by `provider`'s
-    synced variant catalogue. A blank position is always valid — callers should skip calling
-    this for an unmapped template part rather than passing an empty string. No-op if `provider`
-    is None (nothing to validate against yet) or the provider hasn't been synced yet (an empty
-    available set means "unknown", not "definitely invalid" — don't block on stale/no data)."""
+    synced variant catalogue. A blank position is always valid — an unmapped template part, and
+    callers should still prefer skipping the call entirely for that case. A *non-blank* position
+    requires both a selected provider and that provider to have usable synced placeholder data —
+    "we don't know yet" is deliberately treated as invalid, not as a free pass: silently accepting
+    an unverifiable mapping is worse than asking the admin to select/sync a provider first."""
     if not position:
         return
     if provider is None:
-        return
+        raise ValueError(
+            "An explicit placeholder mapping requires a Printify print provider to be selected on this template first."
+        )
+    if not provider_has_synced_placeholder_data(provider):
+        raise ValueError(
+            "This provider's variants and print areas have not been synchronized yet. "
+            "Synchronize the provider before mapping template placeholders."
+        )
     available = get_provider_placeholder_positions(provider)
-    if available and position not in available:
+    if position not in available:
         raise ValueError(
             f"'{position}' is not a placeholder position offered by print provider '{provider.title}' "
             f"(available: {', '.join(sorted(available))})."
+        )
+
+
+def validate_template_placeholder_mappings(template) -> dict[str, list[str]]:
+    """Check every part on `template` with a non-blank printify_placeholder_position against
+    template.selected_print_provider, via validate_placeholder_position (so the same rules apply
+    here as everywhere else). Returns {part_name: [error, ...]} for every failing part — an empty
+    dict means everything's consistent. Doesn't raise itself; callers decide how to report this
+    alongside other validation (see validate_blueprint_mapping)."""
+    errors: dict[str, list[str]] = {}
+    provider = template.selected_print_provider
+    for part in template.parts.all():
+        if not part.printify_placeholder_position:
+            continue
+        try:
+            validate_placeholder_position(part.printify_placeholder_position, provider)
+        except ValueError as exc:
+            errors[part.name] = [str(exc)]
+    return errors
+
+
+class MappingValidationError(ValueError):
+    """Raised by validate_blueprint_mapping() — carries either just a message (provider
+    mismatch) or a message plus a per-part errors dict (placeholder mismatches), matching
+    whichever shape the caller needs for its 400 response."""
+
+    def __init__(self, message: str, part_errors: dict[str, list[str]] | None = None):
+        super().__init__(message)
+        self.part_errors = part_errors or {}
+
+
+def validate_blueprint_mapping(template) -> None:
+    """Full consistency check for a blueprint→template mapping. Call this *after* tentatively
+    saving the new `blueprint.mockup_template` within an open transaction — get_mapped_blueprint_ids
+    (used by validate_provider_matches_template_blueprint below) needs to see the pending mapping
+    via read-your-writes to know whether the template's existing selected_print_provider is still
+    consistent with it. No-op if `template` is None (unmapping — nothing to conflict with).
+
+    Checks provider-blueprint consistency first and stops there if it fails — per-part placeholder
+    errors would be meaningless against a provider that doesn't even belong to the right blueprint.
+    Only checks placeholders once the provider itself checks out. Raises MappingValidationError;
+    callers should run this inside the same transaction.atomic() as the tentative save so a
+    failure here rolls back that save too, leaving nothing partially applied."""
+    if template is None:
+        return
+
+    try:
+        validate_provider_matches_template_blueprint(template.pk, template.selected_print_provider)
+    except ValueError:
+        raise MappingValidationError(
+            "The selected mockup template is configured with a print provider from another "
+            "Printify blueprint. Clear or change the selected provider before remapping this blueprint."
+        )
+
+    part_errors = validate_template_placeholder_mappings(template)
+    if part_errors:
+        raise MappingValidationError(
+            "The template contains invalid Printify placeholder mappings.", part_errors=part_errors
         )

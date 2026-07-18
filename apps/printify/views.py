@@ -1,3 +1,4 @@
+from django.db import transaction
 from django.db.models import Count
 from rest_framework import status
 from rest_framework.generics import ListAPIView, RetrieveAPIView
@@ -13,6 +14,7 @@ from .serializers import (
     PrintifySyncRunSerializer,
 )
 from .services import PrintifyError, is_printify_configured, sync_blueprints, sync_print_providers_for_blueprint, validate_configured_shop
+from .validation import MappingValidationError, validate_blueprint_mapping
 
 
 class PrintifyConnectionStatusView(APIView):
@@ -79,7 +81,20 @@ class PrintifyBlueprintDetailView(RetrieveAPIView):
 
 class PrintifyBlueprintMapView(APIView):
     """Link (or unlink, with mockup_template_id: null) a synced blueprint to an internal
-    MockupTemplate — the "map internal products to Printify" step."""
+    MockupTemplate — the "map internal products to Printify" step. Enforces one blueprint per
+    template: mapping a new blueprint to a template that already has a *different* blueprint
+    mapped to it clears that old mapping first (in the same transaction) — otherwise the old
+    blueprint would still count as "mapped" for consistency purposes, and a provider belonging
+    to it could slip past validation even though it no longer matches the template's new
+    blueprint.
+
+    A blueprint can't be mapped to a template whose existing selected_print_provider belongs to
+    a *different* blueprint (that would leave the template pointing at a provider it can no
+    longer reach), and can't be mapped if that would leave any of the template's explicit
+    placeholder mappings unsupported by the (unchanged) selected provider. All of this — the
+    auto-unmap, the tentative save, and both checks — runs inside one transaction.atomic(): a
+    failure rolls back everything, so nothing is left partially mapped and the previous
+    mapping/provider/placeholder configuration is untouched, not silently cleared."""
 
     permission_classes = [IsAdminUser]
 
@@ -91,8 +106,31 @@ class PrintifyBlueprintMapView(APIView):
 
         serializer = PrintifyBlueprintMapSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        blueprint.mockup_template_id = serializer.validated_data["mockup_template_id"]
-        blueprint.save(update_fields=["mockup_template"])
+        new_template_id = serializer.validated_data["mockup_template_id"]
+
+        try:
+            with transaction.atomic():
+                if new_template_id:
+                    PrintifyBlueprint.objects.filter(mockup_template_id=new_template_id).exclude(pk=blueprint.pk).update(
+                        mockup_template=None
+                    )
+                blueprint.mockup_template_id = new_template_id
+                blueprint.save(update_fields=["mockup_template"])
+
+                template = None
+                if new_template_id:
+                    from apps.generator.models import MockupTemplate
+
+                    template = MockupTemplate.objects.select_related("selected_print_provider__blueprint").get(
+                        pk=new_template_id
+                    )
+                validate_blueprint_mapping(template)
+        except MappingValidationError as exc:
+            body = {"detail": str(exc)}
+            if exc.part_errors:
+                body["errors"] = exc.part_errors
+            return Response(body, status=status.HTTP_400_BAD_REQUEST)
+
         return Response(PrintifyBlueprintDetailSerializer(blueprint).data)
 
 

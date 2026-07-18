@@ -238,7 +238,9 @@ class ProductVariantSyncTests(TestCase):
     def setUp(self):
         self.template = make_template()
         self.product = make_shop_product(self.template)
-        self.blueprint = PrintifyBlueprint.objects.create(blueprint_id=1, title="Unisex Tee")
+        self.blueprint = PrintifyBlueprint.objects.create(
+            blueprint_id=1, title="Unisex Tee", mockup_template=self.template
+        )
         self.provider = PrintifyPrintProvider.objects.create(
             blueprint=self.blueprint,
             provider_id=10,
@@ -589,6 +591,78 @@ class PrintifyTestConnectionCommandTests(TestCase):
         self.assertNotIn("Bearer", out.getvalue())
 
 
+@override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345", PRINTIFY_ENABLED=True)
+class SyncPrintifyCatalogueCommandConnectionCheckTests(TestCase):
+    """sync_printify_catalogue must validate the connection *before* touching any catalogue
+    endpoint — these tests specifically prove the catalogue sync functions are never even
+    called when that pre-flight check fails, not just that the command errors out somehow."""
+
+    @patch("apps.printify.services.fetch_blueprints")
+    @patch("apps.printify.services.fetch_shops")
+    def test_valid_shop_allows_sync_to_begin(self, mock_shops, mock_blueprints):
+        mock_shops.return_value = [{"id": 12345, "title": "Artverse API Store", "sales_channel": "disconnected"}]
+        mock_blueprints.return_value = [{"id": 1, "title": "A", "brand": "", "model": "", "images": []}]
+
+        out = StringIO()
+        call_command("sync_printify_catalogue", stdout=out)
+
+        mock_blueprints.assert_called_once()
+        output = out.getvalue()
+        self.assertIn("Artverse API Store", output)
+        self.assertIn("12345", output)
+
+    @override_settings(PRINTIFY_API_TOKEN="")
+    @patch("apps.printify.services.fetch_blueprints")
+    def test_missing_token_stops_command_before_sync(self, mock_blueprints):
+        with self.assertRaises(CommandError) as ctx:
+            call_command("sync_printify_catalogue", stdout=StringIO())
+        self.assertIn("PRINTIFY_API_TOKEN", str(ctx.exception))
+        mock_blueprints.assert_not_called()
+
+    @override_settings(PRINTIFY_SHOP_ID="")
+    @patch("apps.printify.services.fetch_blueprints")
+    def test_missing_shop_id_stops_command_before_sync(self, mock_blueprints):
+        with self.assertRaises(CommandError) as ctx:
+            call_command("sync_printify_catalogue", stdout=StringIO())
+        self.assertIn("PRINTIFY_SHOP_ID", str(ctx.exception))
+        mock_blueprints.assert_not_called()
+
+    @patch("apps.printify.services.fetch_blueprints")
+    @patch("apps.printify.services.fetch_shops")
+    def test_inaccessible_shop_stops_command_before_sync(self, mock_shops, mock_blueprints):
+        mock_shops.return_value = [{"id": 99999, "title": "Someone Else's Shop"}]
+        with self.assertRaises(CommandError) as ctx:
+            call_command("sync_printify_catalogue", stdout=StringIO())
+        self.assertIn("12345", str(ctx.exception))
+        mock_blueprints.assert_not_called()
+
+    @patch("apps.printify.services.fetch_blueprints")
+    @patch("apps.printify.services.fetch_shops")
+    def test_invalid_token_stops_command_before_sync(self, mock_shops, mock_blueprints):
+        mock_shops.side_effect = PrintifyAPIError("Printify API returned 401", status_code=401)
+        with self.assertRaises(CommandError):
+            call_command("sync_printify_catalogue", stdout=StringIO())
+        mock_blueprints.assert_not_called()
+
+    @patch("apps.printify.services.fetch_shops")
+    def test_token_never_appears_in_output_or_errors(self, mock_shops):
+        mock_shops.side_effect = PrintifyAPIError("Printify API returned 401", status_code=401)
+        out = StringIO()
+        try:
+            call_command("sync_printify_catalogue", stdout=out)
+        except CommandError as exc:
+            self.assertNotIn("test-token", str(exc))
+        self.assertNotIn("test-token", out.getvalue())
+
+    @patch("apps.printify.services.fetch_blueprints")
+    @patch("apps.printify.services.fetch_shops")
+    def test_skip_connection_check_flag_bypasses_validation(self, mock_shops, mock_blueprints):
+        mock_blueprints.return_value = []
+        call_command("sync_printify_catalogue", "--skip-connection-check", stdout=StringIO())
+        mock_shops.assert_not_called()
+        mock_blueprints.assert_called_once()
+
+
 class ProviderBlueprintConsistencyTests(TestCase):
     def setUp(self):
         self.template = make_template()
@@ -613,10 +687,14 @@ class ProviderBlueprintConsistencyTests(TestCase):
             self.template.full_clean()
         self.assertIn("selected_print_provider", ctx.exception.message_dict)
 
-    def test_no_constraint_when_template_has_no_mapped_blueprint(self):
+    def test_selected_provider_rejected_when_template_has_no_mapped_blueprint(self):
+        # A provider is only ever valid relative to a blueprint mapping — with none mapped at
+        # all, no provider selection can be confirmed consistent, so it's rejected outright.
         unmapped_template = make_template(slug="unmapped-template")
         unmapped_template.selected_print_provider = self.mismatched_provider
-        unmapped_template.full_clean()  # no mapped blueprint yet — nothing to validate against
+        with self.assertRaises(ValidationError) as ctx:
+            unmapped_template.full_clean()
+        self.assertIn("selected_print_provider", ctx.exception.message_dict)
 
     def test_validate_provider_matches_template_blueprint_helper_directly(self):
         validate_provider_matches_template_blueprint(self.template.pk, self.matching_provider)
@@ -799,6 +877,95 @@ class PlaceholderValidationTests(TestCase):
         # Three variants all offering "front" — the result is still just {"front"}, not inflated.
         self.assertEqual(get_provider_placeholder_positions(provider), {"front"})
 
+    def test_valid_right_sleeve_mapping(self):
+        provider = PrintifyPrintProvider.objects.create(
+            blueprint=self.blueprint,
+            provider_id=14,
+            title="Provider E",
+            variants=[
+                {"id": 500, "options": {"color": "Black", "size": "M"}, "placeholders": [{"position": "right_sleeve"}]}
+            ],
+        )
+        validate_placeholder_position("right_sleeve", provider)  # should not raise
+
+    def test_valid_provider_specific_custom_placeholder(self):
+        # Real Printify data includes positions like "neck"/"inside_label" that aren't among our
+        # own front/back/sleeve part names — validation must accept whatever the provider offers.
+        provider = PrintifyPrintProvider.objects.create(
+            blueprint=self.blueprint,
+            provider_id=15,
+            title="Provider F",
+            variants=[{"id": 600, "options": {"color": "Black", "size": "M"}, "placeholders": [{"position": "neck"}]}],
+        )
+        validate_placeholder_position("neck", provider)  # should not raise
+
+    def test_explicit_placeholder_rejected_when_provider_has_no_synced_variants(self):
+        # A provider row only exists after a sync, but its variant catalogue can still come back
+        # empty (or with no placeholders on any variant) — that must not be treated as "anything
+        # goes"; an explicit mapping against it can't be verified, so it's rejected.
+        unsynced_provider = PrintifyPrintProvider.objects.create(
+            blueprint=self.blueprint, provider_id=16, title="Never really synced", variants=[]
+        )
+        with self.assertRaises(ValueError) as ctx:
+            validate_placeholder_position("front", unsynced_provider)
+        self.assertIn("not been synchronized", str(ctx.exception))
+
+    def test_explicit_placeholder_rejected_via_model_when_provider_unsynced(self):
+        unsynced_provider = PrintifyPrintProvider.objects.create(
+            blueprint=self.blueprint, provider_id=17, title="Never really synced", variants=[]
+        )
+        self.template.selected_print_provider = unsynced_provider
+        self.template.save(update_fields=["selected_print_provider"])
+
+        part = MockupTemplatePart(
+            template=self.template, name=MockupTemplatePart.PartName.FRONT, printify_placeholder_position="front"
+        )
+        with self.assertRaises(ValidationError) as ctx:
+            part.full_clean(exclude=["base_image"])
+        self.assertIn("printify_placeholder_position", ctx.exception.message_dict)
+
+    def test_blank_placeholder_still_allowed_when_provider_unsynced(self):
+        unsynced_provider = PrintifyPrintProvider.objects.create(
+            blueprint=self.blueprint, provider_id=18, title="Never really synced", variants=[]
+        )
+        self.template.selected_print_provider = unsynced_provider
+        self.template.save(update_fields=["selected_print_provider"])
+
+        # make_template() already creates a FRONT part, so use BACK to avoid a unique-together clash.
+        part = MockupTemplatePart(template=self.template, name=MockupTemplatePart.PartName.BACK)
+        part.full_clean(exclude=["base_image"])  # blank — should not raise even though provider is unsynced
+
+    def test_explicit_placeholder_rejected_when_no_provider_selected(self):
+        # make_template() already creates a FRONT part, so use BACK to keep this test isolated
+        # to the placeholder/provider check rather than also tripping a unique-together error.
+        template = make_template(slug="no-provider-template")
+        part = MockupTemplatePart(
+            template=template, name=MockupTemplatePart.PartName.BACK, printify_placeholder_position="back"
+        )
+        with self.assertRaises(ValueError):
+            validate_placeholder_position("front", None)
+        with self.assertRaises(ValidationError) as ctx:
+            part.full_clean(exclude=["base_image"])
+        self.assertIn("printify_placeholder_position", ctx.exception.message_dict)
+
+    def test_malformed_variants_json_handled_safely(self):
+        provider = PrintifyPrintProvider.objects.create(
+            blueprint=self.blueprint,
+            provider_id=19,
+            title="Provider G",
+            variants=[
+                "not a dict",
+                {"id": 700, "options": {"color": "Black", "size": "M"}, "placeholders": "not a list"},
+                {"id": 701, "options": {"color": "Black", "size": "L"}, "placeholders": [123, "not a dict either"]},
+                {"id": 702, "options": {"color": "Black", "size": "XL"}, "placeholders": [{"position": "front"}]},
+            ],
+        )
+        # Only the one well-formed entry contributes; the rest are safely ignored, not crashed on.
+        self.assertEqual(get_provider_placeholder_positions(provider), {"front"})
+        validate_placeholder_position("front", provider)  # should not raise
+        with self.assertRaises(ValueError):
+            validate_placeholder_position("back", provider)
+
 
 class TransactionAndFailureStateTests(TestCase):
     @override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345", PRINTIFY_ENABLED=True)
@@ -920,3 +1087,210 @@ class TransactionAndFailureStateTests(TestCase):
             sync_blueprints()
 
         self.assertEqual(PrintifySyncRun.objects.filter(status=PrintifySyncRun.Status.RUNNING).count(), 0)
+
+
+class PrintifyBlueprintMapViewConsistencyTests(APITestCase):
+    """The mapping endpoint (POST /api/printify/blueprints/<id>/map/) must not be able to leave
+    a template pointing at a provider outside its mapped blueprint, or at a placeholder mapping
+    that provider doesn't support — see PrintifyBlueprintMapView / validate_blueprint_mapping."""
+
+    def setUp(self):
+        self.staff = make_user("staff", is_staff=True)
+        self.regular = make_user("regular", is_staff=False)
+
+    def _synced_provider(self, blueprint, provider_id=10, positions=("front", "back")):
+        return PrintifyPrintProvider.objects.create(
+            blueprint=blueprint,
+            provider_id=provider_id,
+            title=f"Provider {provider_id}",
+            variants=[
+                {
+                    "id": 1000 + provider_id,
+                    "options": {"color": "Black", "size": "M"},
+                    "placeholders": [{"position": p} for p in positions],
+                }
+            ],
+        )
+
+    # --- Valid mapping ---
+
+    def test_maps_to_unconfigured_template(self):
+        template = make_template(slug="unconfigured")
+        blueprint = PrintifyBlueprint.objects.create(blueprint_id=1, title="Unisex Tee")
+        self.client.force_authenticate(user=self.staff)
+
+        response = self.client.post(
+            f"/api/printify/blueprints/{blueprint.id}/map/", {"mockup_template_id": template.id}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        blueprint.refresh_from_db()
+        self.assertEqual(blueprint.mockup_template_id, template.id)
+
+    def test_remapping_to_a_new_blueprint_unmaps_the_previous_one(self):
+        # No provider selected on the template, so there's nothing to conflict with — this
+        # isolates the "one blueprint per template" enforcement itself from provider validation.
+        template = make_template(slug="reassign")
+        blueprint_a = PrintifyBlueprint.objects.create(blueprint_id=1, title="Blueprint A", mockup_template=template)
+        blueprint_b = PrintifyBlueprint.objects.create(blueprint_id=2, title="Blueprint B")
+
+        self.client.force_authenticate(user=self.staff)
+        response = self.client.post(
+            f"/api/printify/blueprints/{blueprint_b.id}/map/", {"mockup_template_id": template.id}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        blueprint_a.refresh_from_db()
+        blueprint_b.refresh_from_db()
+        self.assertIsNone(blueprint_a.mockup_template_id)  # auto-unmapped
+        self.assertEqual(blueprint_b.mockup_template_id, template.id)
+
+    def test_reaffirming_existing_consistent_mapping_succeeds_and_preserves_placeholders(self):
+        template = make_template(slug="consistent")
+        blueprint = PrintifyBlueprint.objects.create(blueprint_id=1, title="Unisex Tee", mockup_template=template)
+        provider = self._synced_provider(blueprint)
+        template.selected_print_provider = provider
+        template.save(update_fields=["selected_print_provider"])
+        part = MockupTemplatePart.objects.get(template=template, name=MockupTemplatePart.PartName.FRONT)
+        part.printify_placeholder_position = "front"
+        part.save(update_fields=["printify_placeholder_position"])
+
+        self.client.force_authenticate(user=self.staff)
+        response = self.client.post(
+            f"/api/printify/blueprints/{blueprint.id}/map/", {"mockup_template_id": template.id}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        part.refresh_from_db()
+        self.assertEqual(part.printify_placeholder_position, "front")
+
+    # --- Invalid selected provider ---
+
+    def test_rejects_remap_when_template_provider_belongs_to_another_blueprint(self):
+        template = make_template(slug="cross-blueprint")
+        blueprint_a = PrintifyBlueprint.objects.create(blueprint_id=1, title="Blueprint A", mockup_template=template)
+        provider_a = self._synced_provider(blueprint_a, provider_id=10)
+        template.selected_print_provider = provider_a
+        template.save(update_fields=["selected_print_provider"])
+
+        blueprint_b = PrintifyBlueprint.objects.create(blueprint_id=2, title="Blueprint B")
+
+        self.client.force_authenticate(user=self.staff)
+        response = self.client.post(
+            f"/api/printify/blueprints/{blueprint_b.id}/map/", {"mockup_template_id": template.id}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+        self.assertIn("another Printify blueprint", response.data["detail"])
+
+        blueprint_a.refresh_from_db()
+        blueprint_b.refresh_from_db()
+        template.refresh_from_db()
+        self.assertEqual(blueprint_a.mockup_template_id, template.id)  # unchanged
+        self.assertIsNone(blueprint_b.mockup_template_id)  # rejected mapping never applied
+        self.assertEqual(template.selected_print_provider_id, provider_a.id)  # unchanged
+
+    # --- Invalid placeholder mapping ---
+
+    def test_rejects_remap_when_a_part_placeholder_is_unsupported(self):
+        template = make_template(slug="bad-placeholder")
+        blueprint = PrintifyBlueprint.objects.create(blueprint_id=1, title="Unisex Tee")
+        provider = self._synced_provider(blueprint, positions=("front",))  # no "back"
+        template.selected_print_provider = provider
+        template.save(update_fields=["selected_print_provider"])
+        part = MockupTemplatePart.objects.get(template=template, name=MockupTemplatePart.PartName.FRONT)
+        part.printify_placeholder_position = "back"  # not offered by this provider
+        part.save(update_fields=["printify_placeholder_position"])
+
+        self.client.force_authenticate(user=self.staff)
+        response = self.client.post(
+            f"/api/printify/blueprints/{blueprint.id}/map/", {"mockup_template_id": template.id}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+        self.assertIn("invalid Printify placeholder", response.data["detail"])
+        self.assertIn("front", response.data["errors"])  # keyed by part name
+
+        blueprint.refresh_from_db()
+        self.assertIsNone(blueprint.mockup_template_id)  # rejected mapping never applied
+        part.refresh_from_db()
+        self.assertEqual(part.printify_placeholder_position, "back")  # untouched by the failed attempt
+
+    # --- Unsynchronized provider ---
+
+    def test_rejects_remap_when_explicit_placeholder_set_but_provider_unsynced(self):
+        template = make_template(slug="unsynced-provider")
+        blueprint = PrintifyBlueprint.objects.create(blueprint_id=1, title="Unisex Tee")
+        unsynced_provider = PrintifyPrintProvider.objects.create(
+            blueprint=blueprint, provider_id=10, title="Unsynced", variants=[]
+        )
+        template.selected_print_provider = unsynced_provider
+        template.save(update_fields=["selected_print_provider"])
+        part = MockupTemplatePart.objects.get(template=template, name=MockupTemplatePart.PartName.FRONT)
+        part.printify_placeholder_position = "front"
+        part.save(update_fields=["printify_placeholder_position"])
+
+        self.client.force_authenticate(user=self.staff)
+        response = self.client.post(
+            f"/api/printify/blueprints/{blueprint.id}/map/", {"mockup_template_id": template.id}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+        self.assertIn("front", response.data["errors"])
+        self.assertIn("not been synchronized", response.data["errors"]["front"][0])
+
+    def test_blank_placeholder_mapping_succeeds_even_with_unsynced_provider(self):
+        template = make_template(slug="unsynced-provider-blank")
+        blueprint = PrintifyBlueprint.objects.create(blueprint_id=1, title="Unisex Tee")
+        unsynced_provider = PrintifyPrintProvider.objects.create(
+            blueprint=blueprint, provider_id=10, title="Unsynced", variants=[]
+        )
+        template.selected_print_provider = unsynced_provider
+        template.save(update_fields=["selected_print_provider"])
+        # FRONT part left with a blank printify_placeholder_position (the default).
+
+        self.client.force_authenticate(user=self.staff)
+        response = self.client.post(
+            f"/api/printify/blueprints/{blueprint.id}/map/", {"mockup_template_id": template.id}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+    # --- Transaction rollback ---
+
+    def test_mapping_rolls_back_on_unexpected_error_during_validation(self):
+        template = make_template(slug="rollback-target")
+        blueprint = PrintifyBlueprint.objects.create(blueprint_id=1, title="Unisex Tee")
+
+        self.client.force_authenticate(user=self.staff)
+        with patch(
+            "apps.printify.views.validate_blueprint_mapping", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaises(RuntimeError):
+                self.client.post(
+                    f"/api/printify/blueprints/{blueprint.id}/map/",
+                    {"mockup_template_id": template.id},
+                    format="json",
+                )
+
+        blueprint.refresh_from_db()
+        self.assertIsNone(blueprint.mockup_template_id)  # the tentative save was rolled back
+
+    # --- Permissions ---
+
+    def test_unauthenticated_cannot_map(self):
+        template = make_template(slug="perm-anon")
+        blueprint = PrintifyBlueprint.objects.create(blueprint_id=1, title="Unisex Tee")
+        response = self.client.post(
+            f"/api/printify/blueprints/{blueprint.id}/map/", {"mockup_template_id": template.id}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_non_admin_cannot_map(self):
+        template = make_template(slug="perm-regular")
+        blueprint = PrintifyBlueprint.objects.create(blueprint_id=1, title="Unisex Tee")
+        self.client.force_authenticate(user=self.regular)
+        response = self.client.post(
+            f"/api/printify/blueprints/{blueprint.id}/map/", {"mockup_template_id": template.id}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
