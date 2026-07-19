@@ -510,3 +510,52 @@ class MockupRender(models.Model):
 
     def __str__(self) -> str:
         return f"{self.template.name} / {self.status}"
+
+
+class GeneratedPrintFile(models.Model):
+    """A production print file for one DesignPlacement — transparent background, the customer's
+    artwork and visible text only, at the template part's required print-file dimensions/DPI.
+    Deliberately a separate model from MockupRender (preview) and never overwrites one: previews
+    are a cheap, disposable web approximation; a print file is the thing a paid order would
+    actually need preserved. `signature` is a content hash of every printable input (source
+    image, placement/crop/rotation/opacity/text, template part production settings) — see
+    apps.generator.services.build_print_file_signature() — so an unchanged design reuses its
+    existing completed file instead of regenerating, and a changed one gets a fresh row rather
+    than mutating history a future paid order might depend on."""
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        PROCESSING = "processing", "Processing"
+        READY = "ready", "Ready"
+        FAILED = "failed", "Failed"
+
+    design_placement = models.ForeignKey(
+        DesignPlacement, on_delete=models.CASCADE, related_name="generated_print_files"
+    )
+    template_part = models.ForeignKey(
+        MockupTemplatePart, on_delete=models.PROTECT, related_name="generated_print_files"
+    )
+    output_file = models.ImageField(upload_to="design-projects/print-files/", blank=True, null=True)
+    width = models.PositiveIntegerField(default=0)
+    height = models.PositiveIntegerField(default=0)
+    dpi = models.PositiveIntegerField(default=0)
+    signature = models.CharField(
+        max_length=64,
+        blank=True,
+        db_index=True,
+        help_text="sha256 of every printable input — see build_print_file_signature(). Used to "
+        "detect staleness and reuse an existing completed file instead of regenerating.",
+    )
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
+    error_message = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("-created_at",)
+        indexes = [
+            models.Index(fields=["design_placement", "signature"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.design_placement} print file ({self.status})"

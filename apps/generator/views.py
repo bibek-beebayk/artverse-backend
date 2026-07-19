@@ -11,7 +11,7 @@ import hashlib
 
 from apps.gallery.models import Artwork
 
-from .models import DesignPlacement, DesignProject, GeneratedImage, GenerationRequest, MockupRender, MockupTemplate, ProductVariant
+from .models import DesignPlacement, DesignProject, GeneratedImage, GeneratedPrintFile, GenerationRequest, MockupRender, MockupTemplate, ProductVariant
 from .serializers import (
     DesignProjectListSerializer,
     DesignProjectSerializer,
@@ -26,7 +26,9 @@ from .serializers import (
 )
 from .services import (
     build_mockup_cache_key,
+    create_or_reuse_print_file,
     ensure_source_design_asset,
+    is_placement_printable,
     process_mockup_render,
     resolve_source_fingerprint,
 )
@@ -518,3 +520,105 @@ class DesignProjectDuplicateView(APIView):
 
         serializer = DesignProjectSerializer(duplicate)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+_PRINT_FILE_STATUS_MAP = {
+    GeneratedPrintFile.Status.READY: "completed",
+    GeneratedPrintFile.Status.FAILED: "failed",
+    GeneratedPrintFile.Status.PROCESSING: "processing",
+    GeneratedPrintFile.Status.PENDING: "queued",
+}
+
+
+def _resolve_output_file_url(record: GeneratedPrintFile) -> str | None:
+    if not record.output_file:
+        return None
+    try:
+        return record.output_file.url
+    except Exception:
+        return None
+
+
+def _print_file_part_payload(placement: DesignPlacement, record: GeneratedPrintFile, *, reused: bool) -> dict:
+    api_status = _PRINT_FILE_STATUS_MAP.get(record.status, "failed")
+    return {
+        "part_name": placement.part_name,
+        "status": api_status,
+        "print_file_url": _resolve_output_file_url(record) if api_status == "completed" else None,
+        "width": record.width or None,
+        "height": record.height or None,
+        "dpi": record.dpi or None,
+        "reused": reused,
+        "error": record.error_message or None,
+    }
+
+
+class DesignProjectGeneratePrintFilesView(APIView):
+    """Generate (or reuse — see create_or_reuse_print_file's signature-based cache) production
+    print files for every printable, configured part of a saved design project. Owner-only,
+    same 404-not-403 pattern as the rest of this app. Synchronous — same as mockup-render
+    generation, there's no task queue yet (roadmap Section 8). Empty parts (nothing configured
+    at all) are silently omitted from the response rather than reported with a status; a part
+    that *is* configured but can't be generated (missing template_part link, invalid production
+    dimensions, etc.) is reported with status "failed" and a clear `error`."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        design_project = get_object_or_404(
+            DesignProject.objects.prefetch_related(_placements_prefetch()), pk=pk, user=request.user
+        )
+
+        parts_response = []
+        for placement in design_project.placements.all():
+            if not is_placement_printable(placement) and not placement.text_elements:
+                continue  # nothing configured on this part — skip silently, not an error
+
+            template_part = placement.template_part
+            if template_part is None:
+                parts_response.append(
+                    {
+                        "part_name": placement.part_name,
+                        "status": "failed",
+                        "print_file_url": None,
+                        "width": None,
+                        "height": None,
+                        "dpi": None,
+                        "reused": False,
+                        "error": "No template part is configured for this placement — a print file can't be generated without one.",
+                    }
+                )
+                continue
+
+            record, reused = create_or_reuse_print_file(placement=placement, template_part=template_part)
+
+            if record.status == GeneratedPrintFile.Status.READY:
+                placement.print_file_url = _resolve_output_file_url(record) or ""
+                placement.save(update_fields=["print_file_url"])
+
+            parts_response.append(_print_file_part_payload(placement, record, reused=reused))
+
+        overall_status = "failed" if any(p["status"] == "failed" for p in parts_response) else "completed"
+        return Response({"project_id": design_project.id, "status": overall_status, "parts": parts_response})
+
+
+class DesignProjectPrintFilesView(APIView):
+    """Read-only status of each configured part's most recent print-file generation attempt,
+    without triggering a new one. Owner-only."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        design_project = get_object_or_404(
+            DesignProject.objects.prefetch_related(_placements_prefetch()), pk=pk, user=request.user
+        )
+
+        parts_response = []
+        for placement in design_project.placements.all():
+            latest = placement.generated_print_files.order_by("-created_at").first()
+            if latest is None:
+                continue
+            parts_response.append(_print_file_part_payload(placement, latest, reused=False))
+
+        overall_status = "failed" if any(p["status"] == "failed" for p in parts_response) else "completed"
+        return Response({"project_id": design_project.id, "status": overall_status, "parts": parts_response})

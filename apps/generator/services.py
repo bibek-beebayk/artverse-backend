@@ -13,7 +13,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, ImageFont
 
 from apps.gallery.models import Artwork
 
-from .models import GeneratedImage, MockupTemplate, SourceDesignAsset
+from .models import DesignPlacement, GeneratedImage, GeneratedPrintFile, MockupTemplate, MockupTemplatePart, SourceDesignAsset
 
 
 def resolve_source_fingerprint(
@@ -516,15 +516,26 @@ def _apply_displacement_map(
 import os
 
 def _draw_text_elements(image: Image.Image, text_elements: list) -> Image.Image:
+    """The single place that decides which text layers actually get drawn — every rendering
+    path (preview renders, production print files, any future reusable text-compositing helper)
+    must go through this function rather than filtering `isHidden` itself, so preview and
+    production can never diverge on what "hidden" means. Layer order follows the input list
+    order (callers are responsible for passing elements in the order they should be drawn/
+    stacked); duplicate layers are independent dicts and render independently. `isLocked` is a
+    frontend-only editing concern (prevents dragging in the browser) — it has no effect here."""
     if not text_elements:
         return image
-    
+
     draw = ImageDraw.Draw(image)
     for elem in text_elements:
+        # Explicitly truthy only — missing, False, or None all mean "visible" (the default).
+        if elem.get("isHidden") is True:
+            continue
+
         text = str(elem.get("text", ""))
         if not text:
             continue
-            
+
         color = str(elem.get("color", "#FFFFFF"))
         font_size = int(elem.get("fontSize", 48))
         font_family = str(elem.get("fontFamily", "Roboto"))
@@ -757,3 +768,268 @@ def process_mockup_render(render):
     render.render_completed_at = timezone.now()
     render.save()
     return render
+
+
+# ---------------------------------------------------------------------------
+# Production print-file generation.
+#
+# Coordinate convention (mirrors DesignProject's docstring, extended for production):
+#   1. Preview/template-canvas coordinates — a DesignPlacement's x/y/width/height/rotation/etc,
+#      in absolute pixels of the template part's base_image (the mockup photo). This is what the
+#      editor's drag/resize/rotate UI manipulates and what gets persisted.
+#   2. Fixed print-area coordinates — the SAME pixel space, but expressed relative to the
+#      template part's admin-configured, non-draggable print boundary (`config["placement"]`,
+#      see get_fixed_print_area()). The user's artwork transform is positioned *within or
+#      relative to* this fixed area; the area itself is never user-editable.
+#   3. Production print-file coordinates — the fixed print area scaled up to the part's required
+#      print-file pixel dimensions (`print_file_width`/`print_file_height`) at its target `dpi`.
+#      This is the only coordinate space a GeneratedPrintFile's canvas is ever drawn in.
+#
+# map_placement_to_production_canvas() is the one function that goes from (1) through (2) to (3)
+# — every production render must go through it rather than re-deriving the scale math locally.
+#
+# Layer model (MVP, deliberate scope decision, not a gap to close later without a product
+# decision to do so): a DesignPlacement has exactly one image layer (source_artwork /
+# source_generated_image / source_image_url — a single artwork, never a stack) plus any number of
+# independent text layers (`text_elements`). There is no unified image+text layer list and no
+# multi-image-layer support here, by design — one artwork per print part, annotated with text.
+# generate_print_file_image() reflects this directly: one artwork composite, then N text layers,
+# never more than one image source. See PartCustomization's equivalent note on the frontend.
+# ---------------------------------------------------------------------------
+
+
+def get_fixed_print_area(template_part: MockupTemplatePart) -> dict:
+    """The admin-configured, non-draggable print boundary for a template part — x/y/width/height
+    in that part's base_image pixel space. Never user-editable; this is what production
+    coordinates are computed relative to (see the module docstring above). Falls back to the
+    full base_image extent if the part has no explicit `config["placement"]` set."""
+    config = template_part.config or {}
+    placement = config.get("placement") or {}
+    image = _load_storage_image(template_part.base_image)
+    fallback_width = image.width if image else 0
+    fallback_height = image.height if image else 0
+    return {
+        "x": float(placement.get("x", 0) or 0),
+        "y": float(placement.get("y", 0) or 0),
+        "width": float(placement.get("width", fallback_width) or fallback_width),
+        "height": float(placement.get("height", fallback_height) or fallback_height),
+    }
+
+
+def map_placement_to_production_canvas(*, placement: DesignPlacement, template_part: MockupTemplatePart) -> dict:
+    """Stage (1) -> (2) -> (3) of the coordinate convention above, for one DesignPlacement's
+    artwork transform. Returns a placement dict in production print-file pixel units, ready to
+    hand to _prepare_design_layer() unchanged. All arithmetic is floating-point — callers round
+    to int only at the final paste/canvas-size step, so repeated calls don't accumulate drift."""
+    if not template_part.print_file_width or not template_part.print_file_height:
+        raise ValueError(
+            f"Template part '{template_part.name}' has no production print-file dimensions "
+            "configured (print_file_width/print_file_height) — cannot generate a print file for it."
+        )
+    if template_part.print_file_width <= 0 or template_part.print_file_height <= 0:
+        raise ValueError(f"Template part '{template_part.name}' has invalid production dimensions.")
+    if not template_part.dpi or template_part.dpi <= 0:
+        raise ValueError(f"Template part '{template_part.name}' has no valid required DPI configured.")
+
+    fixed_area = get_fixed_print_area(template_part)
+    if fixed_area["width"] <= 0 or fixed_area["height"] <= 0:
+        raise ValueError(f"Template part '{template_part.name}' has no configured print-area boundary.")
+
+    scale_x = template_part.print_file_width / fixed_area["width"]
+    scale_y = template_part.print_file_height / fixed_area["height"]
+
+    return {
+        "x": (placement.x - fixed_area["x"]) * scale_x,
+        "y": (placement.y - fixed_area["y"]) * scale_y,
+        "width": placement.width * scale_x,
+        "height": placement.height * scale_y,
+        "rotation": placement.rotation,
+        "opacity": placement.opacity,
+        "fit": placement.fit,
+        "corner_radius": placement.corner_radius * ((scale_x + scale_y) / 2),
+    }
+
+
+def is_placement_printable(placement: DesignPlacement) -> bool:
+    """Does this placement have an actual artwork source configured? Mirrors the frontend's
+    isPartConfigured() — text-only parts are still printable even with no artwork."""
+    return bool(
+        placement.source_artwork_id
+        or placement.source_generated_image_id
+        or (placement.source_image_url or "").strip()
+    )
+
+
+def _load_source_image_for_placement(placement: DesignPlacement) -> Image.Image:
+    """Same resolution order as _load_source_image(), adapted for DesignPlacement's field names
+    (it has no `source_asset` FK — that's MockupRender-specific). Always the original, full-
+    resolution source — nothing here is ever the downscaled preview output."""
+    if placement.source_generated_image:
+        generated_image = placement.source_generated_image
+        if generated_image.image:
+            image = _load_storage_image(generated_image.image)
+            if image is not None:
+                return image
+        if generated_image.image_url:
+            return _load_remote_or_data_image(generated_image.image_url)
+
+    if placement.source_artwork:
+        artwork = placement.source_artwork
+        if artwork.image:
+            image = _load_storage_image(artwork.image)
+            if image is not None:
+                return image
+        if artwork.image_url:
+            return _load_remote_or_data_image(artwork.image_url)
+
+    if placement.source_image_url:
+        return _load_remote_or_data_image(placement.source_image_url)
+
+    raise ValueError("No source image is available for this design placement.")
+
+
+def build_print_file_signature(*, placement: DesignPlacement, template_part: MockupTemplatePart) -> str:
+    """A deterministic hash of every printable input for this placement + template part. Changing
+    anything that would visibly change the output (source, crop, position, size, rotation,
+    opacity, fit, corner radius, text content/styling/order/visibility, or the part's own
+    production dimensions/DPI) changes this signature — an unchanged signature means an existing
+    completed GeneratedPrintFile can be reused instead of regenerated."""
+    source_fingerprint = resolve_source_fingerprint(
+        generated_image=placement.source_generated_image,
+        artwork=placement.source_artwork,
+        source_image_url=placement.source_image_url,
+    )
+    printable_state = {
+        "x": placement.x,
+        "y": placement.y,
+        "width": placement.width,
+        "height": placement.height,
+        "rotation": placement.rotation,
+        "opacity": placement.opacity,
+        "fit": placement.fit,
+        "corner_radius": placement.corner_radius,
+        "crop": [placement.crop_left, placement.crop_top, placement.crop_width, placement.crop_height],
+        "text_elements": placement.text_elements or [],
+    }
+    raw_value = "|".join(
+        [
+            template_part.template.slug,
+            str(template_part.template.template_version),
+            template_part.name,
+            str(template_part.print_file_width),
+            str(template_part.print_file_height),
+            str(template_part.dpi),
+            source_fingerprint,
+            json.dumps(printable_state, sort_keys=True, separators=(",", ":")),
+        ]
+    )
+    return hashlib.sha256(raw_value.encode("utf-8")).hexdigest()
+
+
+def _scale_text_elements_to_production(text_elements: list, *, template_part: MockupTemplatePart) -> list:
+    """Text coordinates/sizing need the same preview-canvas -> fixed-print-area -> production
+    scaling as the artwork (see the module docstring). Visibility filtering itself happens once,
+    centrally, inside _draw_text_elements() — this only rescales, it doesn't filter."""
+    fixed_area = get_fixed_print_area(template_part)
+    scale_x = template_part.print_file_width / fixed_area["width"]
+    scale_y = template_part.print_file_height / fixed_area["height"]
+    average_scale = (scale_x + scale_y) / 2
+
+    scaled = []
+    for element in text_elements or []:
+        next_element = dict(element)
+        next_element["x"] = (float(element.get("x", 0) or 0) - fixed_area["x"]) * scale_x
+        next_element["y"] = (float(element.get("y", 0) or 0) - fixed_area["y"]) * scale_y
+        next_element["fontSize"] = float(element.get("fontSize", 48) or 48) * average_scale
+        next_element["letterSpacing"] = float(element.get("letterSpacing", 0) or 0) * average_scale
+        scaled.append(next_element)
+    return scaled
+
+
+def generate_print_file_image(*, placement: DesignPlacement, template_part: MockupTemplatePart) -> Image.Image:
+    """Pure compositing, no persistence: a transparent RGBA canvas at the template part's
+    production dimensions, with only the customer's artwork (cropped/fit/positioned/rotated/
+    opacity-adjusted, from the original source) and visible text layers drawn onto it. Nothing
+    else — no garment/mockup photo, no mask, no displacement warp, no shadow/highlight, no
+    safe-area or bleed guides. Raises ValueError (not silently falling back to preview
+    dimensions) if the part has no valid production dimensions/DPI configured."""
+    if not template_part.print_file_width or not template_part.print_file_height:
+        raise ValueError(
+            f"Template part '{template_part.name}' has no production print-file dimensions configured."
+        )
+    if template_part.print_file_width <= 0 or template_part.print_file_height <= 0:
+        raise ValueError(f"Template part '{template_part.name}' has invalid production dimensions.")
+    if not template_part.dpi or template_part.dpi <= 0:
+        raise ValueError(f"Template part '{template_part.name}' has no valid required DPI configured.")
+
+    canvas = Image.new("RGBA", (template_part.print_file_width, template_part.print_file_height), (0, 0, 0, 0))
+
+    if is_placement_printable(placement):
+        production_placement = map_placement_to_production_canvas(placement=placement, template_part=template_part)
+        source_image = _load_source_image_for_placement(placement)
+        crop_override = {
+            "left": placement.crop_left,
+            "top": placement.crop_top,
+            "width": placement.crop_width,
+            "height": placement.crop_height,
+        }
+        prepared = _prepare_design_layer(source_image, production_placement, crop_override)
+
+        target_width = max(1, int(round(production_placement["width"])))
+        target_height = max(1, int(round(production_placement["height"])))
+        paste_x = int(round(production_placement["x"])) + max(0, (target_width - prepared.width) // 2)
+        paste_y = int(round(production_placement["y"])) + max(0, (target_height - prepared.height) // 2)
+        canvas.alpha_composite(prepared, dest=(paste_x, paste_y))
+
+    if placement.text_elements:
+        scaled_text_elements = _scale_text_elements_to_production(placement.text_elements, template_part=template_part)
+        canvas = _draw_text_elements(canvas, scaled_text_elements)
+
+    return canvas
+
+
+def create_or_reuse_print_file(
+    *, placement: DesignPlacement, template_part: MockupTemplatePart
+) -> tuple[GeneratedPrintFile, bool]:
+    """Orchestrates one part's print-file generation: computes the signature, reuses an existing
+    completed file with the same signature if one exists, otherwise generates, persists, and
+    returns a new GeneratedPrintFile (marking it FAILED with a safe error message on any error
+    rather than leaving nothing behind or raising past the caller — the API view surfaces
+    per-part status, not a single all-or-nothing exception). Returns (record, reused)."""
+    signature = build_print_file_signature(placement=placement, template_part=template_part)
+
+    existing = (
+        GeneratedPrintFile.objects.filter(
+            design_placement=placement, signature=signature, status=GeneratedPrintFile.Status.READY
+        )
+        .order_by("-created_at")
+        .first()
+    )
+    if existing is not None:
+        return existing, True
+
+    record = GeneratedPrintFile.objects.create(
+        design_placement=placement,
+        template_part=template_part,
+        signature=signature,
+        status=GeneratedPrintFile.Status.PROCESSING,
+        width=template_part.print_file_width or 0,
+        height=template_part.print_file_height or 0,
+        dpi=template_part.dpi or 0,
+    )
+    try:
+        image = generate_print_file_image(placement=placement, template_part=template_part)
+        buffer = BytesIO()
+        image.save(buffer, format="PNG", optimize=True)
+        filename = f"{signature}.png"
+        record.output_file.save(filename, ContentFile(buffer.getvalue()), save=False)
+        record.width = image.width
+        record.height = image.height
+        record.status = GeneratedPrintFile.Status.READY
+        record.error_message = ""
+    except Exception as exc:
+        record.status = GeneratedPrintFile.Status.FAILED
+        record.error_message = str(exc)
+
+    record.save()
+    return record, False

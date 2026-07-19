@@ -1,7 +1,7 @@
 import json
 
 from django import forms
-from django.contrib import admin
+from django.contrib import admin, messages
 from django.core.exceptions import ValidationError
 from PIL import Image
 
@@ -9,6 +9,7 @@ from .models import (
     DesignPlacement,
     DesignProject,
     GeneratedImage,
+    GeneratedPrintFile,
     GenerationRequest,
     MockupRender,
     MockupTemplate,
@@ -17,7 +18,9 @@ from .models import (
     SourceDesignAsset,
 )
 from .services import (
+    create_or_reuse_print_file,
     hydrate_source_design_asset,
+    is_placement_printable,
     resolve_source_asset_fingerprint,
 )
 
@@ -343,3 +346,58 @@ class DesignProjectAdmin(admin.ModelAdmin):
     readonly_fields = ("created_at", "updated_at")
     list_select_related = ("user", "product", "mockup_template", "selected_variant")
     inlines = [DesignPlacementInline]
+    actions = ["generate_print_files"]
+
+    @admin.action(description="Generate print files for all configured parts")
+    def generate_print_files(self, request, queryset):
+        for project in queryset:
+            created = reused = failed = 0
+            for placement in project.placements.select_related("template_part"):
+                if not is_placement_printable(placement) and not placement.text_elements:
+                    continue  # empty part — nothing to generate
+                if placement.template_part is None:
+                    failed += 1
+                    continue
+                record, was_reused = create_or_reuse_print_file(
+                    placement=placement, template_part=placement.template_part
+                )
+                if record.status == GeneratedPrintFile.Status.READY:
+                    if was_reused:
+                        reused += 1
+                    else:
+                        created += 1
+                    if record.output_file:
+                        try:
+                            placement.print_file_url = record.output_file.url
+                            placement.save(update_fields=["print_file_url"])
+                        except Exception:
+                            pass
+                else:
+                    failed += 1
+
+            level = messages.ERROR if failed and not (created or reused) else messages.SUCCESS
+            self.message_user(
+                request,
+                f"{project.name or f'Project #{project.id}'}: {created} generated, {reused} reused, {failed} failed.",
+                level=level,
+            )
+
+
+@admin.register(GeneratedPrintFile)
+class GeneratedPrintFileAdmin(admin.ModelAdmin):
+    """Read-only — records are only ever created via generate_print_file_image() /
+    create_or_reuse_print_file(), never hand-edited. Distinguishing this list from Mockup
+    renders (a cheap preview) is the point: these are the production-quality, transparent-
+    background files a paid order would actually need."""
+
+    list_display = ("id", "design_placement", "template_part", "status", "width", "height", "dpi", "created_at")
+    list_filter = ("status", "template_part__template__product_type")
+    search_fields = ("design_placement__design_project__name", "design_placement__design_project__user__email", "signature")
+    readonly_fields = [f.name for f in GeneratedPrintFile._meta.fields]
+    list_select_related = ("design_placement", "template_part")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False

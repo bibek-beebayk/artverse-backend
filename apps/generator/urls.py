@@ -3,7 +3,9 @@ from django.urls import path
 from .views import (
     DesignProjectDetailView,
     DesignProjectDuplicateView,
+    DesignProjectGeneratePrintFilesView,
     DesignProjectListCreateView,
+    DesignProjectPrintFilesView,
     GeneratedImageListView,
     GenerationRequestListCreateView,
     MockupRenderDetailView,
@@ -26,5 +28,15 @@ urlpatterns = [
         "design-projects/<int:pk>/duplicate/",
         DesignProjectDuplicateView.as_view(),
         name="design-project-duplicate",
+    ),
+    path(
+        "design-projects/<int:pk>/generate-print-files/",
+        DesignProjectGeneratePrintFilesView.as_view(),
+        name="design-project-generate-print-files",
+    ),
+    path(
+        "design-projects/<int:pk>/print-files/",
+        DesignProjectPrintFilesView.as_view(),
+        name="design-project-print-files",
     ),
 ]

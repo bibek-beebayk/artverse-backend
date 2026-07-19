@@ -18,6 +18,7 @@ from .models import (
     DesignPlacement,
     DesignProject,
     GeneratedImage,
+    GeneratedPrintFile,
     MockupRender,
     MockupTemplate,
     MockupTemplatePart,
@@ -65,6 +66,51 @@ def make_variant(template, product=None, color_name="Black", size="M", **overrid
 
 def make_user(username="tester", email=None):
     return User.objects.create_user(username=username, email=email or f"{username}@example.com", password="testpass123")
+
+
+def make_data_url(color, size=(300, 300)):
+    """A solid-colour PNG as a data: URI — a self-contained source image with no filesystem/DB
+    dependency, for tests that need real, distinguishable pixel content (crop/fit/rotation/etc)."""
+    import base64
+
+    buffer = BytesIO()
+    Image.new("RGBA", size, color).save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def make_production_part(template, *, name="front", print_file_width=1200, print_file_height=1200, dpi=300, fixed_area=None):
+    """A MockupTemplatePart with real production dimensions configured — make_template()'s
+    default parts deliberately don't have these set (mirrors real templates before an admin
+    configures them), so print-file tests need their own explicit part."""
+    fixed_area = fixed_area or {"x": 100, "y": 100, "width": 400, "height": 400}
+    part, _ = MockupTemplatePart.objects.update_or_create(
+        template=template,
+        name=name,
+        defaults={
+            "dpi": dpi,
+            "print_file_width": print_file_width,
+            "print_file_height": print_file_height,
+            "config": {"placement": fixed_area},
+        },
+    )
+    if not part.base_image:
+        attach_image(part.base_image, "part-base.png")
+    return part
+
+
+def make_printable_placement(project, template_part, *, source_color=(255, 0, 0, 255), source_size=(300, 300), **overrides):
+    defaults = {
+        "design_project": project,
+        "part_name": template_part.name,
+        "template_part": template_part,
+        "source_image_url": make_data_url(source_color, source_size),
+        "x": 150,
+        "y": 150,
+        "width": 300,
+        "height": 300,
+    }
+    defaults.update(overrides)
+    return DesignPlacement.objects.create(**defaults)
 
 
 class DesignProjectModelTests(TestCase):
@@ -930,3 +976,511 @@ class TextRenderingTests(TestCase):
             image, [{"text": "TOP\n\nBOTTOM", "fontSize": 32, "x": 250, "y": 250, "color": "#ffffff"}]
         )
         self.assertTrue(any(pixel[3] > 0 for pixel in result.getdata()))
+
+
+class HiddenTextExclusionTests(TestCase):
+    """Roadmap item 1: hidden text layers must never appear in any backend rendering path, and
+    the exclusion must live in one centralized place (_draw_text_elements) so preview and
+    production output can't diverge on what "hidden" means."""
+
+    def _bbox(self, elements):
+        from .services import _draw_text_elements
+
+        image = Image.new("RGBA", (400, 400), (0, 0, 0, 0))
+        return _draw_text_elements(image, elements).getbbox()
+
+    def test_hidden_text_is_absent(self):
+        bbox = self._bbox([{"text": "HIDDEN", "isHidden": True, "x": 200, "y": 200, "fontSize": 40, "color": "#fff"}])
+        self.assertIsNone(bbox)
+
+    def test_visible_text_remains(self):
+        bbox = self._bbox([{"text": "VISIBLE", "x": 200, "y": 200, "fontSize": 40, "color": "#fff"}])
+        self.assertIsNotNone(bbox)
+
+    def test_locked_text_remains_visible(self):
+        # isLocked is a frontend editing-only concern — must have zero effect on rendering.
+        bbox = self._bbox([{"text": "LOCKED", "isLocked": True, "x": 200, "y": 200, "fontSize": 40, "color": "#fff"}])
+        self.assertIsNotNone(bbox)
+
+    def test_hidden_locked_text_remains_hidden(self):
+        bbox = self._bbox(
+            [{"text": "BOTH", "isHidden": True, "isLocked": True, "x": 200, "y": 200, "fontSize": 40, "color": "#fff"}]
+        )
+        self.assertIsNone(bbox)
+
+    def test_missing_isHidden_key_behaves_as_visible(self):
+        bbox = self._bbox([{"text": "NO KEY", "x": 200, "y": 200, "fontSize": 40, "color": "#fff"}])
+        self.assertIsNotNone(bbox)
+
+    def test_isHidden_false_and_none_remain_visible(self):
+        for value in (False, None):
+            with self.subTest(value=value):
+                bbox = self._bbox([{"text": "X", "isHidden": value, "x": 200, "y": 200, "fontSize": 40, "color": "#fff"}])
+                self.assertIsNotNone(bbox)
+
+    def test_layers_render_in_list_order(self):
+        # Two same-position, opaque, differently-coloured filled-circle glyphs — whichever is
+        # LAST in the list must end up on top (its colour visible at the solid glyph centre),
+        # proving order is followed.
+        from .services import _draw_text_elements
+
+        image = Image.new("RGBA", (400, 400), (0, 0, 0, 0))
+        result = _draw_text_elements(
+            image,
+            [
+                {"text": "●", "x": 200, "y": 200, "fontSize": 120, "color": "#ff0000"},
+                {"text": "●", "x": 200, "y": 200, "fontSize": 120, "color": "#0000ff"},
+            ],
+        )
+        center_pixel = result.getpixel((200, 200))
+        self.assertEqual(center_pixel[:3], (0, 0, 255))  # the later (blue) layer painted on top
+
+    def test_duplicate_layers_render_independently(self):
+        # Same text/style at two different positions — both must render as separate marks.
+        from .services import _draw_text_elements
+
+        image = Image.new("RGBA", (400, 400), (0, 0, 0, 0))
+        result = _draw_text_elements(
+            image,
+            [
+                {"text": "DUPE", "x": 100, "y": 100, "fontSize": 30, "color": "#fff"},
+                {"text": "DUPE", "x": 300, "y": 300, "fontSize": 30, "color": "#fff"},
+            ],
+        )
+        self.assertTrue(any(result.getpixel((x, 100))[3] > 0 for x in range(60, 141)))
+        self.assertTrue(any(result.getpixel((x, 300))[3] > 0 for x in range(260, 341)))
+
+    def test_missing_visibility_properties_do_not_break_rendering(self):
+        # No isHidden/isLocked keys at all on any element — must not raise.
+        bbox = self._bbox([{"text": "PLAIN", "x": 200, "y": 200, "fontSize": 40, "color": "#fff"}])
+        self.assertIsNotNone(bbox)
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(prefix="artverse-test-media-"))
+class ProductionPrintFileCanvasTests(TestCase):
+    """Roadmap items 2/3: canvas creation and validation."""
+
+    def setUp(self):
+        self.user = make_user()
+        self.template = make_template(slug="print-canvas-test")
+        self.part = make_production_part(self.template, print_file_width=1500, print_file_height=1800, dpi=300)
+        self.project = DesignProject.objects.create(user=self.user, mockup_template=self.template, name="P")
+
+    def test_correct_production_width_and_height(self):
+        from .services import generate_print_file_image
+
+        placement = make_printable_placement(self.project, self.part)
+        image = generate_print_file_image(placement=placement, template_part=self.part)
+        self.assertEqual(image.size, (1500, 1800))
+
+    def test_transparent_rgba_background(self):
+        from .services import generate_print_file_image
+
+        placement = DesignPlacement.objects.create(design_project=self.project, part_name=self.part.name, template_part=self.part)
+        image = generate_print_file_image(placement=placement, template_part=self.part)
+        self.assertEqual(image.mode, "RGBA")
+        self.assertEqual(image.getpixel((0, 0))[3], 0)  # corner pixel fully transparent
+
+    def test_correct_dpi_metadata_stored(self):
+        from .services import create_or_reuse_print_file
+
+        placement = make_printable_placement(self.project, self.part)
+        record, _ = create_or_reuse_print_file(placement=placement, template_part=self.part)
+        self.assertEqual(record.dpi, 300)
+        self.assertEqual((record.width, record.height), (1500, 1800))
+
+    def test_missing_print_file_dimensions_rejected(self):
+        from .services import generate_print_file_image
+
+        unconfigured_part = MockupTemplatePart.objects.create(
+            template=self.template,
+            name=MockupTemplatePart.PartName.LEFT_SLEEVE,
+            config={"placement": {"x": 0, "y": 0, "width": 100, "height": 100}},
+        )
+        attach_image(unconfigured_part.base_image, "sleeve.png")
+        placement = make_printable_placement(self.project, unconfigured_part)
+        with self.assertRaises(ValueError):
+            generate_print_file_image(placement=placement, template_part=unconfigured_part)
+
+    def test_zero_dpi_rejected(self):
+        from .services import generate_print_file_image
+
+        self.part.dpi = 0
+        self.part.save(update_fields=["dpi"])
+        placement = make_printable_placement(self.project, self.part)
+        with self.assertRaises(ValueError):
+            generate_print_file_image(placement=placement, template_part=self.part)
+
+    def test_does_not_silently_fall_back_to_a_default_size(self):
+        # A part with print_file_width/height explicitly 0 must fail loudly, not produce some
+        # arbitrary/preview-sized canvas.
+        from .services import generate_print_file_image
+
+        self.part.print_file_width = 0
+        self.part.save(update_fields=["print_file_width"])
+        placement = make_printable_placement(self.project, self.part)
+        with self.assertRaises(ValueError):
+            generate_print_file_image(placement=placement, template_part=self.part)
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(prefix="artverse-test-media-"))
+class ProductionPrintFileArtworkTests(TestCase):
+    """Roadmap item 6: crop/fit/position/rotation/opacity, and that nothing from the mockup
+    photo (garment, shadow, highlight) ever leaks into the production output."""
+
+    def setUp(self):
+        self.user = make_user()
+        self.template = make_template(slug="print-artwork-test")
+        self.part = make_production_part(self.template, print_file_width=1200, print_file_height=1200)
+        self.project = DesignProject.objects.create(user=self.user, mockup_template=self.template, name="P")
+
+    def test_crop_applied(self):
+        from .services import generate_print_file_image
+
+        # Half-red, half-blue source; crop to only the right (blue) half.
+        source = Image.new("RGBA", (200, 200), (255, 0, 0, 255))
+        for x in range(100, 200):
+            for y in range(200):
+                source.putpixel((x, y), (0, 0, 255, 255))
+        buffer = BytesIO()
+        source.save(buffer, format="PNG")
+        import base64
+
+        data_url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+        placement = make_printable_placement(
+            self.project, self.part, source_color=(0, 0, 0, 0), source_image_url=data_url,
+            crop_left=50, crop_top=0, crop_width=50, crop_height=100, fit=DesignPlacement.Fit.COVER,
+        )
+        image = generate_print_file_image(placement=placement, template_part=self.part)
+        bbox = image.getbbox()
+        center = image.getpixel(((bbox[0] + bbox[2]) // 2, (bbox[1] + bbox[3]) // 2))
+        self.assertEqual(center[:3], (0, 0, 255))  # only the blue half survived the crop
+
+    def test_contain_fit_applied(self):
+        from .services import generate_print_file_image
+
+        # A wide (2:1) source into a square placement — "contain" must not fill the whole square.
+        placement = make_printable_placement(
+            self.project, self.part, source_size=(400, 200), width=400, height=400, fit=DesignPlacement.Fit.CONTAIN
+        )
+        image = generate_print_file_image(placement=placement, template_part=self.part)
+        bbox = image.getbbox()
+        bbox_width = bbox[2] - bbox[0]
+        bbox_height = bbox[3] - bbox[1]
+        self.assertGreater(bbox_width, bbox_height)  # stayed wide, didn't stretch to fill the square
+
+    def test_cover_fit_applied(self):
+        from .services import generate_print_file_image
+
+        placement = make_printable_placement(
+            self.project, self.part, source_size=(400, 200), width=300, height=300, fit=DesignPlacement.Fit.COVER
+        )
+        image = generate_print_file_image(placement=placement, template_part=self.part)
+        bbox = image.getbbox()
+        # "cover" fills the full target box — production placement width/height is 300*3=900.
+        self.assertAlmostEqual(bbox[2] - bbox[0], 900, delta=2)
+        self.assertAlmostEqual(bbox[3] - bbox[1], 900, delta=2)
+
+    def test_rotation_applied(self):
+        from .services import generate_print_file_image
+
+        placement_a = make_printable_placement(self.project, self.part, source_size=(300, 100), width=300, height=100, rotation=0)
+        image_a = generate_print_file_image(placement=placement_a, template_part=self.part)
+        bbox_a = image_a.getbbox()
+
+        placement_b = make_printable_placement(
+            self.project, self.part, part_name="front-b", source_size=(300, 100), width=300, height=100, rotation=90
+        )
+        # rotation lives on the placement, not tied to part_name uniqueness — reuse same part.
+        placement_b.part_name = self.part.name
+        image_b = generate_print_file_image(placement=placement_b, template_part=self.part)
+        bbox_b = image_b.getbbox()
+
+        self.assertGreater(bbox_a[2] - bbox_a[0], bbox_a[3] - bbox_a[1])  # unrotated: wide
+        self.assertGreater(bbox_b[3] - bbox_b[1], bbox_b[2] - bbox_b[0])  # rotated 90°: tall
+
+    def test_opacity_applied(self):
+        from .services import generate_print_file_image
+
+        placement = make_printable_placement(self.project, self.part, opacity=0.4)
+        image = generate_print_file_image(placement=placement, template_part=self.part)
+        bbox = image.getbbox()
+        alpha = image.getpixel(((bbox[0] + bbox[2]) // 2, (bbox[1] + bbox[3]) // 2))[3]
+        self.assertLess(alpha, 255)
+        self.assertGreater(alpha, 0)
+
+    def test_transparency_preserved(self):
+        from .services import generate_print_file_image
+
+        placement = make_printable_placement(self.project, self.part, source_color=(255, 0, 0, 0))  # fully transparent source
+        image = generate_print_file_image(placement=placement, template_part=self.part)
+        # A fully-transparent source composited on a transparent canvas stays fully transparent.
+        self.assertIsNone(image.getbbox())
+
+    def test_garment_shadow_and_highlight_are_never_present(self):
+        from .services import generate_print_file_image
+
+        # Deliberately distinct, opaque colours for the mockup-photo layers this pipeline must
+        # never touch — if any leaked in, that exact colour would appear in the output.
+        attach_image(self.part.base_image, "garment.png")  # transparent 4x4 by default; make it opaque+distinct:
+        garment = Image.new("RGBA", (1000, 1000), (10, 20, 30, 255))
+        buffer = BytesIO()
+        garment.save(buffer, format="PNG")
+        self.part.base_image.save("garment.png", ContentFile(buffer.getvalue()), save=False)
+        shadow = Image.new("RGBA", (1000, 1000), (40, 50, 60, 255))
+        buffer2 = BytesIO()
+        shadow.save(buffer2, format="PNG")
+        self.part.shadow_layer.save("shadow.png", ContentFile(buffer2.getvalue()), save=False)
+        highlight = Image.new("RGBA", (1000, 1000), (70, 80, 90, 255))
+        buffer3 = BytesIO()
+        highlight.save(buffer3, format="PNG")
+        self.part.highlight_layer.save("highlight.png", ContentFile(buffer3.getvalue()), save=False)
+        self.part.save()
+
+        placement = make_printable_placement(self.project, self.part, source_color=(255, 0, 0, 255))
+        image = generate_print_file_image(placement=placement, template_part=self.part)
+
+        forbidden_colours = {(10, 20, 30), (40, 50, 60), (70, 80, 90)}
+        found_colours = {pixel[:3] for pixel in image.getdata() if pixel[3] > 0}
+        self.assertFalse(found_colours & forbidden_colours)
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(prefix="artverse-test-media-"))
+class ProductionPrintFileTextTests(TestCase):
+    """Roadmap item 7: text layers in production output."""
+
+    def setUp(self):
+        self.user = make_user()
+        self.template = make_template(slug="print-text-test")
+        self.part = make_production_part(self.template, print_file_width=1200, print_file_height=1200)
+        self.project = DesignProject.objects.create(user=self.user, mockup_template=self.template, name="P")
+
+    def test_visible_text_rendered_and_hidden_excluded(self):
+        from .services import generate_print_file_image
+
+        placement = DesignPlacement.objects.create(
+            design_project=self.project,
+            part_name=self.part.name,
+            template_part=self.part,
+            text_elements=[
+                {"text": "SHOW", "x": 200, "y": 200, "fontSize": 40, "color": "#fff"},
+                {"text": "HIDE", "isHidden": True, "x": 400, "y": 400, "fontSize": 40, "color": "#fff"},
+            ],
+        )
+        image = generate_print_file_image(placement=placement, template_part=self.part)
+        self.assertIsNotNone(image.getbbox())
+        # Hidden text's own region (scaled) has nothing drawn.
+        hidden_region_alpha = [image.getpixel((x, y))[3] for x in range(850, 950) for y in range(850, 950)]
+        self.assertTrue(all(a == 0 for a in hidden_region_alpha))
+
+    def test_locked_text_still_renders(self):
+        from .services import generate_print_file_image
+
+        placement = DesignPlacement.objects.create(
+            design_project=self.project,
+            part_name=self.part.name,
+            template_part=self.part,
+            text_elements=[{"text": "LOCKED", "isLocked": True, "x": 200, "y": 200, "fontSize": 40, "color": "#fff"}],
+        )
+        image = generate_print_file_image(placement=placement, template_part=self.part)
+        self.assertIsNotNone(image.getbbox())
+
+    def test_multiline_text_preserved(self):
+        # Compare a one-line vs. a two-line placement (unsaved DesignPlacement instances — no
+        # need to persist them, generate_print_file_image only reads attributes) to prove the
+        # second line actually adds height in the production output, not just the preview.
+        from .services import generate_print_file_image
+
+        def bbox_for(text):
+            placement = DesignPlacement(
+                design_project=self.project,
+                part_name=self.part.name,
+                template_part=self.part,
+                text_elements=[{"text": text, "x": 200, "y": 200, "fontSize": 30, "color": "#fff", "lineHeight": 1.4}],
+            )
+            return generate_print_file_image(placement=placement, template_part=self.part).getbbox()
+
+        single_line_bbox = bbox_for("LINE ONE")
+        two_line_bbox = bbox_for("LINE ONE\nLINE TWO")
+
+        self.assertIsNotNone(single_line_bbox)
+        self.assertIsNotNone(two_line_bbox)
+        single_height = single_line_bbox[3] - single_line_bbox[1]
+        two_line_height = two_line_bbox[3] - two_line_bbox[1]
+        self.assertGreater(two_line_height, single_height)
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(prefix="artverse-test-media-"))
+class ProductionPrintFileStorageAndInvalidationTests(APITestCase):
+    """Roadmap items 8/9/10: separate storage from previews, signature-based cache reuse and
+    invalidation, and the generate/status API endpoints (ownership-scoped)."""
+
+    def setUp(self):
+        self.user = make_user("owner")
+        self.other_user = make_user("intruder")
+        self.template = make_template(slug="print-storage-test")
+        self.part = make_production_part(self.template, print_file_width=900, print_file_height=900)
+        self.project = DesignProject.objects.create(user=self.user, mockup_template=self.template, name="Storage test")
+        self.placement = make_printable_placement(self.project, self.part)
+
+    def test_print_file_stored_as_separate_model_from_preview(self):
+        from .services import create_or_reuse_print_file
+
+        record, _ = create_or_reuse_print_file(placement=self.placement, template_part=self.part)
+        self.assertIsInstance(record, GeneratedPrintFile)
+        self.assertEqual(MockupRender.objects.count(), 0)  # nothing written to the preview model
+
+    def test_same_signature_reuses_existing_file(self):
+        from .services import create_or_reuse_print_file
+
+        record1, reused1 = create_or_reuse_print_file(placement=self.placement, template_part=self.part)
+        record2, reused2 = create_or_reuse_print_file(placement=self.placement, template_part=self.part)
+        self.assertFalse(reused1)
+        self.assertTrue(reused2)
+        self.assertEqual(record1.id, record2.id)
+        self.assertEqual(GeneratedPrintFile.objects.filter(design_placement=self.placement).count(), 1)
+
+    def test_changed_placement_invalidates_prior_file(self):
+        from .services import create_or_reuse_print_file
+
+        record1, _ = create_or_reuse_print_file(placement=self.placement, template_part=self.part)
+        self.placement.x = self.placement.x + 50
+        self.placement.save(update_fields=["x"])
+        record2, reused = create_or_reuse_print_file(placement=self.placement, template_part=self.part)
+        self.assertFalse(reused)
+        self.assertNotEqual(record1.id, record2.id)
+        self.assertEqual(GeneratedPrintFile.objects.filter(design_placement=self.placement).count(), 2)
+
+    def test_generate_endpoint_updates_placement_print_file_url(self):
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post(f"/api/generator/design-projects/{self.project.id}/generate-print-files/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["status"], "completed")
+        self.placement.refresh_from_db()
+        self.assertTrue(self.placement.print_file_url)
+        part_result = response.data["parts"][0]
+        self.assertEqual(part_result["status"], "completed")
+        self.assertFalse(part_result["reused"])
+
+    def test_generate_endpoint_reports_reused_on_second_call(self):
+        self.client.force_authenticate(user=self.user)
+        self.client.post(f"/api/generator/design-projects/{self.project.id}/generate-print-files/")
+        response = self.client.post(f"/api/generator/design-projects/{self.project.id}/generate-print-files/")
+        self.assertTrue(response.data["parts"][0]["reused"])
+
+    def test_empty_placement_skipped_by_generate_endpoint(self):
+        empty_placement = DesignPlacement.objects.create(
+            design_project=self.project, part_name="back", template_part=None
+        )
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post(f"/api/generator/design-projects/{self.project.id}/generate-print-files/")
+        part_names = [p["part_name"] for p in response.data["parts"]]
+        self.assertNotIn("back", part_names)  # empty part omitted, not reported as failed
+
+    def test_another_user_cannot_access_or_generate_print_files(self):
+        self.client.force_authenticate(user=self.other_user)
+        response = self.client.post(f"/api/generator/design-projects/{self.project.id}/generate-print-files/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+        response = self.client.get(f"/api/generator/design-projects/{self.project.id}/print-files/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_status_endpoint_returns_previously_generated_files_without_regenerating(self):
+        self.client.force_authenticate(user=self.user)
+        self.client.post(f"/api/generator/design-projects/{self.project.id}/generate-print-files/")
+        count_before = GeneratedPrintFile.objects.count()
+
+        response = self.client.get(f"/api/generator/design-projects/{self.project.id}/print-files/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(GeneratedPrintFile.objects.count(), count_before)  # no new generation triggered
+        self.assertEqual(response.data["parts"][0]["status"], "completed")
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(prefix="artverse-test-media-"))
+class PrintFileCoordinateMappingTests(TestCase):
+    """Roadmap item 5: preview -> fixed print area -> production coordinate mapping."""
+
+    def setUp(self):
+        self.user = make_user()
+        self.template = make_template(slug="coordinate-mapping-test")
+
+    def test_preview_coordinates_scale_correctly(self):
+        from .services import map_placement_to_production_canvas
+
+        part = make_production_part(
+            self.template, print_file_width=1200, print_file_height=1200, fixed_area={"x": 0, "y": 0, "width": 400, "height": 400}
+        )
+        project = DesignProject.objects.create(user=self.user, mockup_template=self.template, name="P")
+        placement = make_printable_placement(project, part, x=100, y=100, width=200, height=200)
+
+        mapped = map_placement_to_production_canvas(placement=placement, template_part=part)
+        # scale = 1200/400 = 3
+        self.assertAlmostEqual(mapped["x"], 300)
+        self.assertAlmostEqual(mapped["y"], 300)
+        self.assertAlmostEqual(mapped["width"], 600)
+        self.assertAlmostEqual(mapped["height"], 600)
+
+    def test_fixed_print_area_offset_is_handled(self):
+        from .services import map_placement_to_production_canvas
+
+        part = make_production_part(
+            self.template, print_file_width=1000, print_file_height=1000, fixed_area={"x": 200, "y": 200, "width": 500, "height": 500}
+        )
+        project = DesignProject.objects.create(user=self.user, mockup_template=self.template, name="P")
+        placement = make_printable_placement(project, part, x=200, y=200, width=250, height=250)
+
+        mapped = map_placement_to_production_canvas(placement=placement, template_part=part)
+        # relative to the fixed area's own origin (200,200): (0,0); scale = 1000/500 = 2
+        self.assertAlmostEqual(mapped["x"], 0)
+        self.assertAlmostEqual(mapped["y"], 0)
+        self.assertAlmostEqual(mapped["width"], 500)
+        self.assertAlmostEqual(mapped["height"], 500)
+
+    def test_rotation_opacity_fit_preserved_through_mapping(self):
+        from .services import map_placement_to_production_canvas
+
+        part = make_production_part(self.template)
+        project = DesignProject.objects.create(user=self.user, mockup_template=self.template, name="P")
+        placement = make_printable_placement(
+            project, part, rotation=45, opacity=0.6, fit=DesignPlacement.Fit.COVER
+        )
+
+        mapped = map_placement_to_production_canvas(placement=placement, template_part=part)
+        self.assertEqual(mapped["rotation"], 45)
+        self.assertEqual(mapped["opacity"], 0.6)
+        self.assertEqual(mapped["fit"], DesignPlacement.Fit.COVER)
+
+    def test_safe_area_and_bleed_metadata_never_render_into_output(self):
+        # safe_area/bleed_area exist on MockupTemplatePart purely as editor-guide metadata —
+        # generate_print_file_image() must never read them at all.
+        from .services import generate_print_file_image
+
+        part = make_production_part(self.template)
+        part.safe_area = {"left": 5, "top": 5, "width": 90, "height": 90}
+        part.bleed_area = {"top": 20, "right": 20, "bottom": 20, "left": 20}
+        part.save()
+        project = DesignProject.objects.create(user=self.user, mockup_template=self.template, name="P")
+        placement = make_printable_placement(project, part)
+
+        # Should render exactly the same regardless of safe/bleed metadata being present.
+        image = generate_print_file_image(placement=placement, template_part=part)
+        self.assertIsNotNone(image.getbbox())
+
+    def test_missing_fixed_print_area_raises(self):
+        from .services import map_placement_to_production_canvas
+
+        part = MockupTemplatePart.objects.create(
+            template=self.template,
+            name=MockupTemplatePart.PartName.LEFT_SLEEVE,
+            dpi=300,
+            print_file_width=1000,
+            print_file_height=1000,
+            config={},
+        )
+        # No base_image and no explicit placement config -> fixed area resolves to 0x0.
+        project = DesignProject.objects.create(user=self.user, mockup_template=self.template, name="P")
+        placement = make_printable_placement(project, part)
+        with self.assertRaises(ValueError):
+            map_placement_to_production_canvas(placement=placement, template_part=part)
