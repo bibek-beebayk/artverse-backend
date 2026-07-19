@@ -527,16 +527,31 @@ class DesignProjectValidationTests(APITestCase):
         self.client.force_authenticate(user=self.user)
 
     def test_rejects_variant_from_another_template(self):
-        other_variant = make_variant(self.template_b, product=self.product_b, color_name="Black", size="M")
+        # Belongs to the *correct* product (product_a) so the product-match check doesn't also
+        # fire and overwrite this test's error — only the template mismatch. Also product-backed
+        # (product_id present) and otherwise unpriced (base_cost unset, the make_variant default)
+        # — so if the template-mismatch check didn't take precedence over the generic sellability
+        # check, this would instead surface the wrong (sellability) message. It must not: the
+        # template-specific error wins.
+        other_variant = make_variant(self.template_b, product=self.product_a, color_name="Black", size="M")
         response = self.client.post(
             "/api/generator/design-projects/",
-            {"mockup_template_id": self.template_a.id, "selected_variant_id": other_variant.id},
+            {
+                "mockup_template_id": self.template_a.id,
+                "product_id": self.product_a.id,
+                "selected_variant_id": other_variant.id,
+            },
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("selected_variant_id", response.data)
+        self.assertEqual(
+            response.data["selected_variant_id"],
+            ["This variant does not belong to the selected mockup_template."],
+        )
 
     def test_rejects_variant_from_another_product(self):
+        # Also otherwise unpriced (base_cost unset) — proves the product-mismatch error takes
+        # precedence over the generic sellability error, not just that *some* error is returned.
         mismatched_variant = make_variant(self.template_a, product=self.product_b, color_name="Black", size="M")
         response = self.client.post(
             "/api/generator/design-projects/",
@@ -548,16 +563,26 @@ class DesignProjectValidationTests(APITestCase):
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("selected_variant_id", response.data)
+        self.assertEqual(
+            response.data["selected_variant_id"],
+            ["This variant does not belong to the selected product."],
+        )
 
     def test_rejects_unavailable_variant(self):
-        variant = make_variant(self.template_a, product=self.product_a, is_available=False)
+        # Also product-backed and priced (base_cost set) — proves the unavailable-variant error
+        # takes precedence over the generic sellability error, not just that *some* error fires.
+        variant = make_variant(self.template_a, product=self.product_a, is_available=False, base_cost="10.00")
         response = self.client.post(
             "/api/generator/design-projects/",
-            {"mockup_template_id": self.template_a.id, "selected_variant_id": variant.id},
+            {
+                "mockup_template_id": self.template_a.id,
+                "product_id": self.product_a.id,
+                "selected_variant_id": variant.id,
+            },
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data["selected_variant_id"], ["This variant is not available."])
 
     def test_rejects_variant_with_missing_production_cost(self):
         # is_available=True (the model default) but base_cost is left unset — available doesn't

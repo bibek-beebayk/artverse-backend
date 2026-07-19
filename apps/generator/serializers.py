@@ -697,18 +697,30 @@ class DesignProjectWriteSerializer(serializers.Serializer):
                     if not variant.is_available:
                         errors["selected_variant_id"] = "This variant is not available."
                     # Commercial sellability (configured production cost, valid provider mapping)
-                    # on top of the relationship/availability checks above — only evaluated when
-                    # none of those more specific checks already failed, so a template/product
-                    # mismatch is never masked by this more generic message. Deferred import: see
-                    # ProductVariantSerializer.get_is_sellable's identical comment above — this
-                    # avoids a module-load-time circular import between apps.generator and
-                    # apps.shop.
-                    if "selected_variant_id" not in errors:
+                    # on top of the relationship/availability checks above — only evaluated for a
+                    # product-backed selection with a known template, and only when none of the
+                    # more specific checks above already failed, so a template/product mismatch
+                    # or unavailable-variant error is never masked by this more generic message.
+                    # Scoped to THIS request's freshly-resolved variant (not the `elif instance is
+                    # not None` branch below) so a write that doesn't touch selected_variant_id at
+                    # all never re-validates an existing project's already-set variant — a saved
+                    # design whose variant later becomes unsellable stays fully readable and
+                    # editable for everything else. Deferred import: apps.shop.services doesn't
+                    # import apps.generator at module load time (this app already imports
+                    # apps.shop.models at its own top — see apps/shop/services.py's module
+                    # docstring), so importing it here rather than at this file's top avoids a
+                    # cycle.
+                    if (
+                        variant is not None
+                        and product is not None
+                        and template is not None
+                        and "selected_variant_id" not in errors
+                    ):
                         from apps.shop.services import variant_is_sellable
 
                         if not variant_is_sellable(
                             variant,
-                            mockup_template_id=template.id if template else None,
+                            mockup_template_id=template.id,
                         ):
                             errors["selected_variant_id"] = (
                                 "This variant is not currently sellable."
