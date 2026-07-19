@@ -68,6 +68,7 @@ INSTALLED_APPS = [
     "apps.gallery",
     "apps.shop",
     "apps.generator",
+    "apps.cart",
     "apps.printify",
 ]
 
