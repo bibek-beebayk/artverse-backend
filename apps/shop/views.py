@@ -6,6 +6,17 @@ from .serializers import (
     ProductCategorySerializer,
     ProductSerializer,
 )
+from .services import sellable_variant_exists_subquery
+
+# Shared by both public views: active AND has at least one sellable variant (see
+# apps.shop.services.sellable_variant_exists_subquery — kept in sync with
+# product_has_sellable_variant()'s Python-side criteria). One correlated EXISTS subquery
+# evaluated per row in SQL, not a per-product Python check — avoids an N+1 query explosion on
+# the list endpoint. Internal/admin code (Django admin, the activation service) intentionally
+# does NOT go through this — it still needs to see inactive/incomplete products.
+_PUBLIC_PRODUCTS = Product.objects.annotate(_has_sellable_variant=sellable_variant_exists_subquery()).filter(
+    is_active=True, _has_sellable_variant=True
+)
 
 
 class ProductCategoryListView(ListAPIView):
@@ -17,9 +28,7 @@ class ProductListView(ListAPIView):
     serializer_class = ProductSerializer
 
     def get_queryset(self):
-        queryset = Product.objects.filter(is_active=True).select_related("category", "mockup_template").prefetch_related(
-            "variants"
-        )
+        queryset = _PUBLIC_PRODUCTS.select_related("category", "mockup_template").prefetch_related("variants")
         category_slug = self.request.query_params.get("category")
         if category_slug and category_slug.lower() != "all":
             queryset = queryset.filter(category__slug=category_slug)
@@ -27,9 +36,7 @@ class ProductListView(ListAPIView):
 
 
 class ProductDetailView(RetrieveAPIView):
-    queryset = Product.objects.filter(is_active=True).select_related("category", "mockup_template").prefetch_related(
-        "variants"
-    )
+    queryset = _PUBLIC_PRODUCTS.select_related("category", "mockup_template").prefetch_related("variants")
     serializer_class = ProductSerializer
     lookup_field = "slug"
 

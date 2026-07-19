@@ -3,6 +3,7 @@ from rest_framework import serializers
 from apps.generator.serializers import ProductVariantSerializer
 
 from .models import NotificationSubscription, Product, ProductCategory
+from .services import _sellable_variants_for_product, get_product_starting_price
 
 
 class ProductCategorySerializer(serializers.ModelSerializer):
@@ -12,6 +13,12 @@ class ProductCategorySerializer(serializers.ModelSerializer):
 
 
 class ProductSerializer(serializers.ModelSerializer):
+    """Product carries no price/inventory of its own anymore — `starting_price`/`is_available`/
+    `available_variant_count` are all derived from `ProductVariant` (see apps.shop.services).
+    Every derived field here reuses the same prefetch-aware helpers, so calling this serializer
+    against a queryset that prefetched `variants` (see ProductListView/ProductDetailView) costs
+    zero extra queries per product regardless of how many of these fields are accessed."""
+
     category = ProductCategorySerializer(read_only=True)
     image = serializers.SerializerMethodField()
     thumbnail = serializers.SerializerMethodField()
@@ -19,6 +26,10 @@ class ProductSerializer(serializers.ModelSerializer):
     variants = serializers.SerializerMethodField()
     available_sizes = serializers.SerializerMethodField()
     available_colors = serializers.SerializerMethodField()
+    starting_price = serializers.SerializerMethodField()
+    is_available = serializers.SerializerMethodField()
+    available_variant_count = serializers.SerializerMethodField()
+    total_variant_count = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
@@ -28,12 +39,14 @@ class ProductSerializer(serializers.ModelSerializer):
             "slug",
             "category",
             "description",
-            "price",
             "image",
             "thumbnail",
             "image_url",
-            "inventory",
             "is_active",
+            "starting_price",
+            "is_available",
+            "available_variant_count",
+            "total_variant_count",
             "mockup_template_id",
             "variants",
             "available_sizes",
@@ -59,6 +72,11 @@ class ProductSerializer(serializers.ModelSerializer):
     def _available_variants(self, obj: Product):
         # Relies on the view prefetching `variants` filtered/ordered appropriately to avoid N+1;
         # falls back to a live query if accessed without that prefetch (e.g. in the admin/shell).
+        # Deliberately just `is_available` — this is the DISPLAY list (which colours/sizes a
+        # shopper can pick), not the stricter "sellable" definition (which also requires a
+        # configured production cost and template match) used for starting_price/is_available
+        # below. A variant missing its cost still shows as a pickable option; adding it to the
+        # cart is where the existing pricing-warning system (apps.cart) catches that.
         if hasattr(obj, "_prefetched_objects_cache") and "variants" in obj._prefetched_objects_cache:
             return [v for v in obj.variants.all() if v.is_available]
         return list(obj.variants.filter(is_available=True))
@@ -81,6 +99,21 @@ class ProductSerializer(serializers.ModelSerializer):
         if obj.mockup_template_id:
             return obj.mockup_template.supported_colors
         return []
+
+    def get_starting_price(self, obj: Product):
+        price = get_product_starting_price(obj)
+        return str(price) if price is not None else None
+
+    def get_is_available(self, obj: Product):
+        return len(_sellable_variants_for_product(obj)) > 0
+
+    def get_available_variant_count(self, obj: Product):
+        return len(_sellable_variants_for_product(obj))
+
+    def get_total_variant_count(self, obj: Product):
+        if hasattr(obj, "_prefetched_objects_cache") and "variants" in obj._prefetched_objects_cache:
+            return len(obj.variants.all())
+        return obj.variants.count()
 
 
 class NotificationSubscriptionSerializer(serializers.ModelSerializer):

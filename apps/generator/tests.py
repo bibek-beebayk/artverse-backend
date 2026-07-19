@@ -13,6 +13,7 @@ from rest_framework.test import APITestCase
 from apps.accounts.models import User
 from apps.gallery.models import Artwork, Category
 from apps.shop.models import Product, ProductCategory
+from apps.shop.serializers import ProductSerializer
 
 from .models import (
     DesignPlacement,
@@ -54,7 +55,7 @@ def make_template(slug="tshirt-test", with_parts=True, **overrides):
 def make_shop_product(template, slug="test-product"):
     category = ProductCategory.objects.create(name=f"Cat {slug}", slug=f"cat-{slug}")
     return Product.objects.create(
-        name="Test Product", slug=slug, category=category, price="19.99", mockup_template=template
+        name="Test Product", slug=slug, category=category, mockup_template=template, is_active=True
     )
 
 
@@ -136,10 +137,11 @@ class DesignProjectModelTests(TestCase):
         self.assertIn(product, self.template.shop_products.all())
 
     def test_product_variant_uniqueness(self):
-        make_variant(self.template, color_name="Black", size="M")
+        product = make_shop_product(self.template)
+        make_variant(self.template, product=product, color_name="Black", size="M")
         with self.assertRaises(IntegrityError):
             with transaction.atomic():
-                make_variant(self.template, color_name="Black", size="M")
+                make_variant(self.template, product=product, color_name="Black", size="M")
 
     def test_cascade_deletion_of_placements(self):
         project = DesignProject.objects.create(user=self.user, mockup_template=self.template)
@@ -525,7 +527,7 @@ class DesignProjectValidationTests(APITestCase):
         self.client.force_authenticate(user=self.user)
 
     def test_rejects_variant_from_another_template(self):
-        other_variant = make_variant(self.template_b, color_name="Black", size="M")
+        other_variant = make_variant(self.template_b, product=self.product_b, color_name="Black", size="M")
         response = self.client.post(
             "/api/generator/design-projects/",
             {"mockup_template_id": self.template_a.id, "selected_variant_id": other_variant.id},
@@ -549,7 +551,7 @@ class DesignProjectValidationTests(APITestCase):
         self.assertIn("selected_variant_id", response.data)
 
     def test_rejects_unavailable_variant(self):
-        variant = make_variant(self.template_a, is_available=False)
+        variant = make_variant(self.template_a, product=self.product_a, is_available=False)
         response = self.client.post(
             "/api/generator/design-projects/",
             {"mockup_template_id": self.template_a.id, "selected_variant_id": variant.id},
@@ -568,7 +570,7 @@ class DesignProjectValidationTests(APITestCase):
         self.assertIn("placements", response.data)
 
     def test_rejects_part_variant_does_not_support(self):
-        variant = make_variant(self.template_a, supported_print_areas=["front"])
+        variant = make_variant(self.template_a, product=self.product_a, supported_print_areas=["front"])
         response = self.client.post(
             "/api/generator/design-projects/",
             {
@@ -867,26 +869,34 @@ class ProductAndVariantAPITests(APITestCase):
 
     def test_product_exposes_template_mapping(self):
         product = make_shop_product(self.template, slug="mapped")
+        # A product needs at least one sellable variant (available + priced) to be publicly
+        # visible at all now — see apps.shop.services.product_has_sellable_variant().
+        make_variant(self.template, product=product, base_cost="10.00")
         response = self.client.get(f"/api/shop/products/{product.slug}/")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["mockup_template_id"], self.template.id)
 
     def test_product_exposes_available_variants_and_sizes_colors(self):
         product = make_shop_product(self.template, slug="withvariants")
-        make_variant(self.template, product=product, color_name="Black", size="M")
+        make_variant(self.template, product=product, color_name="Black", size="M", base_cost="10.00")
         make_variant(self.template, product=product, color_name="White", size="L", is_available=False)
         response = self.client.get(f"/api/shop/products/{product.slug}/")
+        self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.data["variants"]), 1)
         self.assertEqual(response.data["available_sizes"], ["M"])
         self.assertEqual(response.data["available_colors"], ["Black"])
 
     def test_product_without_variants_falls_back_to_template_lists(self):
+        # A product with zero variants can never be *publicly* reachable anymore (no sellable
+        # variant), so this now tests the serializer's own fallback logic directly rather than
+        # through the public endpoint (which correctly 404s — see
+        # ProductPublicVisibilityTests in apps/shop/tests.py for that behaviour).
         template = make_template(slug="fallback-template", supported_colors=["Red"], supported_sizes=["S"])
         product = make_shop_product(template, slug="novariants")
-        response = self.client.get(f"/api/shop/products/{product.slug}/")
-        self.assertEqual(response.data["variants"], [])
-        self.assertEqual(response.data["available_sizes"], ["S"])
-        self.assertEqual(response.data["available_colors"], ["Red"])
+        data = ProductSerializer(product).data
+        self.assertEqual(data["variants"], [])
+        self.assertEqual(data["available_sizes"], ["S"])
+        self.assertEqual(data["available_colors"], ["Red"])
 
     def test_variant_list_filters_by_product_and_template(self):
         product = make_shop_product(self.template, slug="filtertest")
@@ -1016,8 +1026,11 @@ class ProductVariantUniquenessTests(TestCase):
             with transaction.atomic():
                 make_variant(self.template, product=product, color_name="Black", size="M")
 
-    def test_template_only_variants_still_cannot_duplicate(self):
-        make_variant(self.template, product=None, color_name="Black", size="M")
+    def test_orphan_variant_creation_fails(self):
+        # product is now a required FK (NOT NULL) — a variant with no product can no longer be
+        # created at all, not even transiently. This replaces the old
+        # unique_template_color_size_without_product fallback constraint, which is gone now that
+        # every variant must belong to a product.
         with self.assertRaises(IntegrityError):
             with transaction.atomic():
                 make_variant(self.template, product=None, color_name="Black", size="M")

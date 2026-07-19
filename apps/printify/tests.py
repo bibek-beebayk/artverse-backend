@@ -45,7 +45,7 @@ def make_template(slug="tshirt-test"):
 def make_shop_product(template, slug="test-product"):
     category = ProductCategory.objects.create(name=f"Cat {slug}", slug=f"cat-{slug}")
     return Product.objects.create(
-        name="Test Product", slug=slug, category=category, price="19.99", mockup_template=template
+        name="Test Product", slug=slug, category=category, mockup_template=template, is_active=True
     )
 
 
@@ -280,7 +280,10 @@ class ProductVariantSyncTests(TestCase):
 
         summary = sync_product_variants_from_printify(self.product)
 
-        self.assertEqual(summary, {"created": 1, "updated": 1, "marked_unavailable": 1})
+        self.assertEqual(
+            summary,
+            {"created": 1, "updated": 1, "skipped": 0, "unavailable": 1, "missing_cost": 2, "errors": []},
+        )
 
         existing_match.refresh_from_db()
         self.assertEqual(existing_match.external_variant_id, "100")
@@ -320,6 +323,21 @@ class ProductVariantSyncTests(TestCase):
         new_variant = ProductVariant.objects.get(product=self.product, color_name="Black", size="M")
         self.assertIsNone(new_variant.retail_price)
         self.assertIsNone(new_variant.base_cost)
+
+    def test_synced_variants_always_belong_to_a_product(self):
+        sync_product_variants_from_printify(self.product)
+        self.assertFalse(ProductVariant.objects.filter(product__isnull=True).exists())
+        for variant in ProductVariant.objects.filter(template=self.template):
+            self.assertEqual(variant.product_id, self.product.id)
+
+    def test_duplicate_sync_does_not_duplicate_variants(self):
+        sync_product_variants_from_printify(self.product)
+        first_count = ProductVariant.objects.filter(product=self.product).count()
+        summary = sync_product_variants_from_printify(self.product)
+        second_count = ProductVariant.objects.filter(product=self.product).count()
+        self.assertEqual(first_count, second_count)
+        self.assertEqual(summary["created"], 0)
+        self.assertEqual(summary["updated"], 2)
 
 
 @override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345", PRINTIFY_ENABLED=True)

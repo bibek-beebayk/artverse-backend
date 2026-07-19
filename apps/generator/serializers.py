@@ -652,7 +652,9 @@ class DesignProjectWriteSerializer(serializers.Serializer):
                 else:
                     if template and variant.template_id != template.id:
                         errors["selected_variant_id"] = "This variant does not belong to the selected mockup_template."
-                    if product and variant.product_id and variant.product_id != product.id:
+                    # variant.product_id is always set now (ProductVariant.product is a required
+                    # FK) — no need to guard against a null product_id here anymore.
+                    if product and variant.product_id != product.id:
                         errors["selected_variant_id"] = "This variant does not belong to the selected product."
                     if not variant.is_available:
                         errors["selected_variant_id"] = "This variant is not available."

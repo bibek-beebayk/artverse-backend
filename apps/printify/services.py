@@ -340,15 +340,25 @@ def sync_print_providers_for_blueprint(blueprint: PrintifyBlueprint, provider_id
 
 def sync_product_variants_from_printify(product) -> dict:
     """Import/refresh a shop.Product's ProductVariant rows from its mapped Printify print
-    provider's synced variant catalogue, matched by (colour, size). Never deletes a row: a
-    variant no longer offered by the provider is marked unavailable instead, so existing orders
-    and cart references stay valid. Pricing (base_cost/retail_price) is intentionally left for
-    an admin to review and set — Printify's catalogue endpoint doesn't reliably return retail-
-    ready cost data, so silently writing a guessed number would be worse than leaving it blank.
-    Returns a summary dict: {created, updated, marked_unavailable}.
+    provider's synced variant catalogue, matched by (colour, size). Every variant this creates
+    is always attached to `product` (a required, explicit argument — there's no code path here
+    that can produce an orphan `ProductVariant.product IS NULL` row). Never deletes a row: a
+    variant no longer offered by the provider is marked unavailable instead, so existing cart/
+    saved-design references stay valid. Pricing (base_cost/retail_price) is intentionally left
+    for an admin to review and set — Printify's catalogue endpoint doesn't reliably return
+    retail-ready cost data, so silently writing a guessed number would be worse than leaving it
+    blank; `missing_cost` in the returned summary flags exactly how many need that follow-up.
+
+    Matching is by (colour, size), not `external_variant_id` — deliberately: `external_provider`/
+    `external_variant_id` are still written and kept up to date on every row (so uniqueness and
+    any future ID-based lookup stay correct), but colour/size is the join key because it's what
+    actually identifies the row to shoppers and to the render pipeline. Since colour/size is also
+    the join key, a variant can never end up with the "wrong" colour/size after a sync — there's
+    nothing to reconcile on the update path.
 
     All writes happen inside one transaction.atomic() block — no network calls are made here
-    (the provider's variant catalogue is already-synced local data), so this is pure DB work."""
+    (the provider's variant catalogue is already-synced local data), so this is pure DB work.
+    Returns a summary dict: {created, updated, skipped, unavailable, missing_cost, errors}."""
     from apps.generator.models import ProductVariant
 
     from .validation import validate_provider_matches_template_blueprint
@@ -371,12 +381,21 @@ def sync_product_variants_from_printify(product) -> dict:
 
     provider_variants = provider.variants or []
     by_color_size: dict[tuple[str, str], dict] = {}
+    skipped = 0
     for entry in provider_variants:
         options = entry.get("options") or {}
-        key = (str(options.get("color", "")).strip(), str(options.get("size", "")).strip())
-        by_color_size[key] = entry
+        color = str(options.get("color", "")).strip()
+        size = str(options.get("size", "")).strip()
+        if not color and not size:
+            # No usable identifying data at all — can't be meaningfully synced as a colour/size
+            # variant. Rare in practice (Printify entries normally have at least one), but
+            # skipped rather than creating a row with no distinguishing attributes.
+            skipped += 1
+            continue
+        by_color_size[(color, size)] = entry
 
-    created = updated = marked_unavailable = 0
+    created = updated = unavailable = 0
+    errors: list[str] = []
 
     with transaction.atomic():
         existing = {
@@ -422,6 +441,17 @@ def sync_product_variants_from_printify(product) -> dict:
             if key not in by_color_size and variant.is_available:
                 variant.is_available = False
                 variant.save(update_fields=["is_available"])
-                marked_unavailable += 1
+                unavailable += 1
 
-    return {"created": created, "updated": updated, "marked_unavailable": marked_unavailable}
+        missing_cost = ProductVariant.objects.filter(
+            product=product, is_available=True, base_cost__isnull=True
+        ).count()
+
+    return {
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "unavailable": unavailable,
+        "missing_cost": missing_cost,
+        "errors": errors,
+    }

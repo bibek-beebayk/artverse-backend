@@ -43,9 +43,9 @@ def make_category(slug="cat-test"):
     return ProductCategory.objects.create(name=f"Category {slug}", slug=slug)
 
 
-def make_product(template=None, category=None, slug="cart-test-product", price="19.99"):
+def make_product(template=None, category=None, slug="cart-test-product"):
     category = category or make_category(slug=f"cat-{slug}")
-    return Product.objects.create(name="Test Product", slug=slug, category=category, price=price, mockup_template=template)
+    return Product.objects.create(name="Test Product", slug=slug, category=category, mockup_template=template, is_active=True)
 
 
 def make_variant(template, product=None, base_cost=None, color_name="Black", size="M"):
@@ -136,6 +136,26 @@ class PriceItemTests(TestCase):
         breakdown = price_item(product=self.product, variant=None, placements=placements)
         self.assertEqual(breakdown.base_cost, Decimal("0.00"))
         self.assertTrue(breakdown.warnings)
+
+    def test_retail_price_is_never_used_as_a_pricing_override(self):
+        # `ProductVariant.retail_price` is admin reference/display data only. Pricing must be
+        # driven solely by base_cost + print-area charges + markup, matching the product/variant
+        # refactor's explicit requirement that Product carries no price of its own and the cart
+        # engine never treats retail_price as an override.
+        variant = make_variant(self.template, self.product, base_cost=Decimal("10.00"))
+        variant.retail_price = Decimal("999.99")
+        variant.save(update_fields=["retail_price"])
+        project = make_design_project(self.user, self.template, self.product, variant)
+        placements = [make_printable_placement(project, "front")]
+
+        breakdown = price_item(product=self.product, variant=variant, placements=placements)
+        self.assertEqual(breakdown.unit_price, Decimal("10.00"))
+
+    def test_product_has_no_price_attribute_pricing_is_variant_only(self):
+        # Product carries no price/inventory of its own — this is a structural guarantee, not
+        # just a behavioral one, so pricing cannot accidentally fall back to a product-level value.
+        self.assertFalse(hasattr(self.product, "price"))
+        self.assertFalse(hasattr(self.product, "inventory"))
 
     def test_fixed_markup_applied(self):
         PricingRule.objects.create(

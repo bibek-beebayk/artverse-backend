@@ -211,18 +211,19 @@ class MockupTemplatePart(models.Model):
 
 
 class ProductVariant(models.Model):
-    """A specific purchasable colour/size combination, belonging to both a storefront
-    Product (what customers browse/buy) and the MockupTemplate that renders it (what the
-    customization editor and renderer use). `product` is nullable so a variant can exist
-    ahead of the storefront listing being wired up; `template` is required since rendering
-    always needs it."""
+    """The single source of truth for sellable pricing, availability and inventory — a specific
+    purchasable colour/size combination, belonging to both a storefront `Product` (what
+    customers browse/buy) and the `MockupTemplate` that renders it (what the customization
+    editor and renderer use). `product` is REQUIRED: every variant must belong to a real
+    storefront listing (see CHANGELOG.md for the migration from the old nullable/orphan-capable
+    shape). `template` is *also* required and, for now, deliberately still duplicated
+    alongside `product.mockup_template` rather than derived from it — see the module-level note
+    above `clean()` for why, and TODO.md for tracking its eventual removal."""
 
     product = models.ForeignKey(
         "shop.Product",
         on_delete=models.CASCADE,
         related_name="variants",
-        null=True,
-        blank=True,
     )
     template = models.ForeignKey(MockupTemplate, on_delete=models.PROTECT, related_name="variants")
     sku = models.CharField(max_length=64, blank=True)
@@ -233,8 +234,27 @@ class ProductVariant(models.Model):
     external_provider = models.CharField(max_length=120, blank=True, help_text="Fulfilment provider name, e.g. Printify.")
     external_variant_id = models.CharField(max_length=64, blank=True, help_text="Provider-side variant ID.")
     base_cost = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
-    retail_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
-    inventory = models.PositiveIntegerField(default=0)
+    retail_price = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text=(
+            "Admin reference/display only — NOT read by the pricing engine. "
+            "apps.cart.pricing.price_item() and apps.shop.services.get_product_starting_price() "
+            "both compute from base_cost + markup rules; this field is never used as an override."
+        ),
+    )
+    inventory = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Known physical stock quantity where supplied. Leave empty for print-on-demand "
+            "availability — empty inventory with is_available=True means the provider (e.g. "
+            "Printify) currently offers this variant, just with no numeric stock count given. "
+            "Never a placeholder like 9999 — empty means genuinely unknown, not unlimited."
+        ),
+    )
     is_available = models.BooleanField(default=True)
     image = models.ImageField(upload_to="product-variants/", blank=True, null=True)
     supported_print_areas = models.JSONField(
@@ -248,20 +268,23 @@ class ProductVariant(models.Model):
     class Meta:
         ordering = ("template", "color_name", "size")
         constraints = [
-            # Two different storefront products may legitimately share one template (e.g. two
-            # brands both selling off the same "Starter T-Shirt" template) and each needs to be
-            # able to offer "Black / M" independently — so uniqueness for product-linked variants
-            # is scoped per-product, not just per-template. Variants with no product yet (created
-            # ahead of the storefront listing) fall back to the old template-only uniqueness.
+            # `product` is now required, so this is unconditional — every variant is scoped to
+            # its own product's colour/size uniqueness. Two different storefront products may
+            # legitimately share one template (e.g. two brands both selling off the same
+            # "Starter T-Shirt" template) and each still gets to offer "Black / M" independently.
             models.UniqueConstraint(
                 fields=["product", "template", "color_name", "size"],
-                condition=models.Q(product__isnull=False),
                 name="unique_product_template_color_size",
             ),
+            # A given provider-side variant ID should only ever back one local row — guards
+            # against a sync bug (or manual data entry) attaching the same Printify variant to
+            # two different ProductVariant rows. Blank external_variant_id (a variant with no
+            # provider mapping yet) is explicitly exempted, since many rows legitimately share
+            # the empty string.
             models.UniqueConstraint(
-                fields=["template", "color_name", "size"],
-                condition=models.Q(product__isnull=True),
-                name="unique_template_color_size_without_product",
+                fields=["external_provider", "external_variant_id"],
+                condition=~models.Q(external_variant_id=""),
+                name="unique_external_provider_variant",
             ),
         ]
 
@@ -272,6 +295,11 @@ class ProductVariant(models.Model):
     def clean(self):
         from django.core.exceptions import ValidationError
 
+        # `ProductVariant.template` duplicates `product.mockup_template` rather than being
+        # derived from it — kept deliberately for this task (see TODO.md: removing it is future
+        # work, since the renderer/editor currently read placement/part data through `template`
+        # directly on a lot of call sites that don't necessarily have `product` loaded). This
+        # check is what keeps the two from silently drifting apart in the meantime.
         if self.product_id and self.product.mockup_template_id and self.product.mockup_template_id != self.template_id:
             raise ValidationError(
                 "This variant's template must match its product's configured mockup_template."

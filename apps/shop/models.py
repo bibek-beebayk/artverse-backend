@@ -16,16 +16,22 @@ class ProductCategory(models.Model):
 
 
 class Product(models.Model):
+    """The Artverse storefront listing — not physical stock. Pricing, availability and
+    inventory are entirely variant-driven now (see `ProductVariant` in `apps.generator.models`
+    and `apps.shop.services`): there is deliberately no `price`/`inventory` field here anymore.
+    `is_active` is the only admin-editable availability switch; whether the product actually has
+    anything sellable is a *derived* fact (`product_has_sellable_variant()`), not a second field
+    to keep in sync by hand — see `apps.shop.services.validate_product_can_be_activated()` for
+    the rule that's supposed to keep `is_active=True` and "no sellable variant" from coexisting."""
+
     name = models.CharField(max_length=255)
     slug = models.SlugField(unique=True)
     category = models.ForeignKey(ProductCategory, on_delete=models.PROTECT, related_name="products")
     description = models.TextField(blank=True)
-    price = models.DecimalField(max_digits=10, decimal_places=2)
     image = models.ImageField(upload_to="products/", blank=True, null=True)
     thumbnail = models.ImageField(upload_to="products/thumbnails/", blank=True, null=True)
     image_url = models.URLField(blank=True)
-    is_active = models.BooleanField(default=True)
-    inventory = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=False)
     mockup_template = models.ForeignKey(
         "generator.MockupTemplate",
         on_delete=models.SET_NULL,
@@ -35,6 +41,7 @@ class Product(models.Model):
         help_text="The customizable mockup template used to render this product's previews and print files.",
     )
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ("name",)
