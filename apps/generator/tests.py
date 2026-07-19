@@ -882,9 +882,29 @@ class ProductAndVariantAPITests(APITestCase):
         make_variant(self.template, product=product, color_name="White", size="L", is_available=False)
         response = self.client.get(f"/api/shop/products/{product.slug}/")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(len(response.data["variants"]), 1)
+        # `variants` deliberately includes the unavailable one too (with is_available=False), so
+        # the frontend can render it as a disabled option instead of it silently not existing —
+        # see apps.shop.serializers.ProductSerializer._all_product_variants.
+        self.assertEqual(len(response.data["variants"]), 2)
+        by_color = {v["color_name"]: v for v in response.data["variants"]}
+        self.assertTrue(by_color["Black"]["is_available"])
+        self.assertTrue(by_color["Black"]["is_sellable"])
+        self.assertFalse(by_color["White"]["is_available"])
+        self.assertFalse(by_color["White"]["is_sellable"])
+        # available_sizes/available_colors still describe only what's currently orderable.
         self.assertEqual(response.data["available_sizes"], ["M"])
         self.assertEqual(response.data["available_colors"], ["Black"])
+
+    def test_product_variant_missing_cost_is_visible_but_not_sellable(self):
+        product = make_shop_product(self.template, slug="missingcost")
+        make_variant(self.template, product=product, color_name="Black", size="M", base_cost="10.00")
+        make_variant(self.template, product=product, color_name="Red", size="S", base_cost=None, is_available=True)
+        response = self.client.get(f"/api/shop/products/{product.slug}/")
+        self.assertEqual(response.status_code, 200)
+        by_color = {v["color_name"]: v for v in response.data["variants"]}
+        self.assertTrue(by_color["Red"]["is_available"])
+        self.assertFalse(by_color["Red"]["pricing_ready"])
+        self.assertFalse(by_color["Red"]["is_sellable"])
 
     def test_product_without_variants_falls_back_to_template_lists(self):
         # A product with zero variants can never be *publicly* reachable anymore (no sellable

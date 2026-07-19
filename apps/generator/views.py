@@ -138,11 +138,18 @@ class MockupTemplateListView(ListAPIView):
 
 
 class ProductVariantListView(ListAPIView):
+    """Deliberately NOT filtered to `is_available=True` — the frontend colour/size pickers
+    (Customization.tsx, the guest-cart merge flow) need to see unavailable/unsellable variants
+    too, so they can render a disabled option with a reason instead of the combination simply
+    not existing. Each row carries `is_available`/`is_sellable`/`pricing_ready`
+    (ProductVariantSerializer) so the caller can distinguish "not offered" from "offered but not
+    yet priced" from "fully sellable" — never infer sellability from `is_available` alone."""
+
     serializer_class = ProductVariantSerializer
     permission_classes = [AllowAny]
 
     def get_queryset(self):
-        queryset = ProductVariant.objects.filter(is_available=True).select_related("template", "product")
+        queryset = ProductVariant.objects.select_related("template", "product")
         template_id = self.request.query_params.get("template_id")
         if template_id:
             queryset = queryset.filter(template_id=template_id)
@@ -321,7 +328,7 @@ class DesignProjectListCreateView(APIView):
     def get(self, request):
         queryset = (
             DesignProject.objects.filter(user=request.user)
-            .select_related("product", "mockup_template", "selected_variant")
+            .select_related("product", "mockup_template", "selected_variant", "selected_variant__product")
             .annotate(placement_count_annotated=Count("placements", distinct=True))
             .prefetch_related(
                 Prefetch(
@@ -391,7 +398,7 @@ class DesignProjectDetailView(APIView):
     def get_object(self, request, pk):
         return get_object_or_404(
             DesignProject.objects.select_related(
-                "user", "product", "mockup_template", "selected_variant"
+                "user", "product", "mockup_template", "selected_variant", "selected_variant__product"
             ).prefetch_related(_placements_prefetch()),
             pk=pk,
             user=request.user,
@@ -468,7 +475,9 @@ class DesignProjectDuplicateView(APIView):
 
     def post(self, request, pk):
         source = get_object_or_404(
-            DesignProject.objects.prefetch_related(_placements_prefetch()),
+            DesignProject.objects.select_related(
+                "product", "mockup_template", "selected_variant", "selected_variant__product"
+            ).prefetch_related(_placements_prefetch()),
             pk=pk,
             user=request.user,
         )

@@ -17,6 +17,7 @@ from .services import (
     get_product_starting_price,
     product_has_sellable_variant,
     validate_product_can_be_activated,
+    variant_is_sellable,
 )
 
 
@@ -180,6 +181,75 @@ class ProductVariantModelTests(TestCase):
         variant.full_clean()  # must not raise — null inventory + available is a valid POD state
         variant.save()
         self.assertIsNone(variant.inventory)
+
+
+class VariantSellabilityTests(TestCase):
+    """Direct tests of variant_is_sellable() — the single source of truth reused by both the
+    variant-level `is_sellable` API field and every product-level availability/pricing
+    calculation. See apps.shop.services.variant_is_sellable's docstring."""
+
+    def setUp(self):
+        self.template = make_template()
+        self.product = make_product(self.template)
+
+    def test_available_priced_variant_is_sellable(self):
+        variant = make_variant(self.product, self.template, base_cost=Decimal("10.00"), is_available=True)
+        self.assertTrue(variant_is_sellable(variant))
+
+    def test_missing_base_cost_is_not_sellable(self):
+        variant = make_variant(self.product, self.template, base_cost=None, is_available=True)
+        self.assertFalse(variant_is_sellable(variant))
+
+    def test_unavailable_variant_is_not_sellable(self):
+        variant = make_variant(self.product, self.template, base_cost=Decimal("10.00"), is_available=False)
+        self.assertFalse(variant_is_sellable(variant))
+
+    def test_template_mismatch_is_not_sellable(self):
+        other_template = make_template(slug="mismatch-sellability")
+        variant = make_variant(self.product, other_template, base_cost=Decimal("10.00"), is_available=True)
+        # Explicit mockup_template_id (as apps.shop.serializers passes when it already has the
+        # product loaded) catches the mismatch even though `variant.product.mockup_template_id`
+        # would resolve to the same thing via the fallback path.
+        self.assertFalse(variant_is_sellable(variant, mockup_template_id=self.template.id))
+        # Falls back to the product's own mockup_template_id when none is passed explicitly.
+        self.assertFalse(variant_is_sellable(variant))
+
+    def test_invalid_external_mapping_is_not_sellable(self):
+        variant = make_variant(
+            self.product,
+            self.template,
+            base_cost=Decimal("10.00"),
+            is_available=True,
+            external_provider="Printify",
+            external_variant_id="",
+        )
+        self.assertFalse(variant_is_sellable(variant))
+
+    def test_valid_external_mapping_is_sellable(self):
+        variant = make_variant(
+            self.product,
+            self.template,
+            base_cost=Decimal("10.00"),
+            is_available=True,
+            external_provider="Printify",
+            external_variant_id="12345",
+        )
+        self.assertTrue(variant_is_sellable(variant))
+
+    def test_local_variant_with_no_external_provider_follows_local_rules(self):
+        # A purely local/manual variant (no external_provider claimed at all) has nothing to
+        # validate on the provider-mapping front — available + priced is sufficient.
+        variant = make_variant(
+            self.product, self.template, base_cost=Decimal("10.00"), is_available=True, external_provider=""
+        )
+        self.assertTrue(variant_is_sellable(variant))
+
+    def test_mockup_template_id_fallback_reads_variant_product(self):
+        # Omitting mockup_template_id falls back to variant.product.mockup_template_id — proves
+        # the standalone (no-context) call path used by e.g. ProductVariantListView works.
+        variant = make_variant(self.product, self.template, base_cost=Decimal("10.00"), is_available=True)
+        variant = ProductVariant.objects.select_related("product").get(pk=variant.pk)
+        self.assertTrue(variant_is_sellable(variant))
 
 
 class ProductActivationTests(TestCase):
@@ -385,3 +455,99 @@ class ProductSerializerDirectTests(TestCase):
         data = ProductSerializer(product).data
         self.assertIsNone(data["starting_price"])
         self.assertFalse(data["is_available"])
+
+
+class ProductVariantSellabilityConsistencyTests(APITestCase):
+    """Section 18/19: Product.is_available / available_variant_count / starting_price and each
+    nested variant's is_sellable must never contradict each other — all four are derived from
+    the exact same `variant_is_sellable()` source of truth."""
+
+    def setUp(self):
+        self.template = make_template()
+
+    def test_one_sellable_variant_is_internally_consistent(self):
+        product = make_product(self.template, is_active=True)
+        make_variant(product, self.template, base_cost=Decimal("10.00"), color_name="Black", size="M")
+        response = self.client.get(f"/api/shop/products/{product.slug}/")
+        self.assertTrue(response.data["is_available"])
+        self.assertEqual(response.data["available_variant_count"], 1)
+        self.assertIsNotNone(response.data["starting_price"])
+        sellable_flags = [v["is_sellable"] for v in response.data["variants"]]
+        self.assertEqual(sellable_flags.count(True), response.data["available_variant_count"])
+
+    def test_all_variants_missing_cost_matches_product_level_unavailability(self):
+        product = make_product(self.template, is_active=True)
+        make_variant(product, self.template, base_cost=None, color_name="Black", size="M")
+        make_variant(product, self.template, base_cost=None, color_name="White", size="L")
+        # A product with only missing-cost variants has no sellable variant at all, so it's not
+        # publicly reachable — this itself is the consistency guarantee (never "is_available: true
+        # with available_variant_count: 0" or similar contradiction).
+        response = self.client.get(f"/api/shop/products/{product.slug}/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        # Verified directly via the serializer (bypassing the public-visibility filter) too.
+        data = ProductSerializer(product).data
+        self.assertFalse(data["is_available"])
+        self.assertEqual(data["available_variant_count"], 0)
+        self.assertIsNone(data["starting_price"])
+        self.assertTrue(all(v["is_sellable"] is False for v in data["variants"]))
+
+    def test_serializer_variant_readiness_matches_product_calculation(self):
+        product = make_product(self.template, is_active=True)
+        make_variant(product, self.template, base_cost=Decimal("10.00"), color_name="Black", size="M")
+        make_variant(product, self.template, base_cost=None, color_name="White", size="L")
+        make_variant(product, self.template, base_cost=Decimal("5.00"), is_available=False, color_name="Red", size="S")
+        response = self.client.get(f"/api/shop/products/{product.slug}/")
+        by_color = {v["color_name"]: v for v in response.data["variants"]}
+        self.assertTrue(by_color["Black"]["is_sellable"])
+        self.assertFalse(by_color["White"]["is_sellable"])  # missing cost
+        self.assertFalse(by_color["Red"]["is_sellable"])  # unavailable
+        # Product-level available_variant_count must equal the number of variants the nested
+        # list itself marks is_sellable=True — no separate, potentially-drifting calculation.
+        sellable_count_from_variants = sum(1 for v in response.data["variants"] if v["is_sellable"])
+        self.assertEqual(response.data["available_variant_count"], sellable_count_from_variants)
+
+
+class ProductVariantSerializerFieldTests(APITestCase):
+    """Section 19 'Serializer' checklist: product_id numeric, is_sellable/pricing_ready present,
+    missing-cost variants clearly marked unsellable, product price/inventory absent."""
+
+    def setUp(self):
+        self.template = make_template()
+
+    def test_product_id_is_always_numeric(self):
+        product = make_product(self.template, is_active=True)
+        variant = make_variant(product, self.template, base_cost=Decimal("10.00"))
+        response = self.client.get(f"/api/generator/product-variants/?product_id={product.id}")
+        row = next(v for v in response.data if v["id"] == variant.id)
+        self.assertIsInstance(row["product_id"], int)
+        self.assertEqual(row["product_id"], product.id)
+
+    def test_is_sellable_and_pricing_ready_present_on_standalone_endpoint(self):
+        product = make_product(self.template, is_active=True)
+        make_variant(product, self.template, base_cost=None, color_name="Black", size="M")
+        response = self.client.get(f"/api/generator/product-variants/?product_id={product.id}")
+        row = response.data[0]
+        self.assertIn("is_sellable", row)
+        self.assertIn("pricing_ready", row)
+        self.assertFalse(row["pricing_ready"])
+        self.assertFalse(row["is_sellable"])
+
+    def test_unavailable_variants_are_included_not_filtered(self):
+        # ProductVariantListView deliberately no longer filters to is_available=True — the
+        # frontend needs unavailable rows too, to render disabled options.
+        product = make_product(self.template, is_active=True)
+        make_variant(product, self.template, base_cost=Decimal("10.00"), is_available=False)
+        response = self.client.get(f"/api/generator/product-variants/?product_id={product.id}")
+        self.assertEqual(len(response.data), 1)
+        self.assertFalse(response.data[0]["is_available"])
+
+    def test_product_price_and_inventory_remain_absent_alongside_new_fields(self):
+        product = make_product(self.template, is_active=True)
+        make_variant(product, self.template, base_cost=Decimal("10.00"))
+        response = self.client.get(f"/api/shop/products/{product.slug}/")
+        self.assertNotIn("price", response.data)
+        self.assertNotIn("inventory", response.data)
+        self.assertIn("starting_price", response.data)
+        variant_row = response.data["variants"][0]
+        self.assertIn("is_sellable", variant_row)
+        self.assertIn("pricing_ready", variant_row)

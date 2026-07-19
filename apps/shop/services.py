@@ -19,11 +19,26 @@ def _round(amount: Decimal) -> Decimal:
     return amount.quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
 
 
-def _is_variant_sellable(variant, *, mockup_template_id: Optional[int]) -> bool:
-    """The single definition of "sellable" a variant must meet — mirrored (not literally
-    shared, since one runs on already-loaded Python objects and the other as a correlated SQL
-    subquery) by `sellable_variant_exists_subquery()` below. Keep the two in sync if this
-    changes."""
+def variant_is_sellable(variant, *, mockup_template_id: Optional[int] = None) -> bool:
+    """The single definition of "sellable" a variant must meet — the one source of truth used by
+    both variant-level readiness (`apps.generator.serializers.ProductVariantSerializer.is_sellable`)
+    and product-level availability (`_sellable_variants_for_product`/`product_has_sellable_variant`/
+    `get_product_starting_price` below), so the two can never disagree. Also mirrored (not
+    literally shared, since one runs on already-loaded Python objects and the other as a
+    correlated SQL subquery) by `sellable_variant_exists_subquery()` below — keep the two in
+    sync if this changes.
+
+    `is_available` reflects provider/catalogue availability (can Printify/the admin supply it at
+    all); `is_sellable` additionally requires Artverse's own commercial readiness — a configured
+    production cost, a template match, and a valid provider mapping where one is claimed.
+
+    Pass `mockup_template_id` when the caller already has the parent product loaded (avoids an
+    extra query per variant in a list — see callers below and
+    `apps.shop.serializers.ProductSerializer.get_variants`). Omitted, it's read off
+    `variant.product.mockup_template_id` (costs a query unless the caller's queryset already
+    `select_related("product")`, e.g. `apps.generator.views.ProductVariantListView`)."""
+    if mockup_template_id is None and variant.product_id:
+        mockup_template_id = variant.product.mockup_template_id
     if not variant.is_available or variant.base_cost is None:
         return False
     if mockup_template_id and variant.template_id != mockup_template_id:
@@ -45,7 +60,7 @@ def _sellable_variants_for_product(product) -> Iterable:
         return [
             variant
             for variant in product.variants.all()
-            if _is_variant_sellable(variant, mockup_template_id=product.mockup_template_id)
+            if variant_is_sellable(variant, mockup_template_id=product.mockup_template_id)
         ]
 
     queryset = product.variants.filter(is_available=True, base_cost__isnull=False)
@@ -66,7 +81,7 @@ def sellable_variant_exists_subquery():
     """The query-level equivalent of `product_has_sellable_variant()`, for filtering a product
     LIST efficiently (one correlated EXISTS subquery per row, evaluated in SQL) instead of
     calling the Python check per product — see `apps.shop.views.ProductListView`. Must be kept
-    in sync with `_is_variant_sellable()`'s criteria."""
+    in sync with `variant_is_sellable()`'s criteria."""
     from apps.generator.models import ProductVariant
 
     return Exists(

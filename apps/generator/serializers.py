@@ -96,13 +96,49 @@ class MockupTemplatePartSerializer(serializers.ModelSerializer):
 
 
 class ProductVariantSerializer(serializers.ModelSerializer):
+    """`product_id` is always numeric — `ProductVariant.product` is a required FK (see
+    apps.shop CHANGELOG entry on the product/variant refactor), never null.
+
+    `is_available` vs. `is_sellable` vs. `pricing_ready` are three deliberately different
+    signals, not synonyms:
+    - `is_available` — provider/catalogue availability (does Printify/the admin currently offer
+      this colour+size at all).
+    - `pricing_ready` — specifically whether a production cost is configured
+      (`base_cost is not None`); a cheap, narrow check the frontend can use to show a "pricing
+      not configured" reason distinct from "unavailable."
+    - `is_sellable` — the full commercial-readiness check (available AND priced AND matches the
+      product's template AND has a valid provider mapping where one is claimed) — the single
+      source of truth is `apps.shop.services.variant_is_sellable`, reused as-is here rather than
+      reimplemented; product-level `starting_price`/`is_available`/`available_variant_count`
+      (apps.shop.serializers.ProductSerializer) are derived from the exact same function, so the
+      two can never disagree."""
+
     image = serializers.SerializerMethodField()
     product_id = serializers.SerializerMethodField()
     template_id = serializers.IntegerField(read_only=True)
     price = serializers.DecimalField(source="retail_price", max_digits=10, decimal_places=2, read_only=True)
+    is_sellable = serializers.SerializerMethodField()
+    pricing_ready = serializers.SerializerMethodField()
 
     def get_product_id(self, obj: ProductVariant):
         return obj.product_id
+
+    def get_pricing_ready(self, obj: ProductVariant):
+        return obj.base_cost is not None
+
+    def get_is_sellable(self, obj: ProductVariant):
+        # Deferred import: apps.shop.services doesn't import apps.generator at module load time
+        # (this app already imports apps.shop.models at its own top — see apps/shop/services.py's
+        # module docstring), so importing it here rather than at this file's top avoids a cycle.
+        from apps.shop.services import variant_is_sellable
+
+        # `mockup_template_id` in context lets a caller that already has the parent Product
+        # loaded (apps.shop.serializers.ProductSerializer.get_variants) avoid an extra query per
+        # variant; omitted, variant_is_sellable() falls back to `obj.product.mockup_template_id`
+        # (a query unless the queryset already select_related("product") — see
+        # apps.generator.views.ProductVariantListView).
+        mockup_template_id = self.context.get("mockup_template_id")
+        return variant_is_sellable(obj, mockup_template_id=mockup_template_id)
 
     class Meta:
         model = ProductVariant
@@ -119,6 +155,8 @@ class ProductVariantSerializer(serializers.ModelSerializer):
             "base_cost",
             "inventory",
             "is_available",
+            "is_sellable",
+            "pricing_ready",
             "supported_print_areas",
             "external_provider",
             "external_variant_id",
@@ -646,7 +684,7 @@ class DesignProjectWriteSerializer(serializers.Serializer):
             if variant_id is None:
                 variant = None
             else:
-                variant = ProductVariant.objects.filter(pk=variant_id).first()
+                variant = ProductVariant.objects.filter(pk=variant_id).select_related("product").first()
                 if not variant:
                     errors["selected_variant_id"] = "No product variant with this id."
                 else:

@@ -15,6 +15,7 @@ from apps.generator.models import (
     ProductVariant,
 )
 from apps.shop.models import Product, ProductCategory
+from apps.shop.services import variant_is_sellable
 
 from .models import Cart, CartItem, Coupon, PricingConfig, PricingRule, PrintAreaCharge
 from .pricing import CouponError, price_cart_totals, price_item, resolve_markup_rule, validate_coupon
@@ -582,6 +583,47 @@ class CartPricingWarningApiTests(CartApiTestBase):
         self.assertEqual(items_by_variant[self.variant.id]["warnings"], [])
         self.assertEqual(items_by_variant[warning_variant.id]["unit_price"], "0.00")
         self.assertTrue(items_by_variant[warning_variant.id]["warnings"])
+
+
+class CartSellabilityContractTests(CartApiTestBase):
+    """Section 19 'Cart' checklist, made explicit: the cart's accept/warn contract (built and
+    tested in the earlier honest-checkout-state round — see CartPricingWarningApiTests) is
+    deliberately UNCHANGED by the variant-sellability API additions. An unsellable variant (here,
+    one with no configured base_cost) is never silently rejected at add-time — it's accepted,
+    priced at 0.00, carries a warning, and marks the cart is_checkout_ready=False. This is a
+    conscious choice to preserve the already-tested "no item silently vanishes" pricing-warning
+    system rather than introduce a new hard-reject path this task didn't otherwise specify."""
+
+    def test_unsellable_variant_is_accepted_but_marks_cart_not_ready(self):
+        unsellable_variant = make_variant(self.template, self.product, base_cost=None, color_name="Ghost", size="XL")
+        self.assertFalse(variant_is_sellable(unsellable_variant))
+        project = make_design_project(self.user, self.template, self.product, unsellable_variant)
+        make_printable_placement(project, "front")
+
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post("/api/cart/items/", {"design_project_id": project.id}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertFalse(response.data["is_checkout_ready"])
+        self.assertTrue(response.data["items"][0]["warnings"])
+
+    def test_variant_product_mismatch_is_rejected_before_it_can_reach_the_cart(self):
+        # A design project can never be saved with a variant belonging to a different product in
+        # the first place (DesignProjectWriteSerializer.validate) — so add_design_project_to_cart
+        # never has to defend against a mismatched pair reaching it. Verified end-to-end here via
+        # the real save API, not just the cart layer.
+        other_product = make_product(template=self.template, slug="mismatch-product")
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post(
+            "/api/generator/design-projects/",
+            {
+                "mockup_template_id": self.template.id,
+                "product_id": other_product.id,
+                "selected_variant_id": self.variant.id,  # belongs to self.product, not other_product
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("selected_variant_id", response.data)
 
 
 class CartCouponApiTests(CartApiTestBase):

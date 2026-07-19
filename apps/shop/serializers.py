@@ -72,17 +72,29 @@ class ProductSerializer(serializers.ModelSerializer):
     def _available_variants(self, obj: Product):
         # Relies on the view prefetching `variants` filtered/ordered appropriately to avoid N+1;
         # falls back to a live query if accessed without that prefetch (e.g. in the admin/shell).
-        # Deliberately just `is_available` — this is the DISPLAY list (which colours/sizes a
-        # shopper can pick), not the stricter "sellable" definition (which also requires a
-        # configured production cost and template match) used for starting_price/is_available
-        # below. A variant missing its cost still shows as a pickable option; adding it to the
-        # cart is where the existing pricing-warning system (apps.cart) catches that.
+        # Deliberately just `is_available` (provider/catalogue availability) — used only to
+        # derive `available_sizes`/`available_colors` below, i.e. "what can currently be
+        # ordered." NOT used for the `variants` field itself — see `_all_product_variants`.
         if hasattr(obj, "_prefetched_objects_cache") and "variants" in obj._prefetched_objects_cache:
             return [v for v in obj.variants.all() if v.is_available]
         return list(obj.variants.filter(is_available=True))
 
+    def _all_product_variants(self, obj: Product):
+        # Every variant belonging to this product, available or not, sellable or not. The public
+        # `variants` field deliberately includes unavailable/missing-cost/template-mismatched
+        # rows (each carrying is_available/is_sellable/pricing_ready via ProductVariantSerializer)
+        # so the frontend can render a disabled colour/size option with a reason instead of that
+        # combination silently not existing at all.
+        if hasattr(obj, "_prefetched_objects_cache") and "variants" in obj._prefetched_objects_cache:
+            return list(obj.variants.all())
+        return list(obj.variants.all())
+
     def get_variants(self, obj: Product):
-        return ProductVariantSerializer(self._available_variants(obj), many=True).data
+        variants = self._all_product_variants(obj)
+        # mockup_template_id in context: obj is already loaded here, so every nested variant's
+        # is_sellable check reuses it instead of each variant querying obj.product itself.
+        context = {**self.context, "mockup_template_id": obj.mockup_template_id}
+        return ProductVariantSerializer(variants, many=True, context=context).data
 
     def get_available_sizes(self, obj: Product):
         variants = self._available_variants(obj)
