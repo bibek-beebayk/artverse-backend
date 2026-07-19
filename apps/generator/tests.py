@@ -993,6 +993,14 @@ class HiddenTextExclusionTests(TestCase):
         bbox = self._bbox([{"text": "HIDDEN", "isHidden": True, "x": 200, "y": 200, "fontSize": 40, "color": "#fff"}])
         self.assertIsNone(bbox)
 
+    def test_truthy_non_boolean_isHidden_does_not_hide(self):
+        # Regression guard: the check must be `is True`, not a generic truthy check — a stray
+        # string value (e.g. from a malformed client payload) must never be treated as "hidden".
+        for value in ("false", "0", "no", []):
+            with self.subTest(value=value):
+                bbox = self._bbox([{"text": "X", "isHidden": value, "x": 200, "y": 200, "fontSize": 40, "color": "#fff"}])
+                self.assertIsNotNone(bbox)
+
     def test_visible_text_remains(self):
         bbox = self._bbox([{"text": "VISIBLE", "x": 200, "y": 200, "fontSize": 40, "color": "#fff"}])
         self.assertIsNotNone(bbox)
@@ -1386,6 +1394,43 @@ class ProductionPrintFileStorageAndInvalidationTests(APITestCase):
         response = self.client.get(f"/api/generator/design-projects/{self.project.id}/print-files/")
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
+    def test_anonymous_user_denied(self):
+        # No force_authenticate() at all — must be rejected before ownership is even checked.
+        response = self.client.post(f"/api/generator/design-projects/{self.project.id}/generate-print-files/")
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        response = self.client.get(f"/api/generator/design-projects/{self.project.id}/print-files/")
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_missing_project_returns_404(self):
+        self.client.force_authenticate(user=self.user)
+        missing_id = self.project.id + 99999
+        response = self.client.post(f"/api/generator/design-projects/{missing_id}/generate-print-files/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+        response = self.client.get(f"/api/generator/design-projects/{missing_id}/print-files/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_deleted_project_returns_404(self):
+        self.client.force_authenticate(user=self.user)
+        project_id = self.project.id
+        self.project.delete()
+        response = self.client.post(f"/api/generator/design-projects/{project_id}/generate-print-files/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_another_users_generated_file_url_is_never_exposed(self):
+        # Owner generates a file, then confirm the intruder's own (empty) status response never
+        # references it — the two users' data must not be able to leak into each other's payload.
+        self.client.force_authenticate(user=self.user)
+        self.client.post(f"/api/generator/design-projects/{self.project.id}/generate-print-files/")
+        owner_file_url = GeneratedPrintFile.objects.filter(design_placement=self.placement).first().output_file.url
+
+        other_project = DesignProject.objects.create(user=self.other_user, mockup_template=self.template, name="Intruder project")
+        self.client.force_authenticate(user=self.other_user)
+        response = self.client.get(f"/api/generator/design-projects/{other_project.id}/print-files/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertNotIn(owner_file_url, str(response.data))
+
     def test_status_endpoint_returns_previously_generated_files_without_regenerating(self):
         self.client.force_authenticate(user=self.user)
         self.client.post(f"/api/generator/design-projects/{self.project.id}/generate-print-files/")
@@ -1484,3 +1529,196 @@ class PrintFileCoordinateMappingTests(TestCase):
         placement = make_printable_placement(project, part)
         with self.assertRaises(ValueError):
             map_placement_to_production_canvas(placement=placement, template_part=part)
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(prefix="artverse-test-media-"))
+class PrintFileSignatureAuditTests(TestCase):
+    """Roadmap item 13: the print-file signature must change for every printable input and must
+    NOT change for UI-only state (layer name, lock state) — regression coverage for both
+    directions, since either one silently breaks either caching or correctness."""
+
+    def setUp(self):
+        self.user = make_user()
+        self.template = make_template(slug="signature-audit-test")
+        self.part = make_production_part(self.template, print_file_width=900, print_file_height=900)
+        self.project = DesignProject.objects.create(user=self.user, mockup_template=self.template, name="P")
+
+    def _signature(self, placement):
+        from .services import build_print_file_signature
+
+        return build_print_file_signature(placement=placement, template_part=self.part)
+
+    def test_renaming_a_text_layer_does_not_change_signature(self):
+        placement = make_printable_placement(
+            self.project, self.part,
+            text_elements=[{"id": "t1", "text": "HI", "x": 100, "y": 100, "fontSize": 40, "color": "#fff", "layerName": "Original Name"}],
+        )
+        before = self._signature(placement)
+        placement.text_elements[0]["layerName"] = "Renamed"
+        after = self._signature(placement)
+        self.assertEqual(before, after)
+
+    def test_toggling_lock_does_not_change_signature(self):
+        placement = make_printable_placement(
+            self.project, self.part,
+            text_elements=[{"id": "t1", "text": "HI", "x": 100, "y": 100, "fontSize": 40, "color": "#fff", "isLocked": False}],
+        )
+        before = self._signature(placement)
+        placement.text_elements[0]["isLocked"] = True
+        after = self._signature(placement)
+        self.assertEqual(before, after)
+
+    def test_changing_element_id_alone_does_not_change_signature(self):
+        # `id` is an editor-internal identifier, not printable content.
+        placement = make_printable_placement(
+            self.project, self.part,
+            text_elements=[{"id": "t1", "text": "HI", "x": 100, "y": 100, "fontSize": 40, "color": "#fff"}],
+        )
+        before = self._signature(placement)
+        placement.text_elements[0]["id"] = "t2"
+        after = self._signature(placement)
+        self.assertEqual(before, after)
+
+    def test_toggling_hidden_changes_signature(self):
+        placement = make_printable_placement(
+            self.project, self.part,
+            text_elements=[{"id": "t1", "text": "HI", "x": 100, "y": 100, "fontSize": 40, "color": "#fff", "isHidden": False}],
+        )
+        before = self._signature(placement)
+        placement.text_elements[0]["isHidden"] = True
+        after = self._signature(placement)
+        self.assertNotEqual(before, after)
+
+    def test_changing_layer_order_changes_signature(self):
+        elements = [
+            {"id": "t1", "text": "FIRST", "x": 100, "y": 100, "fontSize": 40, "color": "#fff"},
+            {"id": "t2", "text": "SECOND", "x": 200, "y": 200, "fontSize": 40, "color": "#fff"},
+        ]
+        placement = make_printable_placement(self.project, self.part, text_elements=elements)
+        before = self._signature(placement)
+        placement.text_elements = [elements[1], elements[0]]
+        after = self._signature(placement)
+        self.assertNotEqual(before, after)
+
+    def test_changing_position_changes_signature(self):
+        placement = make_printable_placement(self.project, self.part, x=100, y=100)
+        before = self._signature(placement)
+        placement.x = 150
+        after = self._signature(placement)
+        self.assertNotEqual(before, after)
+
+    def test_changing_rotation_opacity_fit_corner_radius_changes_signature(self):
+        for field, value in (("rotation", 30), ("opacity", 0.5), ("fit", DesignPlacement.Fit.COVER), ("corner_radius", 12)):
+            with self.subTest(field=field):
+                DesignPlacement.objects.filter(design_project=self.project, part_name=self.part.name).delete()
+                placement = make_printable_placement(self.project, self.part)
+                before = self._signature(placement)
+                setattr(placement, field, value)
+                after = self._signature(placement)
+                self.assertNotEqual(before, after)
+
+    def test_changing_crop_changes_signature(self):
+        placement = make_printable_placement(self.project, self.part)
+        before = self._signature(placement)
+        placement.crop_left = 10
+        after = self._signature(placement)
+        self.assertNotEqual(before, after)
+
+    def test_changing_font_styling_changes_signature(self):
+        placement = make_printable_placement(
+            self.project, self.part,
+            text_elements=[{"id": "t1", "text": "HI", "x": 100, "y": 100, "fontSize": 40, "color": "#fff", "isBold": False}],
+        )
+        before = self._signature(placement)
+        placement.text_elements[0]["isBold"] = True
+        after = self._signature(placement)
+        self.assertNotEqual(before, after)
+
+    def test_changing_production_dimensions_changes_signature(self):
+        placement = make_printable_placement(self.project, self.part)
+        before = self._signature(placement)
+        self.part.print_file_width = 1800
+        after = self._signature(placement)
+        self.assertNotEqual(before, after)
+
+    def test_changing_dpi_changes_signature(self):
+        placement = make_printable_placement(self.project, self.part)
+        before = self._signature(placement)
+        self.part.dpi = 150
+        after = self._signature(placement)
+        self.assertNotEqual(before, after)
+
+    def test_unchanged_state_produces_identical_signature(self):
+        placement = make_printable_placement(
+            self.project, self.part,
+            text_elements=[{"id": "t1", "text": "HI", "x": 100, "y": 100, "fontSize": 40, "color": "#fff"}],
+        )
+        self.assertEqual(self._signature(placement), self._signature(placement))
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(prefix="artverse-test-media-"))
+class GeneratedPrintFileModelAvailabilityTests(TestCase):
+    """Roadmap item 18: the GeneratedPrintFile table/relationships/cascade behavior actually
+    work against a real (test) database — not just assumed by services-layer tests that create
+    records through create_or_reuse_print_file() and never exercise the model directly."""
+
+    def setUp(self):
+        self.user = make_user()
+        self.template = make_template(slug="model-availability-test")
+        self.part = make_production_part(self.template, print_file_width=600, print_file_height=600)
+        self.project = DesignProject.objects.create(user=self.user, mockup_template=self.template, name="P")
+        self.placement = make_printable_placement(self.project, self.part)
+
+    def test_table_exists_and_record_can_be_created(self):
+        record = GeneratedPrintFile.objects.create(
+            design_placement=self.placement,
+            template_part=self.part,
+            width=600,
+            height=600,
+            dpi=300,
+            signature="a" * 64,
+            status=GeneratedPrintFile.Status.READY,
+        )
+        self.assertIsNotNone(record.pk)
+        self.assertEqual(GeneratedPrintFile.objects.count(), 1)
+
+    def test_relationship_to_design_placement_and_template_part(self):
+        record = GeneratedPrintFile.objects.create(
+            design_placement=self.placement, template_part=self.part, signature="b" * 64
+        )
+        self.assertEqual(record.design_placement_id, self.placement.id)
+        self.assertEqual(record.template_part_id, self.part.id)
+        self.assertIn(record, self.placement.generated_print_files.all())
+        self.assertIn(record, self.part.generated_print_files.all())
+
+    def test_deleting_design_placement_cascades(self):
+        record = GeneratedPrintFile.objects.create(
+            design_placement=self.placement, template_part=self.part, signature="c" * 64
+        )
+        record_id = record.id
+        self.placement.delete()
+        self.assertFalse(GeneratedPrintFile.objects.filter(id=record_id).exists())
+
+    def test_deleting_template_part_with_print_files_is_protected(self):
+        GeneratedPrintFile.objects.create(design_placement=self.placement, template_part=self.part, signature="d" * 64)
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                self.part.delete()
+
+    def test_signature_field_is_indexed(self):
+        # Confirms the (design_placement, signature) composite index declared in Meta.indexes is
+        # actually present on the real table — not just declared in the model, which is what
+        # `makemigrations --check` guards against drifting apart from the migration.
+        with connection.cursor() as cursor:
+            constraints = connection.introspection.get_constraints(cursor, GeneratedPrintFile._meta.db_table)
+        indexed_column_sets = [tuple(c["columns"]) for c in constraints.values() if c.get("index")]
+        self.assertIn(("design_placement_id", "signature"), indexed_column_sets)
+
+    def test_output_file_storage_path(self):
+        buffer = BytesIO()
+        Image.new("RGBA", (4, 4), (0, 0, 0, 0)).save(buffer, format="PNG")
+        record = GeneratedPrintFile.objects.create(
+            design_placement=self.placement, template_part=self.part, signature="e" * 64
+        )
+        record.output_file.save("test-print-file.png", ContentFile(buffer.getvalue()), save=True)
+        self.assertTrue(record.output_file.name.startswith("design-projects/print-files/"))

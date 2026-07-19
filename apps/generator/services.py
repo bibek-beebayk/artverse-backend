@@ -795,6 +795,13 @@ def process_mockup_render(render):
 # multi-image-layer support here, by design — one artwork per print part, annotated with text.
 # generate_print_file_image() reflects this directly: one artwork composite, then N text layers,
 # never more than one image source. See PartCustomization's equivalent note on the frontend.
+#
+# Future work (not started, not scheduled): multiple image layers per part, and a unified
+# image+text layer stack with real z-ordering (today the single image always composites first,
+# text always on top — see the fixed draw order in generate_print_file_image/
+# render_mockup_to_image). Would need a real schema change (a layer list with a discriminated
+# type, not another field on DesignPlacement) plus matching editor/undo/signature work — a
+# project-level decision, not a drive-by addition.
 # ---------------------------------------------------------------------------
 
 
@@ -888,12 +895,49 @@ def _load_source_image_for_placement(placement: DesignPlacement) -> Image.Image:
     raise ValueError("No source image is available for this design placement.")
 
 
+#: Keys `_draw_text_elements()` actually reads when rendering a text layer. Anything not in this
+#: list is UI-only state (an editor identifier, a display label, a drag-lock flag) that has zero
+#: effect on rendered output, and must therefore be excluded from the print-file signature — see
+#: `_printable_text_element_state()` below. Keep this in sync with `_draw_text_elements()`'s own
+#: `elem.get(...)` calls; a new printable text property needs to be added to *both*.
+_PRINTABLE_TEXT_ELEMENT_KEYS = (
+    "text",
+    "fontFamily",
+    "color",
+    "fontSize",
+    "x",
+    "y",
+    "rotation",
+    "isBold",
+    "isItalic",
+    "letterSpacing",
+    "textAlign",
+    "lineHeight",
+    "isHidden",
+)
+
+
+def _printable_text_element_state(text_elements: list) -> list:
+    """Reduce each text element to only the fields that affect rendered output, preserving list
+    order (order affects stacking, so it's part of the printable state too). Deliberately drops
+    `id` (an editor-only identifier), `layerName` (a display label — renaming a layer must not
+    invalidate its print file), and `isLocked` (prevents dragging in the browser only, per
+    `_draw_text_elements()`'s own docstring — it never reaches the renderer)."""
+    return [
+        {key: element.get(key) for key in _PRINTABLE_TEXT_ELEMENT_KEYS}
+        for element in (text_elements or [])
+        if isinstance(element, dict)
+    ]
+
+
 def build_print_file_signature(*, placement: DesignPlacement, template_part: MockupTemplatePart) -> str:
     """A deterministic hash of every printable input for this placement + template part. Changing
     anything that would visibly change the output (source, crop, position, size, rotation,
     opacity, fit, corner radius, text content/styling/order/visibility, or the part's own
     production dimensions/DPI) changes this signature — an unchanged signature means an existing
-    completed GeneratedPrintFile can be reused instead of regenerated."""
+    completed GeneratedPrintFile can be reused instead of regenerated. Non-printable UI state
+    (layer names, lock state, which panel/guide is open) must never affect this — see
+    `_printable_text_element_state()`."""
     source_fingerprint = resolve_source_fingerprint(
         generated_image=placement.source_generated_image,
         artwork=placement.source_artwork,
@@ -909,7 +953,7 @@ def build_print_file_signature(*, placement: DesignPlacement, template_part: Moc
         "fit": placement.fit,
         "corner_radius": placement.corner_radius,
         "crop": [placement.crop_left, placement.crop_top, placement.crop_width, placement.crop_height],
-        "text_elements": placement.text_elements or [],
+        "text_elements": _printable_text_element_state(placement.text_elements),
     }
     raw_value = "|".join(
         [
