@@ -93,8 +93,14 @@ class ProductSerializer(serializers.ModelSerializer):
         variants = self._all_product_variants(obj)
         # mockup_template_id in context: obj is already loaded here, so every nested variant's
         # is_sellable check reuses it instead of each variant querying obj.product itself.
-        context = {**self.context, "mockup_template_id": obj.mockup_template_id}
-        return ProductVariantSerializer(variants, many=True, context=context).data
+        return ProductVariantSerializer(
+            variants,
+            many=True,
+            context={
+                **self.context,
+                "mockup_template_id": obj.mockup_template_id,
+            },
+        ).data
 
     def get_available_sizes(self, obj: Product):
         variants = self._available_variants(obj)

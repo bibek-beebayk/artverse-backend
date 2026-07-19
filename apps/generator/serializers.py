@@ -696,6 +696,23 @@ class DesignProjectWriteSerializer(serializers.Serializer):
                         errors["selected_variant_id"] = "This variant does not belong to the selected product."
                     if not variant.is_available:
                         errors["selected_variant_id"] = "This variant is not available."
+                    # Commercial sellability (configured production cost, valid provider mapping)
+                    # on top of the relationship/availability checks above — only evaluated when
+                    # none of those more specific checks already failed, so a template/product
+                    # mismatch is never masked by this more generic message. Deferred import: see
+                    # ProductVariantSerializer.get_is_sellable's identical comment above — this
+                    # avoids a module-load-time circular import between apps.generator and
+                    # apps.shop.
+                    if "selected_variant_id" not in errors:
+                        from apps.shop.services import variant_is_sellable
+
+                        if not variant_is_sellable(
+                            variant,
+                            mockup_template_id=template.id if template else None,
+                        ):
+                            errors["selected_variant_id"] = (
+                                "This variant is not currently sellable."
+                            )
         elif instance is not None:
             variant = instance.selected_variant
         else:

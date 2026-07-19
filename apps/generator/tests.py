@@ -488,7 +488,7 @@ class DesignProjectUpdateTests(APITestCase):
 
     def test_change_variant_updates_color_and_size_snapshot(self):
         product = make_shop_product(self.template, slug="variant-product")
-        variant = make_variant(self.template, product=product, color_name="Cyber White", size="XL")
+        variant = make_variant(self.template, product=product, color_name="Cyber White", size="XL", base_cost="10.00")
         response = self.client.patch(
             f"/api/generator/design-projects/{self.project_id}/",
             {"selected_variant_id": variant.id},
@@ -558,6 +558,106 @@ class DesignProjectValidationTests(APITestCase):
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_rejects_variant_with_missing_production_cost(self):
+        # is_available=True (the model default) but base_cost is left unset — available doesn't
+        # mean sellable. See apps.shop.services.variant_is_sellable.
+        variant = make_variant(self.template_a, product=self.product_a, base_cost=None)
+        response = self.client.post(
+            "/api/generator/design-projects/",
+            {
+                "mockup_template_id": self.template_a.id,
+                "product_id": self.product_a.id,
+                "selected_variant_id": variant.id,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("not currently sellable", str(response.data["selected_variant_id"]))
+
+    def test_rejects_variant_with_invalid_external_provider_mapping(self):
+        # A variant claiming an external provider needs a real provider-side id — one without it
+        # is not sellable, even though it's available and priced.
+        variant = make_variant(
+            self.template_a,
+            product=self.product_a,
+            base_cost="10.00",
+            external_provider="Printify",
+            external_variant_id="",
+        )
+        response = self.client.post(
+            "/api/generator/design-projects/",
+            {
+                "mockup_template_id": self.template_a.id,
+                "product_id": self.product_a.id,
+                "selected_variant_id": variant.id,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("not currently sellable", str(response.data["selected_variant_id"]))
+
+    def test_accepts_valid_sellable_variant(self):
+        variant = make_variant(self.template_a, product=self.product_a, base_cost="10.00")
+        response = self.client.post(
+            "/api/generator/design-projects/",
+            {
+                "mockup_template_id": self.template_a.id,
+                "product_id": self.product_a.id,
+                "selected_variant_id": variant.id,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["selected_variant"]["id"], variant.id)
+
+    def test_preview_only_project_with_no_product_or_variant_still_allowed(self):
+        # No product_id, no selected_variant_id at all — a legitimate template-only preview, must
+        # never be rejected by the sellability check (which only runs when a variant is selected).
+        response = self.client.post(
+            "/api/generator/design-projects/",
+            {"mockup_template_id": self.template_a.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertIsNone(response.data["product"])
+        self.assertIsNone(response.data["selected_variant"])
+
+    def test_existing_project_with_now_unsellable_variant_remains_readable_and_editable(self):
+        # A project saved while its variant was sellable must not be locked out once that variant
+        # later becomes unsellable (e.g. an admin clears base_cost) — reads are unaffected (GET
+        # never goes through this write serializer), and a write that doesn't touch
+        # selected_variant_id must still succeed rather than re-validating a field the client
+        # never asked to change.
+        variant = make_variant(self.template_a, product=self.product_a, base_cost="10.00")
+        create_response = self.client.post(
+            "/api/generator/design-projects/",
+            {
+                "mockup_template_id": self.template_a.id,
+                "product_id": self.product_a.id,
+                "selected_variant_id": variant.id,
+            },
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
+        project_id = create_response.data["id"]
+
+        variant.base_cost = None
+        variant.save(update_fields=["base_cost"])
+
+        get_response = self.client.get(f"/api/generator/design-projects/{project_id}/")
+        self.assertEqual(get_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(get_response.data["selected_variant"]["id"], variant.id)
+
+        patch_response = self.client.patch(
+            f"/api/generator/design-projects/{project_id}/",
+            {"name": "Renamed while variant unsellable"},
+            format="json",
+        )
+        self.assertEqual(patch_response.status_code, status.HTTP_200_OK, patch_response.data)
+        self.assertEqual(patch_response.data["name"], "Renamed while variant unsellable")
+        # The variant was never silently swapped out for something else.
+        self.assertEqual(patch_response.data["selected_variant"]["id"], variant.id)
 
     def test_rejects_unsupported_part_for_template_without_parts(self):
         bare_template = make_template(slug="bare", with_parts=False)
