@@ -709,6 +709,158 @@ class DesignProjectDuplicateTests(APITestCase):
         self.assertEqual(original.name, "Dragon Tee")
 
 
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(prefix="artverse-test-media-"))
+class DesignProjectDuplicatePrintFileTests(APITestCase):
+    """A duplicated placement must never inherit the source placement's production print file —
+    it has no GeneratedPrintFile record of its own, so the copied URL would point at a file this
+    placement never actually generated. Regression coverage for that bug plus proof duplicates
+    can independently regenerate their own, fully separate production files."""
+
+    def setUp(self):
+        from .services import create_or_reuse_print_file
+
+        self.user = make_user()
+        self.template = make_template(slug="duplicate-print-file-test")
+        self.front_part = make_production_part(self.template, name="front", print_file_width=900, print_file_height=900)
+        self.back_part = make_production_part(self.template, name="back", print_file_width=900, print_file_height=900)
+        self.client.force_authenticate(user=self.user)
+
+        self.project = DesignProject.objects.create(user=self.user, mockup_template=self.template, name="Original")
+        self.front_placement = make_printable_placement(
+            self.project, self.front_part, text_elements=[{"text": "HI", "x": 100, "y": 100, "fontSize": 30, "color": "#fff"}]
+        )
+        self.back_placement = make_printable_placement(self.project, self.back_part)
+
+        self.front_record, _ = create_or_reuse_print_file(placement=self.front_placement, template_part=self.front_part)
+        self.back_record, _ = create_or_reuse_print_file(placement=self.back_placement, template_part=self.back_part)
+        self.front_placement.print_file_url = self.front_record.output_file.url
+        self.front_placement.preview_url = "https://example.com/front-preview.png"
+        self.front_placement.save(update_fields=["print_file_url", "preview_url"])
+        self.back_placement.print_file_url = self.back_record.output_file.url
+        self.back_placement.save(update_fields=["print_file_url"])
+
+    def _duplicate(self):
+        response = self.client.post(f"/api/generator/design-projects/{self.project.id}/duplicate/")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        return response.data
+
+    # --- Original project ---
+
+    def test_original_keeps_its_print_file_url(self):
+        self._duplicate()
+        self.front_placement.refresh_from_db()
+        self.assertEqual(self.front_placement.print_file_url, self.front_record.output_file.url)
+
+    def test_original_generated_print_file_record_unchanged(self):
+        self._duplicate()
+        self.front_record.refresh_from_db()
+        self.assertEqual(self.front_record.design_placement_id, self.front_placement.id)
+        self.assertEqual(self.front_record.status, GeneratedPrintFile.Status.READY)
+
+    def test_original_production_file_still_queryable(self):
+        self._duplicate()
+        self.assertTrue(GeneratedPrintFile.objects.filter(pk=self.front_record.pk).exists())
+
+    # --- Duplicate project ---
+
+    def test_duplicate_placement_has_new_id(self):
+        data = self._duplicate()
+        duplicate_front = DesignPlacement.objects.get(design_project_id=data["id"], part_name="front")
+        self.assertNotEqual(duplicate_front.id, self.front_placement.id)
+
+    def test_duplicate_placement_print_file_url_is_empty(self):
+        data = self._duplicate()
+        duplicate_front = DesignPlacement.objects.get(design_project_id=data["id"], part_name="front")
+        self.assertEqual(duplicate_front.print_file_url, "")
+
+    def test_duplicate_placement_has_no_generated_print_file_record(self):
+        data = self._duplicate()
+        duplicate_front = DesignPlacement.objects.get(design_project_id=data["id"], part_name="front")
+        self.assertFalse(GeneratedPrintFile.objects.filter(design_placement=duplicate_front).exists())
+
+    def test_duplicate_retains_preview_url(self):
+        data = self._duplicate()
+        duplicate_front = DesignPlacement.objects.get(design_project_id=data["id"], part_name="front")
+        self.assertEqual(duplicate_front.preview_url, "https://example.com/front-preview.png")
+
+    def test_duplicate_retains_source_and_text(self):
+        data = self._duplicate()
+        duplicate_front = DesignPlacement.objects.get(design_project_id=data["id"], part_name="front")
+        self.assertEqual(duplicate_front.source_image_url, self.front_placement.source_image_url)
+        self.assertEqual(duplicate_front.text_elements, self.front_placement.text_elements)
+        self.assertEqual(duplicate_front.x, self.front_placement.x)
+        self.assertEqual(duplicate_front.crop_width, self.front_placement.crop_width)
+
+    def test_duplicate_is_independent_of_original(self):
+        data = self._duplicate()
+        duplicate_front = DesignPlacement.objects.get(design_project_id=data["id"], part_name="front")
+        duplicate_front.text_elements = [{"text": "CHANGED", "x": 1, "y": 1, "fontSize": 10, "color": "#000"}]
+        duplicate_front.save(update_fields=["text_elements"])
+        self.front_placement.refresh_from_db()
+        self.assertNotEqual(self.front_placement.text_elements, duplicate_front.text_elements)
+
+    # --- Regeneration ---
+
+    def test_regenerating_duplicate_creates_its_own_record_linked_only_to_it(self):
+        from .services import create_or_reuse_print_file
+
+        data = self._duplicate()
+        duplicate_front = DesignPlacement.objects.get(design_project_id=data["id"], part_name="front")
+
+        record, reused = create_or_reuse_print_file(placement=duplicate_front, template_part=self.front_part)
+
+        self.assertFalse(reused)
+        self.assertNotEqual(record.pk, self.front_record.pk)
+        self.assertEqual(record.design_placement_id, duplicate_front.id)
+
+        self.front_record.refresh_from_db()
+        self.assertEqual(self.front_record.design_placement_id, self.front_placement.id)
+        self.assertNotEqual(self.front_record.design_placement_id, duplicate_front.id)
+
+    def test_regenerating_duplicate_via_api_gives_it_its_own_url(self):
+        data = self._duplicate()
+        response = self.client.post(f"/api/generator/design-projects/{data['id']}/generate-print-files/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        front_result = next(p for p in response.data["parts"] if p["part_name"] == "front")
+        self.assertEqual(front_result["status"], "completed")
+        self.assertFalse(front_result["reused"])
+        self.assertTrue(front_result["print_file_url"])
+
+        duplicate_front = DesignPlacement.objects.get(design_project_id=data["id"], part_name="front")
+        self.assertEqual(duplicate_front.print_file_url, front_result["print_file_url"])
+        # And the original's own file/URL are completely untouched by generating the duplicate's.
+        self.front_placement.refresh_from_db()
+        self.assertEqual(self.front_placement.print_file_url, self.front_record.output_file.url)
+
+    def test_no_existing_original_record_is_reassigned(self):
+        from .services import create_or_reuse_print_file
+
+        data = self._duplicate()
+        duplicate_front = DesignPlacement.objects.get(design_project_id=data["id"], part_name="front")
+        create_or_reuse_print_file(placement=duplicate_front, template_part=self.front_part)
+
+        # The original record must still point at the original placement, never the duplicate.
+        self.front_record.refresh_from_db()
+        self.assertEqual(self.front_record.design_placement_id, self.front_placement.id)
+
+    # --- Multiple parts ---
+
+    def test_neither_front_nor_back_duplicate_inherits_a_production_url(self):
+        data = self._duplicate()
+        duplicate_front = DesignPlacement.objects.get(design_project_id=data["id"], part_name="front")
+        duplicate_back = DesignPlacement.objects.get(design_project_id=data["id"], part_name="back")
+        self.assertEqual(duplicate_front.print_file_url, "")
+        self.assertEqual(duplicate_back.print_file_url, "")
+        self.assertFalse(GeneratedPrintFile.objects.filter(design_placement=duplicate_front).exists())
+        self.assertFalse(GeneratedPrintFile.objects.filter(design_placement=duplicate_back).exists())
+
+        # Originals for both parts remain untouched.
+        self.front_placement.refresh_from_db()
+        self.back_placement.refresh_from_db()
+        self.assertEqual(self.front_placement.print_file_url, self.front_record.output_file.url)
+        self.assertEqual(self.back_placement.print_file_url, self.back_record.output_file.url)
+
+
 class ProductAndVariantAPITests(APITestCase):
     def setUp(self):
         self.template = make_template()

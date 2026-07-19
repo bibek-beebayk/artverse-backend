@@ -514,7 +514,13 @@ class DesignProjectDuplicateView(APIView):
                     text_elements=placement.text_elements,
                     preview_render=placement.preview_render,
                     preview_url=placement.preview_url,
-                    print_file_url=placement.print_file_url,
+                    # Deliberately NOT print_file_url=placement.print_file_url — the duplicated
+                    # placement doesn't own the source placement's GeneratedPrintFile row (that
+                    # record's FK points at the original DesignPlacement only), so copying the
+                    # URL here would point at a production file this placement never actually
+                    # generated. A preview MockupRender is a shared, content-addressed cache
+                    # (safe to reference from multiple placements); a GeneratedPrintFile is not.
+                    print_file_url="",
                     metadata=dict(placement.metadata),
                 )
 

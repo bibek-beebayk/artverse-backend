@@ -122,7 +122,16 @@ def price_item(
         base_cost = variant.base_cost
     else:
         base_cost = Decimal("0.00")
-        warnings.append("No variant base_cost set — defaulted to 0.00. An admin should set ProductVariant.base_cost.")
+        # Deliberately not just "defaulted to 0.00" — that reads like a harmless fallback. It
+        # isn't: a real production cost is unknown, so this item is NOT checkout-ready (see
+        # serialize_cart()'s is_checkout_ready) even though a (misleadingly low) price displays.
+        warnings.append(
+            f"Production cost is not configured for this variant ({product.name}). "
+            "An admin must set ProductVariant.base_cost before this item can be checked out."
+        )
+
+    if variant is not None and not variant.is_available:
+        warnings.append(f"This variant ({product.name}) is no longer available.")
 
     printable_parts = {
         placement.part_name for placement in placements if is_placement_printable(placement) or placement.text_elements

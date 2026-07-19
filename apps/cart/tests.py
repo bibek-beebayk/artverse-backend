@@ -481,6 +481,89 @@ class CartMutationApiTests(CartApiTestBase):
         self.assertEqual(response.data["items"][0]["unit_price"], "50.00")
 
 
+class CartPricingWarningApiTests(CartApiTestBase):
+    """Roadmap item 8: a missing ProductVariant.base_cost (or an unavailable variant) must not
+    be silently presented as a normal $0.00 item — it stays in the cart, prices without
+    crashing, but carries a clear warning and marks the cart not checkout-ready."""
+
+    def test_missing_base_cost_produces_a_clear_warning(self):
+        variant = make_variant(self.template, self.product, base_cost=None, color_name="Ghost", size="L")
+        project = make_design_project(self.user, self.template, self.product, variant)
+        make_printable_placement(project, "front")
+
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post("/api/cart/items/", {"design_project_id": project.id}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        item = response.data["items"][0]
+        self.assertEqual(item["unit_price"], "0.00")  # still prices without crashing
+        self.assertTrue(item["warnings"])
+        self.assertIn(self.product.name, item["warnings"][0])
+        self.assertIn("base_cost", item["warnings"][0])
+
+    def test_cart_is_not_checkout_ready_when_an_item_has_a_warning(self):
+        variant = make_variant(self.template, self.product, base_cost=None, color_name="Ghost", size="L")
+        project = make_design_project(self.user, self.template, self.product, variant)
+        make_printable_placement(project, "front")
+
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post("/api/cart/items/", {"design_project_id": project.id}, format="json")
+        self.assertFalse(response.data["is_checkout_ready"])
+
+    def test_item_with_warning_is_not_removed_from_cart(self):
+        variant = make_variant(self.template, self.product, base_cost=None, color_name="Ghost", size="L")
+        project = make_design_project(self.user, self.template, self.product, variant)
+        make_printable_placement(project, "front")
+
+        self.client.force_authenticate(user=self.user)
+        self.client.post("/api/cart/items/", {"design_project_id": project.id}, format="json")
+        response = self.client.get("/api/cart/")
+        self.assertEqual(len(response.data["items"]), 1)
+
+    def test_unavailable_variant_produces_a_warning(self):
+        variant = make_variant(self.template, self.product, base_cost=Decimal("10.00"), color_name="Retired", size="S")
+        variant.is_available = False
+        variant.save(update_fields=["is_available"])
+        project = make_design_project(self.user, self.template, self.product, variant)
+        make_printable_placement(project, "front")
+
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post("/api/cart/items/", {"design_project_id": project.id}, format="json")
+        item = response.data["items"][0]
+        self.assertTrue(any("no longer available" in w for w in item["warnings"]))
+        self.assertFalse(response.data["is_checkout_ready"])
+
+    def test_valid_variant_has_no_warnings_and_cart_is_checkout_ready(self):
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post("/api/cart/items/", {"design_project_id": self.project.id}, format="json")
+        self.assertEqual(response.data["items"][0]["warnings"], [])
+        self.assertTrue(response.data["is_checkout_ready"])
+
+    def test_pricing_does_not_crash_with_missing_base_cost(self):
+        variant = make_variant(self.template, self.product, base_cost=None, color_name="Ghost", size="L")
+        project = make_design_project(self.user, self.template, self.product, variant)
+        make_printable_placement(project, "front")
+
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post("/api/cart/items/", {"design_project_id": project.id}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_one_warning_item_does_not_affect_other_items_pricing(self):
+        warning_variant = make_variant(self.template, self.product, base_cost=None, color_name="Ghost", size="L")
+        warning_project = make_design_project(self.user, self.template, self.product, warning_variant)
+        make_printable_placement(warning_project, "front")
+
+        self.client.force_authenticate(user=self.user)
+        self.client.post("/api/cart/items/", {"design_project_id": self.project.id}, format="json")
+        response = self.client.post("/api/cart/items/", {"design_project_id": warning_project.id}, format="json")
+
+        items_by_variant = {item["variant_id"]: item for item in response.data["items"]}
+        self.assertEqual(items_by_variant[self.variant.id]["unit_price"], "10.00")
+        self.assertEqual(items_by_variant[self.variant.id]["warnings"], [])
+        self.assertEqual(items_by_variant[warning_variant.id]["unit_price"], "0.00")
+        self.assertTrue(items_by_variant[warning_variant.id]["warnings"])
+
+
 class CartCouponApiTests(CartApiTestBase):
     def test_apply_and_remove_coupon(self):
         Coupon.objects.create(code="SAVE5", discount_type=Coupon.DiscountType.FIXED, amount=Decimal("5.00"))
