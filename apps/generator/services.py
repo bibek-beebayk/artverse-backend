@@ -290,6 +290,99 @@ def ensure_source_design_asset(
     return asset
 
 
+# Upload validation — device file uploads and client-generated AI images ("Upload Design" /
+# "Generate with AI" in the customization action menu) share one entry point
+# (create_uploaded_source_design_asset / SourceDesignAssetUploadView) since both are "here are
+# raw image bytes I own, store them for me" — the only difference is the declared source_type.
+ALLOWED_UPLOAD_CONTENT_TYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}
+ALLOWED_UPLOAD_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+MAX_UPLOAD_SIZE_BYTES = 15 * 1024 * 1024  # 15MB
+MIN_UPLOAD_DIMENSION_PX = 100  # below this, not a practical print-ready design
+
+
+class UploadValidationError(ValueError):
+    """Raised by create_uploaded_source_design_asset for any client-fixable upload problem —
+    the upload view catches this specifically and returns 400 with the message, distinct from
+    an unexpected server error."""
+
+
+def create_uploaded_source_design_asset(
+    *, uploaded_file, owner, source_type: str, title: str = ""
+) -> SourceDesignAsset:
+    """Validates and persists a user-supplied image as a PRIVATE SourceDesignAsset (owner set,
+    never surfaced through any public listing endpoint). Deliberately distinct from
+    ensure_source_design_asset()/hydrate_source_design_asset() above: those always re-encode to
+    PNG for the mockup-render dedup cache; this preserves the ORIGINAL uploaded bytes and format
+    untouched, per the "preserve original file" / "use the highest-quality source for production
+    rendering" requirement for user-owned assets."""
+    if source_type not in {SourceDesignAsset.SourceType.USER_UPLOAD, SourceDesignAsset.SourceType.AI_GENERATED}:
+        raise UploadValidationError("Invalid source_type for an upload.")
+
+    content_type = (getattr(uploaded_file, "content_type", "") or "").lower()
+    if content_type not in ALLOWED_UPLOAD_CONTENT_TYPES:
+        raise UploadValidationError(f"Unsupported file type '{content_type or 'unknown'}'. Allowed: PNG, JPEG, WEBP.")
+
+    extension = Path(uploaded_file.name or "").suffix.lower()
+    if extension not in ALLOWED_UPLOAD_EXTENSIONS:
+        raise UploadValidationError(f"Unsupported file extension '{extension or 'none'}'.")
+
+    if uploaded_file.size <= 0:
+        raise UploadValidationError("The uploaded file is empty.")
+    if uploaded_file.size > MAX_UPLOAD_SIZE_BYTES:
+        raise UploadValidationError(
+            f"File is too large ({uploaded_file.size // (1024 * 1024)}MB). "
+            f"Maximum is {MAX_UPLOAD_SIZE_BYTES // (1024 * 1024)}MB."
+        )
+
+    uploaded_file.seek(0)
+    image_bytes = uploaded_file.read()
+    uploaded_file.seek(0)
+
+    try:
+        with Image.open(BytesIO(image_bytes)) as probe:
+            probe.verify()
+    except Exception as exc:
+        raise UploadValidationError("This file could not be read as a valid image.") from exc
+
+    # Re-open after verify() — per Pillow's docs, an Image object is unusable for anything else
+    # once verify() has run, so this is a fresh decode from the same (immutable) bytes.
+    with Image.open(BytesIO(image_bytes)) as decoded:
+        width, height = decoded.size
+        has_transparency = decoded.mode in {"RGBA", "LA"} or "transparency" in decoded.info
+
+    if width < MIN_UPLOAD_DIMENSION_PX or height < MIN_UPLOAD_DIMENSION_PX:
+        raise UploadValidationError(
+            f"Image is too small ({width}x{height}px). Minimum is "
+            f"{MIN_UPLOAD_DIMENSION_PX}x{MIN_UPLOAD_DIMENSION_PX}px."
+        )
+
+    # Owner-scoped fingerprint (not a bare content hash): SourceDesignAsset.source_fingerprint
+    # is globally unique (shared with the gallery/URL dedup path above, which is genuinely
+    # content-addressed). Two different users uploading byte-identical files must not collide on
+    # that constraint — folding the owner id in keeps global uniqueness while still letting the
+    # SAME user re-uploading identical bytes dedupe to their own existing asset.
+    fingerprint = hashlib.sha256(f"user:{owner.pk}:".encode("utf-8") + image_bytes).hexdigest()
+
+    existing = SourceDesignAsset.objects.filter(source_fingerprint=fingerprint).first()
+    if existing and existing.image:
+        return existing
+
+    asset = SourceDesignAsset(
+        owner=owner,
+        source_type=source_type,
+        title=title,
+        source_fingerprint=fingerprint,
+        width=width,
+        height=height,
+        mime_type=content_type,
+        file_size=uploaded_file.size,
+        has_transparency=has_transparency,
+    )
+    asset.image.save(f"{fingerprint}{extension}", ContentFile(image_bytes), save=False)
+    asset.save()
+    return asset
+
+
 def _load_source_image(render) -> Image.Image:
     if render.generated_image:
         generated_image = render.generated_image
@@ -868,9 +961,17 @@ def is_placement_printable(placement: DesignPlacement) -> bool:
 
 
 def _load_source_image_for_placement(placement: DesignPlacement) -> Image.Image:
-    """Same resolution order as _load_source_image(), adapted for DesignPlacement's field names
-    (it has no `source_asset` FK — that's MockupRender-specific). Always the original, full-
-    resolution source — nothing here is ever the downscaled preview output."""
+    """Always the original, full-resolution source — nothing here is ever the downscaled
+    preview output. `source_asset` (an uploaded file or a stored AI-generated result — see
+    apps.generator.services.create_uploaded_source_design_asset) is checked FIRST: it's the
+    highest-fidelity, explicitly-chosen source for a part customized via the editor's Upload or
+    Generate-with-AI actions, stored as an untouched local file rather than a URL to re-fetch.
+    A Gallery selection still resolves via `source_artwork` below, unchanged."""
+    if placement.source_asset and placement.source_asset.image:
+        image = _load_storage_image(placement.source_asset.image)
+        if image is not None:
+            return image
+
     if placement.source_generated_image:
         generated_image = placement.source_generated_image
         if generated_image.image:

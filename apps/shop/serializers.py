@@ -53,21 +53,34 @@ class ProductSerializer(serializers.ModelSerializer):
             "available_colors",
         )
 
-    def get_image(self, obj: Product):
-        if not obj.image:
+    def _fallback_template_image_url(self, obj: Product):
+        # A product with no dedicated photo of its own yet (common for a freshly-activated
+        # product an admin hasn't photographed) falls back to its linked template's blank
+        # garment mockup rather than showing nothing on the storefront. A product with no
+        # linked template either has genuinely nothing to show — that's a real content gap,
+        # not something to paper over.
+        if not obj.mockup_template_id or not obj.mockup_template.base_image:
             return None
         try:
-            return obj.image.url
+            return obj.mockup_template.base_image.url
         except Exception:
             return None
 
+    def get_image(self, obj: Product):
+        if obj.image:
+            try:
+                return obj.image.url
+            except Exception:
+                pass
+        return self._fallback_template_image_url(obj)
+
     def get_thumbnail(self, obj: Product):
-        if not obj.thumbnail:
-            return None
-        try:
-            return obj.thumbnail.url
-        except Exception:
-            return None
+        if obj.thumbnail:
+            try:
+                return obj.thumbnail.url
+            except Exception:
+                pass
+        return self._fallback_template_image_url(obj)
 
     def _available_variants(self, obj: Product):
         # Relies on the view prefetching `variants` filtered/ordered appropriately to avoid N+1;

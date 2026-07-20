@@ -1,5 +1,6 @@
 from rest_framework import status
 from rest_framework.generics import ListAPIView, RetrieveAPIView
+from rest_framework.parsers import MultiPartParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -11,7 +12,7 @@ import hashlib
 
 from apps.gallery.models import Artwork
 
-from .models import DesignPlacement, DesignProject, GeneratedImage, GeneratedPrintFile, GenerationRequest, MockupRender, MockupTemplate, ProductVariant
+from .models import DesignPlacement, DesignProject, GeneratedImage, GeneratedPrintFile, GenerationRequest, MockupRender, MockupTemplate, ProductVariant, SourceDesignAsset
 from .serializers import (
     DesignProjectListSerializer,
     DesignProjectSerializer,
@@ -22,11 +23,14 @@ from .serializers import (
     MockupRenderSerializer,
     MockupTemplateSerializer,
     ProductVariantSerializer,
+    SourceDesignAssetSerializer,
     _placement_write_data_to_model_fields,
 )
 from .services import (
+    UploadValidationError,
     build_mockup_cache_key,
     create_or_reuse_print_file,
+    create_uploaded_source_design_asset,
     ensure_source_design_asset,
     is_placement_printable,
     process_mockup_render,
@@ -157,6 +161,38 @@ class ProductVariantListView(ListAPIView):
         if product_id:
             queryset = queryset.filter(product_id=product_id)
         return queryset
+
+
+class SourceDesignAssetUploadView(APIView):
+    """POST /api/generator/design-assets/upload/ — the one entry point for both a device file
+    upload ("Upload Design") and persisting a client-generated AI image ("Generate with AI") in
+    the customization editor's artwork action menu. Both are "here are raw image bytes I own,
+    store them" — the only difference is the declared `source_type` form field. Always private
+    to the uploading user (see SourceDesignAsset.owner) — never surfaced through any public
+    listing endpoint."""
+
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser]
+
+    def post(self, request):
+        uploaded_file = request.FILES.get("file")
+        if not uploaded_file:
+            return Response({"file": ["No file was submitted."]}, status=status.HTTP_400_BAD_REQUEST)
+
+        source_type = request.data.get("source_type") or SourceDesignAsset.SourceType.USER_UPLOAD
+        title = request.data.get("title", "")
+
+        try:
+            asset = create_uploaded_source_design_asset(
+                uploaded_file=uploaded_file,
+                owner=request.user,
+                source_type=source_type,
+                title=title,
+            )
+        except UploadValidationError as exc:
+            return Response({"file": [str(exc)]}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(SourceDesignAssetSerializer(asset).data, status=status.HTTP_201_CREATED)
 
 
 class MockupRenderListCreateView(APIView):

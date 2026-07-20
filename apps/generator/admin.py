@@ -236,18 +236,40 @@ class MockupTemplateAdmin(admin.ModelAdmin):
 
 @admin.register(SourceDesignAsset)
 class SourceDesignAssetAdmin(admin.ModelAdmin):
+    """Gallery-derived rows (artwork set, owner null) are still hand-editable here as before.
+    User uploads / AI-generated assets (owner set — see SourceDesignAssetUploadView, never
+    created through this admin form) are visible for support/moderation but their file-derived
+    facts (mime_type/file_size/has_transparency/owner) are read-only — they describe the actual
+    uploaded bytes, not admin-editable metadata."""
+
     form = SourceDesignAssetAdminForm
-    list_display = ("id", "title", "artwork", "source_fingerprint", "updated_at")
-    search_fields = ("title", "source_url", "source_fingerprint", "artwork__title")
-    readonly_fields = ("source_fingerprint", "width", "height", "created_at", "updated_at")
+    list_display = ("id", "title", "source_type", "owner", "artwork", "source_fingerprint", "updated_at")
+    list_filter = ("source_type",)
+    search_fields = ("title", "source_url", "source_fingerprint", "artwork__title", "owner__email")
+    readonly_fields = (
+        "source_fingerprint",
+        "width",
+        "height",
+        "owner",
+        "mime_type",
+        "file_size",
+        "has_transparency",
+        "created_at",
+        "updated_at",
+    )
     fields = (
         "artwork",
+        "owner",
+        "source_type",
         "title",
         "image",
         "source_url",
         "source_fingerprint",
         "width",
         "height",
+        "mime_type",
+        "file_size",
+        "has_transparency",
         "notes",
         "created_at",
         "updated_at",

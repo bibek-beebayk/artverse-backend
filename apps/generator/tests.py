@@ -24,6 +24,7 @@ from .models import (
     MockupTemplate,
     MockupTemplatePart,
     ProductVariant,
+    SourceDesignAsset,
 )
 
 
@@ -2032,3 +2033,267 @@ class GeneratedPrintFileModelAvailabilityTests(TestCase):
         )
         record.output_file.save("test-print-file.png", ContentFile(buffer.getvalue()), save=True)
         self.assertTrue(record.output_file.name.startswith("design-projects/print-files/"))
+
+
+def make_upload_file(*, filename="design.png", size=(200, 200), mode="RGBA", color=(10, 20, 30, 255), fmt="PNG", content_type="image/png"):
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    buffer = BytesIO()
+    Image.new(mode, size, color).save(buffer, format=fmt)
+    return SimpleUploadedFile(filename, buffer.getvalue(), content_type=content_type)
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(prefix="artverse-test-media-"))
+class SourceDesignAssetUploadApiTests(APITestCase):
+    """POST /api/generator/design-assets/upload/ — the shared entry point for both a device
+    file upload and persisting a client-generated AI image."""
+
+    def setUp(self):
+        self.user = make_user("uploader")
+        self.other_user = make_user("someone-else")
+
+    def test_authentication_required(self):
+        response = self.client.post(
+            "/api/generator/design-assets/upload/", {"file": make_upload_file()}, format="multipart"
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_valid_image_accepted_and_ownership_assigned(self):
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post(
+            "/api/generator/design-assets/upload/", {"file": make_upload_file()}, format="multipart"
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["width"], 200)
+        self.assertEqual(response.data["height"], 200)
+        self.assertIsNotNone(response.data["file_url"])
+
+        asset = SourceDesignAsset.objects.get(pk=response.data["id"])
+        self.assertEqual(asset.owner_id, self.user.id)
+        self.assertEqual(asset.source_type, SourceDesignAsset.SourceType.USER_UPLOAD)
+
+    def test_dimensions_and_transparency_stored(self):
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post(
+            "/api/generator/design-assets/upload/",
+            {"file": make_upload_file(size=(321, 654), mode="RGBA", color=(1, 2, 3, 0))},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["width"], 321)
+        self.assertEqual(response.data["height"], 654)
+        self.assertTrue(response.data["has_transparency"])
+
+    def test_opaque_image_has_transparency_false(self):
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post(
+            "/api/generator/design-assets/upload/",
+            {"file": make_upload_file(mode="RGB", color=(10, 20, 30), fmt="JPEG", filename="opaque.jpg", content_type="image/jpeg")},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertFalse(response.data["has_transparency"])
+
+    def test_invalid_mime_type_rejected(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        self.client.force_authenticate(user=self.user)
+        bad_file = SimpleUploadedFile("not-an-image.gif", b"GIF89a", content_type="image/gif")
+        response = self.client.post(
+            "/api/generator/design-assets/upload/", {"file": bad_file}, format="multipart"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("file", response.data)
+
+    def test_oversized_file_rejected(self):
+        from unittest import mock
+
+        self.client.force_authenticate(user=self.user)
+        with mock.patch("apps.generator.services.MAX_UPLOAD_SIZE_BYTES", 100):
+            response = self.client.post(
+                "/api/generator/design-assets/upload/", {"file": make_upload_file()}, format="multipart"
+            )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("too large", str(response.data["file"]))
+
+    def test_corrupt_image_rejected(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        self.client.force_authenticate(user=self.user)
+        corrupt_file = SimpleUploadedFile("design.png", b"this is not a real png file", content_type="image/png")
+        response = self.client.post(
+            "/api/generator/design-assets/upload/", {"file": corrupt_file}, format="multipart"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("could not be read", str(response.data["file"]))
+
+    def test_too_small_image_rejected(self):
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post(
+            "/api/generator/design-assets/upload/",
+            {"file": make_upload_file(size=(10, 10))},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("too small", str(response.data["file"]))
+
+    def test_ai_generated_source_type_accepted(self):
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post(
+            "/api/generator/design-assets/upload/",
+            {"file": make_upload_file(), "source_type": "ai_generated"},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        asset = SourceDesignAsset.objects.get(pk=response.data["id"])
+        self.assertEqual(asset.source_type, SourceDesignAsset.SourceType.AI_GENERATED)
+
+    def test_gallery_source_type_rejected_for_uploads(self):
+        # "gallery" is never client-settable — it only ever applies to admin-owned Artwork-backed
+        # assets, which this endpoint (owner=request.user) never creates.
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post(
+            "/api/generator/design-assets/upload/",
+            {"file": make_upload_file(), "source_type": "gallery"},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_other_user_cannot_reference_private_upload_in_own_design_project(self):
+        self.client.force_authenticate(user=self.user)
+        upload_response = self.client.post(
+            "/api/generator/design-assets/upload/", {"file": make_upload_file()}, format="multipart"
+        )
+        asset_id = upload_response.data["id"]
+
+        template = make_template(slug="upload-ownership-template")
+        self.client.force_authenticate(user=self.other_user)
+        response = self.client.post(
+            "/api/generator/design-projects/",
+            {
+                "mockup_template_id": template.id,
+                "placements": [{"part_name": "front", "source_asset_id": asset_id}],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("source_asset_id", str(response.data["placements"]))
+
+    def test_owner_can_reference_own_upload_in_design_project(self):
+        self.client.force_authenticate(user=self.user)
+        upload_response = self.client.post(
+            "/api/generator/design-assets/upload/", {"file": make_upload_file()}, format="multipart"
+        )
+        asset_id = upload_response.data["id"]
+
+        template = make_template(slug="upload-ownership-template-2")
+        response = self.client.post(
+            "/api/generator/design-projects/",
+            {
+                "mockup_template_id": template.id,
+                "placements": [{"part_name": "front", "source_asset_id": asset_id}],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["placements"][0]["source_asset_id"], asset_id)
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(prefix="artverse-test-media-"))
+class DesignProjectSourceAssetPersistenceTests(APITestCase):
+    """Section 18/28: a saved design project's placements must correctly persist and restore
+    gallery / user-upload / AI-generated sources, and production rendering must use the
+    original, highest-quality source file rather than a re-derived URL."""
+
+    def setUp(self):
+        self.user = make_user("persist-user")
+        self.template = make_template(slug="persist-template")
+        self.client.force_authenticate(user=self.user)
+
+    def test_gallery_asset_persists_via_source_artwork(self):
+        category = Category.objects.create(name="Persist Cat", slug="persist-cat")
+        artwork = Artwork.objects.create(title="Gallery Piece", slug="persist-artwork", category=category)
+        response = self.client.post(
+            "/api/generator/design-projects/",
+            {
+                "mockup_template_id": self.template.id,
+                "placements": [{"part_name": "front", "source_artwork_id": artwork.id}],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["placements"][0]["source_artwork_id"], artwork.id)
+        placement = DesignPlacement.objects.get(design_project_id=response.data["id"])
+        self.assertEqual(placement.source_artwork_id, artwork.id)
+        self.assertIsNone(placement.source_asset_id)
+
+    def test_user_upload_asset_persists_via_source_asset(self):
+        upload_response = self.client.post(
+            "/api/generator/design-assets/upload/", {"file": make_upload_file()}, format="multipart"
+        )
+        asset_id = upload_response.data["id"]
+        response = self.client.post(
+            "/api/generator/design-projects/",
+            {
+                "mockup_template_id": self.template.id,
+                "placements": [{"part_name": "front", "source_asset_id": asset_id}],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        placement = DesignPlacement.objects.get(design_project_id=response.data["id"])
+        self.assertEqual(placement.source_asset_id, asset_id)
+        self.assertEqual(placement.source_asset.source_type, SourceDesignAsset.SourceType.USER_UPLOAD)
+
+    def test_ai_generated_asset_persists_via_source_asset(self):
+        upload_response = self.client.post(
+            "/api/generator/design-assets/upload/",
+            {"file": make_upload_file(), "source_type": "ai_generated"},
+            format="multipart",
+        )
+        asset_id = upload_response.data["id"]
+        response = self.client.post(
+            "/api/generator/design-projects/",
+            {
+                "mockup_template_id": self.template.id,
+                "placements": [{"part_name": "front", "source_asset_id": asset_id}],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        placement = DesignPlacement.objects.get(design_project_id=response.data["id"])
+        self.assertEqual(placement.source_asset.source_type, SourceDesignAsset.SourceType.AI_GENERATED)
+
+    def test_preview_only_blank_project_has_no_placements_required(self):
+        response = self.client.post(
+            "/api/generator/design-projects/",
+            {"mockup_template_id": self.template.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertEqual(response.data["placements"], [])
+        self.assertIsNone(response.data["product"])
+
+    def test_production_rendering_prefers_source_asset_over_url(self):
+        from .services import _load_source_image_for_placement
+
+        upload_response = self.client.post(
+            "/api/generator/design-assets/upload/",
+            {"file": make_upload_file(size=(150, 150), color=(200, 0, 0, 255))},
+            format="multipart",
+        )
+        asset = SourceDesignAsset.objects.get(pk=upload_response.data["id"])
+
+        project = DesignProject.objects.create(user=self.user, mockup_template=self.template)
+        placement = DesignPlacement.objects.create(
+            design_project=project,
+            part_name="front",
+            source_asset=asset,
+            # A deliberately-wrong URL fallback — if source_asset weren't prioritized first,
+            # loading would either fail (bad URL) or return the wrong pixels.
+            source_image_url=make_data_url((0, 255, 0, 255), (50, 50)),
+        )
+
+        loaded = _load_source_image_for_placement(placement)
+        self.assertEqual(loaded.size, (150, 150))
+        self.assertEqual(loaded.getpixel((0, 0))[:3], (200, 0, 0))

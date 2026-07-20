@@ -12,6 +12,7 @@ from .views import (
     MockupRenderListCreateView,
     MockupTemplateListView,
     ProductVariantListView,
+    SourceDesignAssetUploadView,
 )
 
 
@@ -20,6 +21,7 @@ urlpatterns = [
     path("images/", GeneratedImageListView.as_view(), name="generated-image-list"),
     path("mockup-templates/", MockupTemplateListView.as_view(), name="mockup-template-list"),
     path("product-variants/", ProductVariantListView.as_view(), name="product-variant-list"),
+    path("design-assets/upload/", SourceDesignAssetUploadView.as_view(), name="source-design-asset-upload"),
     path("mockup-renders/", MockupRenderListCreateView.as_view(), name="mockup-render-list-create"),
     path("mockup-renders/<int:pk>/", MockupRenderDetailView.as_view(), name="mockup-render-detail"),
     path("design-projects/", DesignProjectListCreateView.as_view(), name="design-project-list-create"),

@@ -11,6 +11,7 @@ from .models import (
     MockupTemplate,
     MockupTemplatePart,
     ProductVariant,
+    SourceDesignAsset,
 )
 
 
@@ -44,6 +45,43 @@ class GeneratedImageSerializer(serializers.ModelSerializer):
             return obj.image.url
         except Exception:
             return None
+
+
+class SourceDesignAssetSerializer(serializers.ModelSerializer):
+    """Response shape for SourceDesignAssetUploadView. No separate thumbnail field on the model
+    — an upload/AI-generated result is already a reasonably-sized single design asset, not a
+    huge original needing a distinct thumbnail the way gallery Artwork/shop Product do — so
+    thumbnail_url is just an alias for file_url."""
+
+    file_url = serializers.SerializerMethodField()
+    thumbnail_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SourceDesignAsset
+        fields = (
+            "id",
+            "source_type",
+            "file_url",
+            "thumbnail_url",
+            "width",
+            "height",
+            "has_transparency",
+            "created_at",
+        )
+
+    def _get_file_url(self, obj: SourceDesignAsset):
+        if not obj.image:
+            return None
+        try:
+            return obj.image.url
+        except Exception:
+            return None
+
+    def get_file_url(self, obj: SourceDesignAsset):
+        return self._get_file_url(obj)
+
+    def get_thumbnail_url(self, obj: SourceDesignAsset):
+        return self._get_file_url(obj)
 
 
 class MockupTemplatePartSerializer(serializers.ModelSerializer):
@@ -375,6 +413,7 @@ class DesignPlacementSerializer(serializers.ModelSerializer):
     preview_render_id = serializers.IntegerField(read_only=True)
     source_artwork_id = serializers.IntegerField(read_only=True)
     source_generated_image_id = serializers.IntegerField(read_only=True)
+    source_asset_id = serializers.IntegerField(read_only=True)
     template_part_id = serializers.IntegerField(read_only=True)
 
     class Meta:
@@ -385,6 +424,7 @@ class DesignPlacementSerializer(serializers.ModelSerializer):
             "template_part_id",
             "source_artwork_id",
             "source_generated_image_id",
+            "source_asset_id",
             "source_image_url",
             "source_prompt",
             "placement_override",
@@ -428,6 +468,11 @@ class DesignPlacementWriteSerializer(serializers.Serializer):
     part_name = serializers.ChoiceField(choices=MockupTemplatePart.PartName.choices)
     source_artwork_id = serializers.IntegerField(required=False, allow_null=True)
     source_generated_image_id = serializers.IntegerField(required=False, allow_null=True)
+    # An uploaded file or a stored AI-generated result (see SourceDesignAssetUploadView) — never
+    # set for a Gallery selection, which still uses source_artwork_id above. Ownership (must be
+    # owned by the requesting user) is validated in DesignProjectWriteSerializer.validate(),
+    # alongside the existing source_generated_image_id ownership check.
+    source_asset_id = serializers.IntegerField(required=False, allow_null=True)
     source_image_url = serializers.CharField(required=False, allow_blank=True, default="")
     source_prompt = serializers.CharField(required=False, allow_blank=True, default="")
     placement_override = PlacementOverrideSerializer(required=False)
@@ -449,6 +494,7 @@ def _placement_write_data_to_model_fields(item: dict) -> dict:
         "part_name": item["part_name"],
         "source_artwork_id": item.get("source_artwork_id"),
         "source_generated_image_id": item.get("source_generated_image_id"),
+        "source_asset_id": item.get("source_asset_id"),
         "source_image_url": item.get("source_image_url", ""),
         "source_prompt": item.get("source_prompt", ""),
         "x": placement.get("x", 0),
@@ -767,6 +813,16 @@ class DesignProjectWriteSerializer(serializers.Serializer):
                 owned = GeneratedImage.objects.filter(pk=image_id, user=request.user).exists()
                 if not owned:
                     item_errors["source_generated_image_id"] = "This generated image does not belong to you."
+
+            source_asset_id = placement.get("source_asset_id")
+            if source_asset_id is not None:
+                # A gallery-derived SourceDesignAsset (owner is null — see the model docstring)
+                # is never referenced here (Gallery selections use source_artwork_id instead), so
+                # this is always an ownership check, never a "does this exist" check against a
+                # legitimately-ownerless row.
+                owned = SourceDesignAsset.objects.filter(pk=source_asset_id, owner=request.user).exists()
+                if not owned:
+                    item_errors["source_asset_id"] = "This design asset does not belong to you."
 
             preview_render_id = placement.get("preview_render_id")
             if preview_render_id is not None:

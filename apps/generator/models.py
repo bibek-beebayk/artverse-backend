@@ -47,6 +47,11 @@ class GeneratedImage(models.Model):
 
 
 class SourceDesignAsset(models.Model):
+    class SourceType(models.TextChoices):
+        GALLERY = "gallery", "Gallery"
+        USER_UPLOAD = "user_upload", "User upload"
+        AI_GENERATED = "ai_generated", "AI generated"
+
     artwork = models.ForeignKey(
         "gallery.Artwork",
         on_delete=models.SET_NULL,
@@ -54,6 +59,19 @@ class SourceDesignAsset(models.Model):
         null=True,
         blank=True,
     )
+    # Null for gallery-derived assets (admin-owned artwork, public by definition — see `artwork`
+    # above) and for legacy rows predating this field. Set for a user upload or an AI-generated
+    # image saved via the customization editor's action menu — those are private to this owner
+    # (see apps.generator.views.SourceDesignAssetUploadView / apps.generator.serializers), never
+    # exposed through any public listing endpoint.
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="source_design_assets",
+        null=True,
+        blank=True,
+    )
+    source_type = models.CharField(max_length=20, choices=SourceType.choices, default=SourceType.GALLERY)
     title = models.CharField(max_length=255, blank=True)
     source_url = models.TextField(
         blank=True,
@@ -68,6 +86,11 @@ class SourceDesignAsset(models.Model):
     )
     width = models.PositiveIntegerField(null=True, blank=True)
     height = models.PositiveIntegerField(null=True, blank=True)
+    mime_type = models.CharField(max_length=100, blank=True)
+    file_size = models.PositiveIntegerField(null=True, blank=True, help_text="Original upload size in bytes.")
+    has_transparency = models.BooleanField(
+        default=False, help_text="Whether the stored image has an alpha channel (structural check, not per-pixel)."
+    )
     notes = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -422,6 +445,19 @@ class DesignPlacement(models.Model):
     )
     source_generated_image = models.ForeignKey(
         "generator.GeneratedImage",
+        on_delete=models.SET_NULL,
+        related_name="design_placements",
+        null=True,
+        blank=True,
+    )
+    # The uploaded-file or AI-generated `SourceDesignAsset` behind this placement, when the
+    # design came from the customization editor's Upload or Generate-with-AI actions (a Gallery
+    # selection still uses `source_artwork` above — a SourceDesignAsset is not created for that
+    # case). Kept distinct from `source_image_url` (which stays empty for these) so production
+    # rendering always reads the original stored file rather than re-deriving from a URL — see
+    # `_load_source_image_for_placement` in services.py.
+    source_asset = models.ForeignKey(
+        "generator.SourceDesignAsset",
         on_delete=models.SET_NULL,
         related_name="design_placements",
         null=True,

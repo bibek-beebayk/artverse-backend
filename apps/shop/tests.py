@@ -1,13 +1,23 @@
+import tempfile
 from decimal import Decimal
+from io import BytesIO
 
 from django.core.exceptions import ValidationError
+from django.core.files.base import ContentFile
 from django.db import IntegrityError, transaction
-from django.test import TestCase
+from django.test import TestCase, override_settings
+from PIL import Image
 from rest_framework import status
 from rest_framework.test import APITestCase
 
 from apps.accounts.models import User
 from apps.generator.models import MockupTemplate, MockupTemplatePart, ProductVariant
+
+
+def attach_image(field_file, filename="test.png"):
+    buffer = BytesIO()
+    Image.new("RGBA", (4, 4), (0, 0, 0, 0)).save(buffer, format="PNG")
+    field_file.save(filename, ContentFile(buffer.getvalue()), save=True)
 
 from .models import Product, ProductCategory
 from .serializers import ProductSerializer
@@ -384,7 +394,7 @@ class ProductPublicVisibilityTests(APITestCase):
         response = self.client.get(f"/api/shop/products/{product.slug}/")
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
         list_response = self.client.get("/api/shop/products/")
-        self.assertNotIn(product.id, [row["id"] for row in list_response.data])
+        self.assertNotIn(product.id, [row["id"] for row in list_response.data["results"]])
 
     def test_active_product_without_sellable_variant_is_hidden(self):
         product = make_product(self.template, is_active=True)
@@ -431,7 +441,7 @@ class ProductPublicVisibilityTests(APITestCase):
         make_product(self.template, is_active=True, slug="hidden-no-variant")
 
         response = self.client.get("/api/shop/products/")
-        slugs = [row["slug"] for row in response.data]
+        slugs = [row["slug"] for row in response.data["results"]]
         self.assertEqual(slugs, ["visible"])
 
 
@@ -455,6 +465,43 @@ class ProductSerializerDirectTests(TestCase):
         data = ProductSerializer(product).data
         self.assertIsNone(data["starting_price"])
         self.assertFalse(data["is_available"])
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(prefix="artverse-test-media-"))
+class ProductImageFallbackTests(TestCase):
+    """A product with no photo of its own falls back to its linked template's blank mockup
+    image, rather than the storefront showing nothing for it."""
+
+    def test_falls_back_to_template_base_image_when_product_has_no_image(self):
+        template = make_template(slug="fallback-template-with-image")
+        attach_image(template.base_image, "template-base.png")
+        product = make_product(template, is_active=True)
+
+        data = ProductSerializer(product).data
+        self.assertIsNotNone(data["image"])
+        self.assertIsNotNone(data["thumbnail"])
+        self.assertIn("template-base", data["image"])
+
+    def test_product_s_own_image_takes_priority_over_template_fallback(self):
+        template = make_template(slug="fallback-template-priority")
+        attach_image(template.base_image, "template-base.png")
+        product = make_product(template, is_active=True)
+        attach_image(product.image, "product-own.png")
+
+        data = ProductSerializer(product).data
+        self.assertIn("product-own", data["image"])
+
+    def test_no_fallback_when_product_has_no_linked_template(self):
+        product = make_product(template=None, is_active=True)
+        data = ProductSerializer(product).data
+        self.assertIsNone(data["image"])
+        self.assertIsNone(data["thumbnail"])
+
+    def test_no_fallback_when_template_itself_has_no_base_image(self):
+        template = make_template(slug="fallback-template-no-image")
+        product = make_product(template, is_active=True)
+        data = ProductSerializer(product).data
+        self.assertIsNone(data["image"])
 
 
 class ProductVariantSellabilityConsistencyTests(APITestCase):
@@ -551,3 +598,108 @@ class ProductVariantSerializerFieldTests(APITestCase):
         variant_row = response.data["variants"][0]
         self.assertIn("is_sellable", variant_row)
         self.assertIn("pricing_ready", variant_row)
+
+
+class ProductCataloguePaginationTests(APITestCase):
+    """Section 3/28 of the Shop-catalogue redesign: server-side pagination, search, category/
+    product-type filtering, and whitelisted ordering on the public product list."""
+
+    def setUp(self):
+        self.tshirt_template = make_template(slug="pg-tshirt")
+        self.mug_template = make_template(slug="pg-mug")
+        self.mug_template.product_type = MockupTemplate.ProductType.MUG
+        self.mug_template.save(update_fields=["product_type"])
+
+    def _make_sellable_product(self, *, name, slug, template, category=None, base_cost="10.00"):
+        product = make_product(template, category=category, slug=slug, is_active=True)
+        product.name = name
+        product.save(update_fields=["name"])
+        make_variant(product, template, base_cost=Decimal(base_cost))
+        return product
+
+    def test_pagination_metadata_shape(self):
+        for i in range(3):
+            self._make_sellable_product(name=f"Item {i}", slug=f"pg-item-{i}", template=self.tshirt_template)
+
+        response = self.client.get("/api/shop/products/?page_size=2")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = response.data
+        self.assertEqual(body["count"], 3)
+        self.assertEqual(body["page"], 1)
+        self.assertEqual(body["page_size"], 2)
+        self.assertEqual(body["total_pages"], 2)
+        self.assertEqual(len(body["results"]), 2)
+        self.assertIsNotNone(body["next"])
+        self.assertIsNone(body["previous"])
+
+    def test_pagination_second_page(self):
+        for i in range(3):
+            self._make_sellable_product(name=f"Item {i}", slug=f"pg-item-{i}", template=self.tshirt_template)
+
+        response = self.client.get("/api/shop/products/?page_size=2&page=2")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["results"]), 1)
+        self.assertIsNone(response.data["next"])
+        self.assertIsNotNone(response.data["previous"])
+
+    def test_search_matches_name_or_description(self):
+        self._make_sellable_product(name="Cyber Hoodie", slug="pg-cyber", template=self.tshirt_template)
+        matched = self._make_sellable_product(name="Neon Tee", slug="pg-neon", template=self.tshirt_template)
+        matched.description = "cyberpunk vibes"
+        matched.save(update_fields=["description"])
+
+        response = self.client.get("/api/shop/products/?search=cyber")
+        slugs = {row["slug"] for row in response.data["results"]}
+        self.assertEqual(slugs, {"pg-cyber", "pg-neon"})
+
+    def test_category_filter(self):
+        cat_a = make_category(slug="pg-cat-a")
+        cat_b = make_category(slug="pg-cat-b")
+        self._make_sellable_product(name="A", slug="pg-a", template=self.tshirt_template, category=cat_a)
+        self._make_sellable_product(name="B", slug="pg-b", template=self.tshirt_template, category=cat_b)
+
+        response = self.client.get("/api/shop/products/?category=pg-cat-a")
+        slugs = {row["slug"] for row in response.data["results"]}
+        self.assertEqual(slugs, {"pg-a"})
+
+    def test_product_type_filter(self):
+        self._make_sellable_product(name="Shirt", slug="pg-shirt", template=self.tshirt_template)
+        self._make_sellable_product(name="Mug", slug="pg-mug-item", template=self.mug_template)
+
+        response = self.client.get("/api/shop/products/?product_type=mug")
+        slugs = {row["slug"] for row in response.data["results"]}
+        self.assertEqual(slugs, {"pg-mug-item"})
+
+    def test_ordering_by_starting_price_ascending_and_descending(self):
+        self._make_sellable_product(name="Cheap", slug="pg-cheap", template=self.tshirt_template, base_cost="5.00")
+        self._make_sellable_product(name="Pricey", slug="pg-pricey", template=self.tshirt_template, base_cost="50.00")
+
+        asc = self.client.get("/api/shop/products/?ordering=starting_price")
+        self.assertEqual([row["slug"] for row in asc.data["results"]], ["pg-cheap", "pg-pricey"])
+
+        desc = self.client.get("/api/shop/products/?ordering=-starting_price")
+        self.assertEqual([row["slug"] for row in desc.data["results"]], ["pg-pricey", "pg-cheap"])
+
+    def test_ordering_by_name(self):
+        self._make_sellable_product(name="Zebra", slug="pg-zebra", template=self.tshirt_template)
+        self._make_sellable_product(name="Alpha", slug="pg-alpha", template=self.tshirt_template)
+
+        response = self.client.get("/api/shop/products/?ordering=name")
+        self.assertEqual([row["slug"] for row in response.data["results"]], ["pg-alpha", "pg-zebra"])
+
+    def test_unknown_ordering_value_is_ignored_not_applied_raw(self):
+        # Never pass an arbitrary/malicious ordering string straight to .order_by() — an unknown
+        # value must not error, it's just ignored (falls back to the queryset's natural order).
+        self._make_sellable_product(name="A", slug="pg-order-a", template=self.tshirt_template)
+        response = self.client.get("/api/shop/products/?ordering=__class__.mro")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_only_sellable_products_returned_in_paginated_list(self):
+        self._make_sellable_product(name="Visible", slug="pg-visible", template=self.tshirt_template)
+        make_product(self.tshirt_template, slug="pg-hidden-inactive", is_active=False)
+        make_product(self.tshirt_template, slug="pg-hidden-no-variant", is_active=True)
+
+        response = self.client.get("/api/shop/products/")
+        slugs = {row["slug"] for row in response.data["results"]}
+        self.assertEqual(slugs, {"pg-visible"})
+        self.assertEqual(response.data["count"], 1)
