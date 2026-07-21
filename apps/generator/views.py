@@ -4,6 +4,7 @@ from rest_framework.parsers import MultiPartParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from django.core.files.base import ContentFile
 from django.db import transaction
 from django.db.models import Count, Prefetch
 from django.shortcuts import get_object_or_404
@@ -27,11 +28,14 @@ from .serializers import (
     _placement_write_data_to_model_fields,
 )
 from .services import (
+    AiGenerationError,
     UploadValidationError,
     build_mockup_cache_key,
     create_or_reuse_print_file,
+    create_source_design_asset_from_generated_image,
     create_uploaded_source_design_asset,
     ensure_source_design_asset,
+    generate_ai_image,
     is_placement_printable,
     process_mockup_render,
     resolve_source_fingerprint,
@@ -39,6 +43,10 @@ from .services import (
 
 
 ALLOWED_DESIGN_PROJECT_ORDERING = {"updated_at", "-updated_at", "created_at", "-created_at", "name", "-name"}
+
+# Whitelisted, same set the frontend's AI panel already offers — never pass a raw client value
+# straight to the provider config.
+ALLOWED_AI_ASPECT_RATIOS = {"1:1", "4:3", "3:4", "16:9", "9:16"}
 
 
 def _placements_prefetch():
@@ -104,6 +112,11 @@ class GenerationRequestListCreateView(APIView):
     def post(self, request):
         serializer = GenerationRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+
+        aspect_ratio = request.data.get("aspect_ratio", "1:1")
+        if aspect_ratio not in ALLOWED_AI_ASPECT_RATIOS:
+            return Response({"aspect_ratio": ["Unsupported aspect ratio."]}, status=status.HTTP_400_BAD_REQUEST)
+
         generation_request = GenerationRequest.objects.create(
             user=request.user,
             prompt=serializer.validated_data["prompt"],
@@ -111,13 +124,37 @@ class GenerationRequestListCreateView(APIView):
             provider=serializer.validated_data.get("provider", "gemini"),
             model_name=serializer.validated_data.get("model_name", ""),
         )
-        response_serializer = GenerationRequestSerializer(generation_request)
+
+        # Synchronous, matching every other generation-adjacent endpoint in this app
+        # (process_mockup_render, create_or_reuse_print_file) — there's no task queue here.
+        try:
+            image_bytes = generate_ai_image(prompt=generation_request.prompt, aspect_ratio=aspect_ratio)
+        except AiGenerationError as exc:
+            generation_request.status = GenerationRequest.Status.FAILED
+            generation_request.error_message = str(exc)
+            generation_request.save(update_fields=["status", "error_message", "updated_at"])
+            return Response(
+                {"detail": str(exc), "request": GenerationRequestSerializer(generation_request).data},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        generated_image = GeneratedImage(
+            generation_request=generation_request,
+            user=request.user,
+            prompt=generation_request.prompt,
+        )
+        generated_image.image.save(f"generation-{generation_request.pk}.png", ContentFile(image_bytes), save=False)
+        generated_image.save()
+
+        generation_request.status = GenerationRequest.Status.COMPLETED
+        generation_request.save(update_fields=["status", "updated_at"])
+
         return Response(
             {
-                "request": response_serializer.data,
-                "message": "Generation request accepted. Provider integration should be added server-side next.",
+                "request": GenerationRequestSerializer(generation_request).data,
+                "image": GeneratedImageSerializer(generated_image).data,
             },
-            status=status.HTTP_202_ACCEPTED,
+            status=status.HTTP_201_CREATED,
         )
 
 
@@ -139,6 +176,16 @@ class MockupTemplateListView(ListAPIView):
         if product_type:
             queryset = queryset.filter(product_type=product_type)
         return queryset
+
+
+class MockupTemplateDetailView(RetrieveAPIView):
+    """Single-template lookup by id — lets a caller that already knows a product's
+    `mockup_template_id` (e.g. shop.ProductSerializer) fetch just that template instead of
+    filtering the full list client-side. Mirrors apps.shop.views.ProductDetailView's shape."""
+
+    queryset = MockupTemplate.objects.filter(is_active=True).prefetch_related("parts")
+    serializer_class = MockupTemplateSerializer
+    permission_classes = [AllowAny]
 
 
 class ProductVariantListView(ListAPIView):
@@ -191,6 +238,33 @@ class SourceDesignAssetUploadView(APIView):
             )
         except UploadValidationError as exc:
             return Response({"file": [str(exc)]}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(SourceDesignAssetSerializer(asset).data, status=status.HTTP_201_CREATED)
+
+
+class SourceDesignAssetFromGeneratedImageView(APIView):
+    """POST /api/generator/design-assets/from-generated-image/ — promotes a GeneratedImage the
+    requesting user already owns (created via GenerationRequestListCreateView.post) into a
+    private SourceDesignAsset, without re-uploading the bytes from the browser a second time.
+    Ownership-scoped: a GeneratedImage belonging to another user 404s, never 403 (same
+    not-found-not-forbidden convention as DesignProjectDetailView elsewhere in this app)."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        generated_image_id = request.data.get("generated_image_id")
+        if not generated_image_id:
+            return Response({"generated_image_id": ["This field is required."]}, status=status.HTTP_400_BAD_REQUEST)
+
+        generated_image = get_object_or_404(GeneratedImage, pk=generated_image_id, user=request.user)
+
+        try:
+            asset = create_source_design_asset_from_generated_image(
+                generated_image=generated_image,
+                owner=request.user,
+            )
+        except UploadValidationError as exc:
+            return Response({"generated_image_id": [str(exc)]}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response(SourceDesignAssetSerializer(asset).data, status=status.HTTP_201_CREATED)
 

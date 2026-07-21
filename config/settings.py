@@ -41,6 +41,12 @@ PRINTIFY_REQUEST_TIMEOUT = int(os.getenv("PRINTIFY_REQUEST_TIMEOUT", "30"))
 # disable the integration (e.g. during an incident) without removing credentials from .env.
 PRINTIFY_ENABLED = env_bool("PRINTIFY_ENABLED", False)
 
+# AI image generation (apps.generator's Gemini-backed GenerationRequest/GeneratedImage flow).
+# Server-side only — never exposed to the frontend. Same kill-switch pattern as Printify above.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash-image")
+GEMINI_ENABLED = env_bool("GEMINI_ENABLED", False)
+
 ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", "127.0.0.1,localhost")
 
 CORS_ALLOWED_ORIGINS = env_list(

@@ -383,6 +383,87 @@ def create_uploaded_source_design_asset(
     return asset
 
 
+class AiGenerationError(RuntimeError):
+    """Raised for any AI-generation-time problem (missing/invalid key, blocked or empty
+    response, provider/network failure) — the view catches this specifically and marks the
+    GenerationRequest failed instead of leaking a raw provider stack trace to the client."""
+
+
+# Same wording as the client-side prompt this replaces (see CHANGELOG) — keeps generated output
+# stylistically identical to what the direct-from-browser calls produced before this migration.
+_PROMPT_PREFIX = "Digital art, cyberpunk style, neon lights, highly detailed, futuristic: "
+
+
+def generate_ai_image(*, prompt: str, aspect_ratio: str) -> bytes:
+    """Calls Gemini server-side and returns the generated image's raw bytes. The only AI-provider
+    call in this codebase — apps.generator.views.GenerationRequestListCreateView is the only
+    caller. Never called with a client-supplied API key; always apps.generator's own
+    settings.GEMINI_API_KEY."""
+    from django.conf import settings
+
+    if not settings.GEMINI_ENABLED:
+        raise AiGenerationError("AI generation is currently disabled.")
+    if not settings.GEMINI_API_KEY:
+        raise AiGenerationError("AI generation is not configured on the server.")
+
+    from google import genai
+    from google.genai import types
+    from google.genai.errors import APIError
+
+    client = genai.Client(api_key=settings.GEMINI_API_KEY)
+
+    try:
+        response = client.models.generate_content(
+            model=settings.GEMINI_MODEL_NAME,
+            contents=types.Content(parts=[types.Part.from_text(text=_PROMPT_PREFIX + prompt)]),
+            config=types.GenerateContentConfig(image_config=types.ImageConfig(aspect_ratio=aspect_ratio)),
+        )
+    except APIError as exc:
+        raise AiGenerationError(f"The AI provider request failed: {exc}") from exc
+    except Exception as exc:
+        raise AiGenerationError(f"The AI provider request failed: {exc}") from exc
+
+    candidates = response.candidates or []
+    for candidate in candidates:
+        parts = candidate.content.parts if candidate.content else []
+        for part in parts or []:
+            inline_data = getattr(part, "inline_data", None)
+            if inline_data and inline_data.data:
+                # The SDK already returns raw bytes here (unlike the JS SDK's base64 string) —
+                # no further decoding needed.
+                return inline_data.data
+
+    raise AiGenerationError("The AI provider did not return an image for this prompt.")
+
+
+def create_source_design_asset_from_generated_image(*, generated_image: GeneratedImage, owner) -> SourceDesignAsset:
+    """Promotes an already-server-side GeneratedImage into a private SourceDesignAsset, reusing
+    create_uploaded_source_design_asset's validation/dedup path instead of duplicating it — the
+    only difference from a device upload is that the bytes already live in GeneratedImage.image
+    rather than arriving in the request body."""
+    if not generated_image.image:
+        raise UploadValidationError("This generated image has no stored file to use.")
+
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    generated_image.image.open("rb")
+    try:
+        image_bytes = generated_image.image.read()
+    finally:
+        generated_image.image.close()
+
+    filename = Path(generated_image.image.name).name or f"generated-{generated_image.pk}.png"
+    content_type = mimetypes.guess_type(filename)[0] or "image/png"
+    uploaded_file = SimpleUploadedFile(filename, image_bytes, content_type=content_type)
+
+    return create_uploaded_source_design_asset(
+        uploaded_file=uploaded_file,
+        owner=owner,
+        source_type=SourceDesignAsset.SourceType.AI_GENERATED,
+        title=generated_image.prompt[:255],
+    )
+
+
 def _load_source_image(render) -> Image.Image:
     if render.generated_image:
         generated_image = render.generated_image

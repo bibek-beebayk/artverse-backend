@@ -1,5 +1,6 @@
 import tempfile
 from io import BytesIO
+from unittest import mock
 
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
@@ -20,12 +21,14 @@ from .models import (
     DesignProject,
     GeneratedImage,
     GeneratedPrintFile,
+    GenerationRequest,
     MockupRender,
     MockupTemplate,
     MockupTemplatePart,
     ProductVariant,
     SourceDesignAsset,
 )
+from .services import AiGenerationError
 
 
 def attach_image(field_file, filename="test.png"):
@@ -2297,3 +2300,170 @@ class DesignProjectSourceAssetPersistenceTests(APITestCase):
         loaded = _load_source_image_for_placement(placement)
         self.assertEqual(loaded.size, (150, 150))
         self.assertEqual(loaded.getpixel((0, 0))[:3], (200, 0, 0))
+
+
+def make_fake_generated_png_bytes(color=(255, 0, 128, 255), size=(128, 128)):
+    buffer = BytesIO()
+    Image.new("RGBA", size, color).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(prefix="artverse-test-media-"))
+class AiGenerationApiTests(APITestCase):
+    """POST /api/generator/requests/ — the backend-mediated Gemini generation endpoint. The
+    provider call itself (apps.generator.services.generate_ai_image) is mocked throughout: these
+    tests exercise auth/ownership/persistence, never a real network call to Google."""
+
+    def setUp(self):
+        self.user = make_user("generator")
+
+    def test_requires_authentication(self):
+        response = self.client.post("/api/generator/requests/", {"prompt": "a neon cat", "aspect_ratio": "1:1"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_successful_generation_creates_generated_image_owned_by_requesting_user(self):
+        self.client.force_authenticate(user=self.user)
+        with mock.patch(
+            "apps.generator.views.generate_ai_image",
+            return_value=make_fake_generated_png_bytes(),
+        ) as mocked:
+            response = self.client.post(
+                "/api/generator/requests/", {"prompt": "a neon cat", "aspect_ratio": "1:1"}, format="json"
+            )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        mocked.assert_called_once()
+        self.assertEqual(mocked.call_args.kwargs["prompt"], "a neon cat")
+        self.assertEqual(mocked.call_args.kwargs["aspect_ratio"], "1:1")
+
+        image_id = response.data["image"]["id"]
+        generated_image = GeneratedImage.objects.get(pk=image_id)
+        self.assertEqual(generated_image.user, self.user)
+        self.assertEqual(generated_image.prompt, "a neon cat")
+        self.assertTrue(generated_image.image)
+        self.assertEqual(generated_image.generation_request.status, GenerationRequest.Status.COMPLETED)
+
+    def test_rejects_unsupported_aspect_ratio(self):
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post(
+            "/api/generator/requests/", {"prompt": "a neon cat", "aspect_ratio": "2:1"}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_provider_failure_marks_request_failed_and_returns_502(self):
+        self.client.force_authenticate(user=self.user)
+        with mock.patch(
+            "apps.generator.views.generate_ai_image",
+            side_effect=AiGenerationError("The AI provider request failed: boom"),
+        ):
+            response = self.client.post(
+                "/api/generator/requests/", {"prompt": "a neon cat", "aspect_ratio": "1:1"}, format="json"
+            )
+        self.assertEqual(response.status_code, status.HTTP_502_BAD_GATEWAY)
+        request_id = response.data["request"]["id"]
+        generation_request = GenerationRequest.objects.get(pk=request_id)
+        self.assertEqual(generation_request.status, GenerationRequest.Status.FAILED)
+        self.assertIn("boom", generation_request.error_message)
+        # A failed generation must never leave behind a GeneratedImage row.
+        self.assertFalse(GeneratedImage.objects.filter(generation_request=generation_request).exists())
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp(prefix="artverse-test-media-"))
+class SourceDesignAssetFromGeneratedImageApiTests(APITestCase):
+    """POST /api/generator/design-assets/from-generated-image/ — promotes a GeneratedImage the
+    caller owns into a private SourceDesignAsset, without a second upload of the bytes."""
+
+    def setUp(self):
+        self.user = make_user("owner")
+        self.other_user = make_user("intruder")
+        self.template = make_template()
+
+    def _make_generated_image(self, *, user):
+        generated_image = GeneratedImage(user=user, prompt="a neon cat")
+        generated_image.image.save(
+            "generated-test.png", ContentFile(make_fake_generated_png_bytes()), save=False
+        )
+        generated_image.save()
+        return generated_image
+
+    def test_requires_authentication(self):
+        generated_image = self._make_generated_image(user=self.user)
+        response = self.client.post(
+            "/api/generator/design-assets/from-generated-image/",
+            {"generated_image_id": generated_image.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_promotes_owned_generated_image_to_source_design_asset(self):
+        self.client.force_authenticate(user=self.user)
+        generated_image = self._make_generated_image(user=self.user)
+        response = self.client.post(
+            "/api/generator/design-assets/from-generated-image/",
+            {"generated_image_id": generated_image.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        asset = SourceDesignAsset.objects.get(pk=response.data["id"])
+        self.assertEqual(asset.owner, self.user)
+        self.assertEqual(asset.source_type, SourceDesignAsset.SourceType.AI_GENERATED)
+        self.assertTrue(asset.image)
+
+    def test_promoted_asset_is_usable_in_a_design_project_placement(self):
+        self.client.force_authenticate(user=self.user)
+        generated_image = self._make_generated_image(user=self.user)
+        promote_response = self.client.post(
+            "/api/generator/design-assets/from-generated-image/",
+            {"generated_image_id": generated_image.id},
+            format="json",
+        )
+        asset = SourceDesignAsset.objects.get(pk=promote_response.data["id"])
+
+        project = DesignProject.objects.create(user=self.user, mockup_template=self.template)
+        placement = DesignPlacement.objects.create(
+            design_project=project, part_name="front", source_asset=asset
+        )
+        from .services import _load_source_image_for_placement
+
+        loaded = _load_source_image_for_placement(placement)
+        self.assertEqual(loaded.size, (128, 128))
+
+    def test_other_user_cannot_promote_someone_elses_generated_image(self):
+        self.client.force_authenticate(user=self.other_user)
+        generated_image = self._make_generated_image(user=self.user)
+        response = self.client.post(
+            "/api/generator/design-assets/from-generated-image/",
+            {"generated_image_id": generated_image.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertFalse(
+            SourceDesignAsset.objects.filter(source_type=SourceDesignAsset.SourceType.AI_GENERATED, owner=self.other_user).exists()
+        )
+
+    def test_missing_generated_image_id_returns_400(self):
+        self.client.force_authenticate(user=self.user)
+        response = self.client.post("/api/generator/design-assets/from-generated-image/", {}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class MockupTemplateDetailApiTests(APITestCase):
+    """GET /api/generator/mockup-templates/<id>/ — pairs with getProductBySlug so the
+    customization editor loads exactly one template instead of the full list."""
+
+    def test_active_template_is_returned(self):
+        template = make_template(slug="detail-active")
+        response = self.client.get(f"/api/generator/mockup-templates/{template.id}/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["id"], template.id)
+        self.assertEqual(response.data["slug"], "detail-active")
+
+    def test_inactive_template_is_hidden(self):
+        template = make_template(slug="detail-inactive")
+        template.is_active = False
+        template.save(update_fields=["is_active"])
+        response = self.client.get(f"/api/generator/mockup-templates/{template.id}/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_missing_template_returns_404(self):
+        response = self.client.get("/api/generator/mockup-templates/999999/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
