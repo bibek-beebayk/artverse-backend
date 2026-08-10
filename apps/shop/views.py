@@ -1,5 +1,5 @@
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db.models import F, Min, Prefetch, Q
+from django.db.models import Count, F, Min, Prefetch, Q
 from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.generics import (
@@ -27,7 +27,16 @@ from .serializers import (
     ProductCategorySerializer,
     ProductSerializer,
 )
-from .services import activate_product, deactivate_product, sellable_variant_exists_subquery
+from .services import (
+    READINESS_INACTIVE_DRAFT,
+    READINESS_NEEDS_ATTENTION,
+    READINESS_READY,
+    activate_product,
+    annotate_product_readiness,
+    deactivate_product,
+    product_readiness_issue_filter,
+    sellable_variant_exists_subquery,
+)
 
 # Shared by both public views: active AND has at least one sellable variant (see
 # apps.shop.services.sellable_variant_exists_subquery — kept in sync with
@@ -155,14 +164,96 @@ class AdminProductCategoryDetailView(RetrieveUpdateDestroyAPIView):
     permission_classes = [IsSuperUser]
 
 
+# Whitelist only — see apps.shop.views._ORDERING_FIELDS above for why a raw ?ordering= is never
+# passed straight to .order_by(). "newest"/"oldest" (not "created_at"/"-created_at") match the
+# labels the admin panel's ordering dropdown actually shows an admin.
+_ADMIN_PRODUCT_ORDERING_FIELDS = {
+    "name": "name",
+    "-name": "-name",
+    "newest": "-created_at",
+    "oldest": "created_at",
+    "starting_price": "_min_sellable_cost",
+    "-starting_price": "-_min_sellable_cost",
+    "variant_count": "_variant_count_annotated",
+    "-variant_count": "-_variant_count_annotated",
+}
+
+
+def _admin_product_base_queryset():
+    return (
+        Product.objects.select_related("category", "mockup_template__selected_print_provider")
+        .prefetch_related("variants")
+        .annotate(
+            _min_sellable_cost=Min(
+                "variants__base_cost",
+                filter=Q(
+                    variants__is_available=True,
+                    variants__base_cost__isnull=False,
+                    variants__template_id=F("mockup_template_id"),
+                )
+                & (Q(variants__external_provider="") | ~Q(variants__external_variant_id="")),
+            ),
+            _variant_count_annotated=Count("variants", distinct=True),
+        )
+    )
+
+
 class AdminProductListCreateView(ListCreateAPIView):
-    queryset = Product.objects.select_related("category", "mockup_template").all().order_by("-created_at")
+    """Products admin — server-side search/filter/ordering so the list stays paginated and
+    efficient regardless of catalogue size (never loads the full table to filter client-side).
+    `ready_status` uses annotate_product_readiness()/product_readiness_issue_filter() — the same
+    rules AdminProductSerializer.readiness reports per-row, evaluated in SQL for the filter."""
+
     serializer_class = AdminProductSerializer
     permission_classes = [IsSuperUser]
+    pagination_class = StandardResultsSetPagination
+
+    def get_queryset(self):
+        queryset = _admin_product_base_queryset()
+
+        search = self.request.query_params.get("search")
+        if search:
+            queryset = queryset.filter(
+                Q(name__icontains=search) | Q(slug__icontains=search) | Q(description__icontains=search)
+            )
+
+        category_id = self.request.query_params.get("category")
+        if category_id:
+            queryset = queryset.filter(category_id=category_id)
+
+        is_active = self.request.query_params.get("is_active")
+        if is_active in {"true", "false"}:
+            queryset = queryset.filter(is_active=(is_active == "true"))
+
+        product_type = self.request.query_params.get("product_type")
+        if product_type:
+            queryset = queryset.filter(mockup_template__product_type=product_type)
+
+        mockup_template_id = self.request.query_params.get("mockup_template")
+        if mockup_template_id:
+            queryset = queryset.filter(mockup_template_id=mockup_template_id)
+
+        ready_status = self.request.query_params.get("ready_status")
+        if ready_status in {READINESS_READY, READINESS_NEEDS_ATTENTION, READINESS_INACTIVE_DRAFT}:
+            queryset = annotate_product_readiness(queryset)
+            if ready_status == READINESS_INACTIVE_DRAFT:
+                queryset = queryset.filter(is_active=False)
+            elif ready_status == READINESS_NEEDS_ATTENTION:
+                queryset = queryset.filter(is_active=True).filter(product_readiness_issue_filter())
+            else:
+                queryset = queryset.filter(is_active=True).exclude(product_readiness_issue_filter())
+
+        ordering = self.request.query_params.get("ordering")
+        order_field = _ADMIN_PRODUCT_ORDERING_FIELDS.get(ordering)
+        queryset = queryset.order_by(order_field, "id") if order_field else queryset.order_by("-created_at", "id")
+
+        return queryset
 
 
 class AdminProductDetailView(RetrieveUpdateDestroyAPIView):
-    queryset = Product.objects.select_related("category", "mockup_template").all()
+    queryset = Product.objects.select_related("category", "mockup_template__selected_print_provider").prefetch_related(
+        "variants"
+    )
     serializer_class = AdminProductSerializer
     permission_classes = [IsSuperUser]
 

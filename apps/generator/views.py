@@ -11,9 +11,10 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.core.files.base import ContentFile
-from django.db import transaction
+from django.db import models, transaction
 from django.db.models import Count, Prefetch
 from django.shortcuts import get_object_or_404
+from decimal import Decimal, InvalidOperation
 import json
 import hashlib
 
@@ -838,24 +839,140 @@ class AdminMockupTemplatePartDetailView(RetrieveUpdateDestroyAPIView):
         super().perform_destroy(instance)
 
 
+# Whitelist only — never pass a raw ?ordering= straight to .order_by() (see
+# apps.shop.views._ORDERING_FIELDS for the same convention on the Products admin list).
+_ADMIN_VARIANT_ORDERING_FIELDS = {
+    "product": "product__name",
+    "-product": "-product__name",
+    "color": "color_name",
+    "-color": "-color_name",
+    "size": "size",
+    "-size": "-size",
+    "base_cost": "base_cost",
+    "-base_cost": "-base_cost",
+    "retail_price": "retail_price",
+    "-retail_price": "-retail_price",
+    "is_available": "is_available",
+    "-is_available": "-is_available",
+}
+
+# variant_is_sellable()'s row-level conditions, expressed directly against the ProductVariant
+# queryset (not as a correlated subquery — this filter runs against variant rows themselves, so
+# it's a plain join/filter, not apps.shop.services.sellable_variant_exists_subquery(), which is
+# built for filtering the *Product* queryset instead). Must stay in sync with variant_is_sellable().
+_SELLABLE_VARIANT_Q = models.Q(is_available=True, base_cost__isnull=False, template_id=models.F(
+    "product__mockup_template_id"
+)) & (models.Q(external_provider="") | ~models.Q(external_variant_id=""))
+
+
 class AdminProductVariantListCreateView(ListCreateAPIView):
-    queryset = ProductVariant.objects.select_related("product", "template").all()
+    """Product Variants admin — built to scale to hundreds/thousands of rows: every filter below
+    runs in SQL against the full table, never loads everything to filter in Python."""
+
+    queryset = ProductVariant.objects.select_related("product", "template__selected_print_provider").all()
     serializer_class = AdminProductVariantSerializer
     permission_classes = [IsSuperUser]
     pagination_class = StandardResultsSetPagination
 
     def get_queryset(self):
         queryset = super().get_queryset()
-        product_id = self.request.query_params.get("product")
+        params = self.request.query_params
+
+        product_id = params.get("product")
         if product_id:
             queryset = queryset.filter(product_id=product_id)
+
+        provider_id = params.get("provider")
+        if provider_id:
+            queryset = queryset.filter(template__selected_print_provider_id=provider_id)
+
+        external_provider = params.get("external_provider")
+        if external_provider:
+            queryset = queryset.filter(external_provider__icontains=external_provider)
+
+        color = params.get("color")
+        if color:
+            queryset = queryset.filter(color_name__icontains=color)
+
+        size = params.get("size")
+        if size:
+            queryset = queryset.filter(size__icontains=size)
+
+        is_available = params.get("is_available")
+        if is_available in {"true", "false"}:
+            queryset = queryset.filter(is_available=(is_available == "true"))
+
+        missing_cost = params.get("missing_cost")
+        if missing_cost in {"true", "false"}:
+            queryset = queryset.filter(base_cost__isnull=(missing_cost == "true"))
+
+        is_sellable = params.get("is_sellable")
+        if is_sellable == "true":
+            queryset = queryset.filter(_SELLABLE_VARIANT_Q)
+        elif is_sellable == "false":
+            queryset = queryset.exclude(_SELLABLE_VARIANT_Q)
+
+        search = params.get("search")
+        if search:
+            queryset = queryset.filter(
+                models.Q(sku__icontains=search)
+                | models.Q(product__name__icontains=search)
+                | models.Q(external_variant_id__icontains=search)
+                | models.Q(color_name__icontains=search)
+                | models.Q(size__icontains=search)
+            )
+
+        ordering = params.get("ordering")
+        order_field = _ADMIN_VARIANT_ORDERING_FIELDS.get(ordering)
+        queryset = queryset.order_by(order_field, "id") if order_field else queryset.order_by(
+            "product__name", "color_name", "size", "id"
+        )
+
         return queryset
 
 
 class AdminProductVariantDetailView(RetrieveUpdateDestroyAPIView):
-    queryset = ProductVariant.objects.select_related("product", "template").all()
+    queryset = ProductVariant.objects.select_related("product", "template__selected_print_provider").all()
     serializer_class = AdminProductVariantSerializer
     permission_classes = [IsSuperUser]
+
+
+class AdminProductVariantBulkActionView(APIView):
+    """Safe, scoped bulk actions only — mirrors the roadmap's explicit allowlist: mark available,
+    mark unavailable, set base cost for every selected row. Deliberately does NOT support bulk
+    edits to external IDs, product/provider/template relationships, or any delete — those need
+    dedicated, reviewed workflows, not a multi-select checkbox."""
+
+    permission_classes = [IsSuperUser]
+
+    ACTIONS = {"mark_available", "mark_unavailable", "set_base_cost"}
+
+    def post(self, request):
+        action = request.data.get("action")
+        variant_ids = request.data.get("variant_ids")
+
+        if action not in self.ACTIONS:
+            return Response({"action": [f"Must be one of {sorted(self.ACTIONS)}."]}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(variant_ids, list) or not variant_ids:
+            return Response({"variant_ids": ["Provide a non-empty list of variant ids."]}, status=status.HTTP_400_BAD_REQUEST)
+
+        queryset = ProductVariant.objects.filter(pk__in=variant_ids)
+
+        if action == "mark_available":
+            updated = queryset.update(is_available=True)
+        elif action == "mark_unavailable":
+            updated = queryset.update(is_available=False)
+        else:
+            base_cost = request.data.get("base_cost")
+            try:
+                base_cost_value = Decimal(str(base_cost))
+            except (InvalidOperation, TypeError):
+                return Response({"base_cost": ["A valid decimal amount is required."]}, status=status.HTTP_400_BAD_REQUEST)
+            if base_cost_value <= 0:
+                return Response({"base_cost": ["Must be greater than zero."]}, status=status.HTTP_400_BAD_REQUEST)
+            updated = queryset.update(base_cost=base_cost_value)
+
+        return Response({"action": action, "updated": updated})
 
 
 class AdminDesignProjectListView(ListAPIView):

@@ -2559,3 +2559,182 @@ class AdminMockupTemplateActivationTests(APITestCase):
 
         response = self.client.delete(f"/api/generator/admin/mockup-template-parts/{part.id}/")
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(MockupTemplatePart.objects.filter(pk=part.id).exists())
+
+
+class AdminMockupTemplateProviderSelectionTests(APITestCase):
+    """'Select Provider' (roadmap section 5) — PATCHing selected_print_provider through the
+    admin panel's Mockup Template edit screen must reject a provider that doesn't belong to a
+    blueprint mapped to this template, the same rule MockupTemplate.clean() enforces for Django
+    admin saves (a plain ModelSerializer.save() never calls full_clean(), so this has to be
+    checked explicitly in AdminMockupTemplateSerializer.validate())."""
+
+    def setUp(self):
+        self.superuser = make_generator_superuser("provideradmin")
+        self.client.force_authenticate(user=self.superuser)
+        self.template = make_template(slug="provider-selection-template")
+
+        from apps.printify.models import PrintifyBlueprint, PrintifyPrintProvider
+
+        self.mapped_blueprint = PrintifyBlueprint.objects.create(
+            blueprint_id=501, title="Mapped Blueprint", mockup_template=self.template
+        )
+        self.matching_provider = PrintifyPrintProvider.objects.create(
+            blueprint=self.mapped_blueprint, provider_id=1, title="Matching Provider"
+        )
+        self.other_blueprint = PrintifyBlueprint.objects.create(blueprint_id=502, title="Other Blueprint")
+        self.foreign_provider = PrintifyPrintProvider.objects.create(
+            blueprint=self.other_blueprint, provider_id=2, title="Foreign Provider"
+        )
+
+    def test_rejects_provider_from_unmapped_blueprint(self):
+        response = self.client.patch(
+            f"/api/generator/admin/mockup-templates/{self.template.id}/",
+            {"selected_print_provider": self.foreign_provider.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+        self.assertIn("selected_print_provider", response.data)
+        self.template.refresh_from_db()
+        self.assertIsNone(self.template.selected_print_provider_id)
+
+    def test_accepts_provider_from_mapped_blueprint(self):
+        response = self.client.patch(
+            f"/api/generator/admin/mockup-templates/{self.template.id}/",
+            {"selected_print_provider": self.matching_provider.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.template.refresh_from_db()
+        self.assertEqual(self.template.selected_print_provider_id, self.matching_provider.id)
+
+    def test_unrelated_field_update_does_not_re_validate_untouched_provider(self):
+        # Force an inconsistent state directly (bypassing the API) to confirm a save that
+        # doesn't touch selected_print_provider at all never re-validates it.
+        self.template.selected_print_provider = self.matching_provider
+        self.template.save(update_fields=["selected_print_provider"])
+        self.mapped_blueprint.mockup_template = None
+        self.mapped_blueprint.save(update_fields=["mockup_template"])
+
+        response = self.client.patch(
+            f"/api/generator/admin/mockup-templates/{self.template.id}/",
+            {"description": "Just a description update."},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+
+class AdminProductVariantAdminApiTests(APITestCase):
+    """Product Variants admin — search/filter/ordering must scope the SQL query, readiness_status
+    must reflect apps.shop.services.variant_is_sellable()'s exact criteria (broken out by which
+    check failed), and the bulk-action endpoint must stay within its safe allowlist."""
+
+    def setUp(self):
+        self.superuser = make_generator_superuser("variantadmin")
+        self.client.force_authenticate(user=self.superuser)
+        self.template = make_template(slug="variant-admin-template")
+        self.product = make_shop_product(self.template, slug="variant-admin-product")
+
+    def test_readiness_status_sellable(self):
+        variant = make_variant(self.template, product=self.product, base_cost="10.00", is_available=True)
+        response = self.client.get(f"/api/generator/admin/product-variants/{variant.id}/")
+        self.assertEqual(response.data["readiness_status"], "sellable")
+        self.assertTrue(response.data["is_sellable"])
+
+    def test_readiness_status_unavailable_takes_priority(self):
+        variant = make_variant(
+            self.template, product=self.product, base_cost=None, is_available=False, color_name="Blue"
+        )
+        response = self.client.get(f"/api/generator/admin/product-variants/{variant.id}/")
+        self.assertEqual(response.data["readiness_status"], "unavailable")
+
+    def test_readiness_status_missing_cost(self):
+        variant = make_variant(
+            self.template, product=self.product, base_cost=None, is_available=True, color_name="Green"
+        )
+        response = self.client.get(f"/api/generator/admin/product-variants/{variant.id}/")
+        self.assertEqual(response.data["readiness_status"], "missing_cost")
+
+    def test_readiness_status_invalid_mapping_for_incomplete_external_id(self):
+        variant = make_variant(
+            self.template,
+            product=self.product,
+            base_cost="10.00",
+            is_available=True,
+            color_name="Red",
+            external_provider="Printify",
+            external_variant_id="",
+        )
+        response = self.client.get(f"/api/generator/admin/product-variants/{variant.id}/")
+        self.assertEqual(response.data["readiness_status"], "invalid_mapping")
+
+    def test_missing_cost_filter(self):
+        make_variant(self.template, product=self.product, base_cost="10.00", color_name="Black")
+        make_variant(self.template, product=self.product, base_cost=None, color_name="White")
+        response = self.client.get("/api/generator/admin/product-variants/?missing_cost=true")
+        colors = {row["color_name"] for row in response.data["results"]}
+        self.assertEqual(colors, {"White"})
+
+    def test_search_by_sku(self):
+        make_variant(self.template, product=self.product, base_cost="10.00", sku="ABC-123", color_name="Black")
+        make_variant(self.template, product=self.product, base_cost="10.00", sku="XYZ-999", color_name="White")
+        response = self.client.get("/api/generator/admin/product-variants/?search=ABC")
+        skus = {row["sku"] for row in response.data["results"]}
+        self.assertEqual(skus, {"ABC-123"})
+
+    def test_bulk_mark_unavailable_and_available(self):
+        v1 = make_variant(self.template, product=self.product, base_cost="10.00", color_name="Black")
+        v2 = make_variant(self.template, product=self.product, base_cost="10.00", color_name="White")
+
+        response = self.client.post(
+            "/api/generator/admin/product-variants/bulk-action/",
+            {"action": "mark_unavailable", "variant_ids": [v1.id, v2.id]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["updated"], 2)
+        v1.refresh_from_db()
+        v2.refresh_from_db()
+        self.assertFalse(v1.is_available)
+        self.assertFalse(v2.is_available)
+
+        response = self.client.post(
+            "/api/generator/admin/product-variants/bulk-action/",
+            {"action": "mark_available", "variant_ids": [v1.id, v2.id]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        v1.refresh_from_db()
+        self.assertTrue(v1.is_available)
+
+    def test_bulk_set_base_cost(self):
+        v1 = make_variant(self.template, product=self.product, base_cost=None, color_name="Black")
+        response = self.client.post(
+            "/api/generator/admin/product-variants/bulk-action/",
+            {"action": "set_base_cost", "variant_ids": [v1.id], "base_cost": "12.50"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        v1.refresh_from_db()
+        self.assertEqual(str(v1.base_cost), "12.50")
+
+    def test_bulk_action_rejects_unknown_action(self):
+        v1 = make_variant(self.template, product=self.product, base_cost="10.00", color_name="Black")
+        response = self.client.post(
+            "/api/generator/admin/product-variants/bulk-action/",
+            {"action": "bulk_delete", "variant_ids": [v1.id]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_bulk_action_requires_superuser(self):
+        self.client.logout()
+        regular = make_user("variant-bulk-regular")
+        self.client.force_authenticate(user=regular)
+        v1 = make_variant(self.template, product=self.product, base_cost="10.00", color_name="Black")
+        response = self.client.post(
+            "/api/generator/admin/product-variants/bulk-action/",
+            {"action": "mark_unavailable", "variant_ids": [v1.id]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)

@@ -4,14 +4,61 @@ from .models import PrintifyBlueprint, PrintifyPrintProvider, PrintifySyncRun
 
 
 class PrintifyPrintProviderSerializer(serializers.ModelSerializer):
+    """Backs the Blueprints page's provider-inspection panel — every field here comes from
+    already-synced local data (this provider's own `variants` JSON, or a bounded query against
+    `ProductVariant` rows this provider currently fulfils), never a live Printify request."""
+
     variant_count = serializers.SerializerMethodField()
+    available_variant_count = serializers.SerializerMethodField()
+    supported_placeholders = serializers.SerializerMethodField()
+    missing_cost_variant_count = serializers.SerializerMethodField()
+    missing_external_id_variant_count = serializers.SerializerMethodField()
 
     class Meta:
         model = PrintifyPrintProvider
-        fields = ("id", "provider_id", "title", "location", "variant_count", "synced_at")
+        fields = (
+            "id",
+            "provider_id",
+            "title",
+            "location",
+            "variant_count",
+            "available_variant_count",
+            "supported_placeholders",
+            "missing_cost_variant_count",
+            "missing_external_id_variant_count",
+            "synced_at",
+        )
 
     def get_variant_count(self, obj: PrintifyPrintProvider) -> int:
         return len(obj.variants or [])
+
+    def get_available_variant_count(self, obj: PrintifyPrintProvider) -> int:
+        # `is_enabled` is a synthetic field folded in by
+        # services.fetch_print_provider_variants() — see that function's docstring for why
+        # Printify's raw catalogue has no native "in stock" flag to read directly.
+        return sum(1 for v in (obj.variants or []) if isinstance(v, dict) and v.get("is_enabled"))
+
+    def get_supported_placeholders(self, obj: PrintifyPrintProvider):
+        from .validation import get_provider_placeholder_positions
+
+        return sorted(get_provider_placeholder_positions(obj))
+
+    def get_missing_cost_variant_count(self, obj: PrintifyPrintProvider) -> int:
+        # Only ever non-zero once this provider has actually been selected on a template and
+        # variants synced from it — inspecting a not-yet-selected provider correctly reports 0
+        # ("nothing synced from it yet"), not an error.
+        from apps.generator.models import ProductVariant
+
+        return ProductVariant.objects.filter(template__selected_print_provider=obj, base_cost__isnull=True).count()
+
+    def get_missing_external_id_variant_count(self, obj: PrintifyPrintProvider) -> int:
+        from apps.generator.models import ProductVariant
+
+        return (
+            ProductVariant.objects.filter(template__selected_print_provider=obj, external_variant_id="")
+            .exclude(external_provider="")
+            .count()
+        )
 
 
 class PrintifyBlueprintListSerializer(serializers.ModelSerializer):

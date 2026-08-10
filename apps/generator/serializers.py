@@ -885,15 +885,45 @@ class AdminMockupTemplateSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     {"is_active": "A template must have at least one part before it can be activated."}
                 )
+
+        # "Select Provider" (Printify admin section 5): a plain ModelSerializer.save() never runs
+        # MockupTemplate.clean() — only Django Admin's form does — so without this, a PATCH here
+        # could silently set a provider that belongs to a different blueprint than the one mapped
+        # to this template. Only validated when the client actually sends this field; leaving it
+        # untouched on an unrelated field update never re-validates an existing, already-invalid
+        # value into a hard error on an unrelated save.
+        if "selected_print_provider" in attrs:
+            from apps.printify.validation import validate_provider_matches_template_blueprint
+
+            try:
+                validate_provider_matches_template_blueprint(
+                    self.instance.pk if self.instance else None, attrs["selected_print_provider"]
+                )
+            except ValueError as exc:
+                raise serializers.ValidationError({"selected_print_provider": str(exc)})
+
         return attrs
 
 
 class AdminProductVariantSerializer(serializers.ModelSerializer):
+    """`readiness_status` is one of SELLABLE / MISSING_COST / UNAVAILABLE / INVALID_MAPPING —
+    checked in that order against the exact same rule apps.shop.services.variant_is_sellable()
+    already enforces (never re-derived here), just broken out into *which* check failed instead
+    of a single boolean, so the admin table can show a specific reason rather than only
+    'not sellable'. `product_name`/`provider_title` are read-only display conveniences —
+    `product`/`template` stay the writable FK ids."""
+
+    product_name = serializers.CharField(source="product.name", read_only=True)
+    provider_title = serializers.SerializerMethodField()
+    readiness_status = serializers.SerializerMethodField()
+    is_sellable = serializers.SerializerMethodField()
+
     class Meta:
         model = ProductVariant
         fields = (
             "id",
             "product",
+            "product_name",
             "template",
             "sku",
             "name",
@@ -902,16 +932,38 @@ class AdminProductVariantSerializer(serializers.ModelSerializer):
             "size",
             "external_provider",
             "external_variant_id",
+            "provider_title",
             "base_cost",
             "retail_price",
             "inventory",
             "is_available",
+            "is_sellable",
+            "readiness_status",
             "image",
             "supported_print_areas",
             "created_at",
             "updated_at",
         )
         read_only_fields = ("id", "created_at", "updated_at")
+
+    def get_provider_title(self, obj: ProductVariant):
+        provider = getattr(obj.template, "selected_print_provider", None)
+        return provider.title if provider else None
+
+    def get_readiness_status(self, obj: ProductVariant):
+        if not obj.is_available:
+            return "unavailable"
+        if obj.base_cost is None:
+            return "missing_cost"
+        mockup_template_id = self.context.get("mockup_template_id", obj.product.mockup_template_id)
+        if mockup_template_id and obj.template_id != mockup_template_id:
+            return "invalid_mapping"
+        if obj.external_provider and not obj.external_variant_id:
+            return "invalid_mapping"
+        return "sellable"
+
+    def get_is_sellable(self, obj: ProductVariant):
+        return self.get_readiness_status(obj) == "sellable"
 
 
 class AdminGenerationRequestSerializer(serializers.ModelSerializer):

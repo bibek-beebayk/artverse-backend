@@ -2,7 +2,7 @@ from django.db import transaction
 from django.db.models import Count
 from rest_framework import status
 from rest_framework.generics import ListAPIView, RetrieveAPIView
-from rest_framework.permissions import IsAdminUser
+from apps.accounts.permissions import IsSuperUser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -18,13 +18,19 @@ from .validation import MappingValidationError, validate_blueprint_mapping
 
 
 class PrintifyConnectionStatusView(APIView):
-    """Admin-only: is Printify configured, and is it *actually* reachable right now? A token
+    """Superuser-only: is Printify configured, and is it *actually* reachable right now? A token
     string being present in settings isn't the same as a working connection — this performs a
     real (but cheap, single-request) shop lookup so "connected" reflects reality, not just
     "someone typed a token in once". Always 200 — a disconnected integration is a normal admin-
-    UI state to display, not a server error."""
+    UI state to display, not a server error.
 
-    permission_classes = [IsAdminUser]
+    Every view in this module was tightened from IsAdminUser (is_staff) to IsSuperUser once the
+    React admin panel's Printify pages became the primary consumer — the panel itself is already
+    superuser-gated, and a plain staff account hitting these endpoints directly (bypassing the
+    frontend route guard) previously got a 200. Never echoes PRINTIFY_API_TOKEN or any other
+    secret back to the client."""
+
+    permission_classes = [IsSuperUser]
 
     def get(self, request):
         last_run = PrintifySyncRun.objects.order_by("-started_at").first()
@@ -59,7 +65,7 @@ class PrintifyConnectionStatusView(APIView):
 
 class PrintifyBlueprintListView(ListAPIView):
     serializer_class = PrintifyBlueprintListSerializer
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsSuperUser]
 
     def get_queryset(self):
         queryset = PrintifyBlueprint.objects.annotate(provider_count_value=Count("print_providers", distinct=True))
@@ -68,6 +74,12 @@ class PrintifyBlueprintListView(ListAPIView):
             queryset = queryset.filter(mockup_template__isnull=False)
         elif is_mapped == "false":
             queryset = queryset.filter(mockup_template__isnull=True)
+        # Reverse lookup for the Mockup Template edit screen's "Printify Mapping" section: given
+        # a template id, find the blueprint (if any) mapped to it — PrintifyBlueprint.mockup_template
+        # has no other query surface for this today.
+        mockup_template_id = self.request.query_params.get("mockup_template")
+        if mockup_template_id:
+            queryset = queryset.filter(mockup_template_id=mockup_template_id)
         return queryset
 
 
@@ -76,7 +88,7 @@ class PrintifyBlueprintDetailView(RetrieveAPIView):
         provider_count_value=Count("print_providers", distinct=True)
     )
     serializer_class = PrintifyBlueprintDetailSerializer
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsSuperUser]
 
 
 class PrintifyBlueprintMapView(APIView):
@@ -96,7 +108,7 @@ class PrintifyBlueprintMapView(APIView):
     failure rolls back everything, so nothing is left partially mapped and the previous
     mapping/provider/placeholder configuration is untouched, not silently cleared."""
 
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsSuperUser]
 
     def post(self, request, pk):
         try:
@@ -144,7 +156,7 @@ class PrintifySyncBlueprintsView(APIView):
     (that endpoint isn't shop-scoped), but letting an admin trigger sync after sync without ever
     surfacing that the configured shop is wrong would be its own kind of silent bypass."""
 
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsSuperUser]
 
     def post(self, request):
         try:
@@ -161,7 +173,7 @@ class PrintifySyncProvidersView(APIView):
     """Trigger a print-provider + variant sync for one already-synced blueprint. Validates the
     configured shop first — see PrintifySyncBlueprintsView's docstring for why."""
 
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsSuperUser]
 
     def post(self, request, pk):
         try:
@@ -186,4 +198,4 @@ class PrintifySyncRunListView(ListAPIView):
 
     queryset = PrintifySyncRun.objects.select_related("triggered_by").order_by("-started_at")
     serializer_class = PrintifySyncRunSerializer
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsSuperUser]

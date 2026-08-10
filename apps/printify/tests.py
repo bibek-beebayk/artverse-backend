@@ -343,7 +343,16 @@ class ProductVariantSyncTests(TestCase):
 @override_settings(PRINTIFY_API_TOKEN="test-token", PRINTIFY_SHOP_ID="12345", PRINTIFY_ENABLED=True)
 class PrintifyAdminAPITests(APITestCase):
     def setUp(self):
+        # Every Printify admin endpoint is IsSuperUser-gated (tightened from IsAdminUser once the
+        # React admin panel — itself superuser-only — became the primary consumer; see
+        # PrintifyConnectionStatusView's docstring). `self.staff` here is a full superuser despite
+        # the name, matching the rest of this test suite's convention; `test_staff_without_
+        # superuser_is_denied` below is what actually exercises the is_staff-but-not-superuser
+        # boundary.
         self.staff = make_user("staff", is_staff=True)
+        self.staff.is_superuser = True
+        self.staff.save(update_fields=["is_superuser"])
+        self.staff_only = make_user("staff-only", is_staff=True)
         self.regular = make_user("regular", is_staff=False)
         self.blueprint = PrintifyBlueprint.objects.create(blueprint_id=1, title="Unisex Tee")
 
@@ -354,6 +363,17 @@ class PrintifyAdminAPITests(APITestCase):
         self.client.force_authenticate(user=self.regular)
         response = self.client.get("/api/printify/status/")
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_staff_without_superuser_is_denied(self):
+        # is_staff=True alone must no longer be enough for any Printify admin endpoint — only
+        # is_superuser=True (see PrintifyConnectionStatusView's docstring on the permission
+        # tightening).
+        self.client.force_authenticate(user=self.staff_only)
+        self.assertEqual(self.client.get("/api/printify/status/").status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.get("/api/printify/blueprints/").status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(
+            self.client.post("/api/printify/sync-blueprints/").status_code, status.HTTP_403_FORBIDDEN
+        )
 
     @patch("apps.printify.services.fetch_shops")
     def test_status_endpoint_connected(self, mock_fetch_shops):
@@ -1245,6 +1265,8 @@ class PrintifyBlueprintMapViewConsistencyTests(APITestCase):
 
     def setUp(self):
         self.staff = make_user("staff", is_staff=True)
+        self.staff.is_superuser = True
+        self.staff.save(update_fields=["is_superuser"])
         self.regular = make_user("regular", is_staff=False)
 
     def _synced_provider(self, blueprint, provider_id=10, positions=("front", "back")):

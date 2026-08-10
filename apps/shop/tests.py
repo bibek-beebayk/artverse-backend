@@ -22,8 +22,12 @@ def attach_image(field_file, filename="test.png"):
 from .models import Product, ProductCategory
 from .serializers import ProductSerializer
 from .services import (
+    READINESS_INACTIVE_DRAFT,
+    READINESS_NEEDS_ATTENTION,
+    READINESS_READY,
     activate_product,
     deactivate_product,
+    get_product_readiness,
     get_product_starting_price,
     product_has_sellable_variant,
     validate_product_can_be_activated,
@@ -778,3 +782,131 @@ class AdminProductActivationActionTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         product.refresh_from_db()
         self.assertFalse(product.is_active)
+
+
+class ProductReadinessTests(TestCase):
+    """get_product_readiness() — the single source of truth behind the admin panel's Ready /
+    Needs Attention / Inactive Draft status, reused by AdminProductSerializer and the dashboard's
+    'Products Needing Attention' count. Each check here mirrors one bullet in the roadmap spec's
+    readiness list."""
+
+    def setUp(self):
+        self.template = make_template(slug="readiness-template")
+
+    def test_inactive_product_is_always_inactive_draft_even_with_issues(self):
+        product = make_product(self.template, slug="readiness-draft")
+        readiness = get_product_readiness(product)
+        self.assertEqual(readiness["status"], READINESS_INACTIVE_DRAFT)
+        self.assertFalse(readiness["is_ready"])
+        self.assertIn("No variants configured.", readiness["issues"])
+
+    def test_active_product_with_sellable_variant_is_ready(self):
+        product = make_product(self.template, slug="readiness-ready", is_active=True)
+        make_variant(product, self.template, base_cost=Decimal("10.00"))
+        readiness = get_product_readiness(product)
+        self.assertEqual(readiness, {"is_ready": True, "status": READINESS_READY, "issues": []})
+
+    def test_active_product_that_lost_its_only_sellable_variant_needs_attention(self):
+        # Activation itself is gated on having a sellable variant — this simulates the variant
+        # regressing (e.g. marked unavailable) *after* activation, which the admin panel's
+        # dashboard/list are specifically meant to surface.
+        product = make_product(self.template, slug="readiness-regressed", is_active=True)
+        variant = make_variant(product, self.template, base_cost=Decimal("10.00"))
+        variant.is_available = False
+        variant.save(update_fields=["is_available"])
+        readiness = get_product_readiness(product)
+        self.assertEqual(readiness["status"], READINESS_NEEDS_ATTENTION)
+        self.assertFalse(readiness["is_ready"])
+
+    def test_missing_production_cost_is_reported(self):
+        product = make_product(self.template, slug="readiness-missing-cost", is_active=True)
+        make_variant(product, self.template, base_cost=Decimal("10.00"))
+        make_variant(product, self.template, base_cost=None, color_name="Blue", size="L")
+        readiness = get_product_readiness(product)
+        self.assertTrue(any("missing production cost" in issue for issue in readiness["issues"]))
+
+    def test_incomplete_printify_mapping_is_reported(self):
+        product = make_product(self.template, slug="readiness-incomplete-mapping", is_active=True)
+        make_variant(
+            product,
+            self.template,
+            base_cost=Decimal("10.00"),
+            external_provider="Printify",
+            external_variant_id="",
+        )
+        readiness = get_product_readiness(product)
+        self.assertTrue(any("incomplete Printify mapping" in issue for issue in readiness["issues"]))
+
+    def test_no_mockup_template_is_reported(self):
+        product = make_product(None, category=make_category("readiness-no-template"), slug="readiness-no-template")
+        readiness = get_product_readiness(product)
+        self.assertIn("No mockup template selected.", readiness["issues"])
+
+
+class AdminProductListFilteringTests(APITestCase):
+    """Products admin — server-side search/filter/ordering must actually scope the SQL query,
+    not just accept the params and ignore them."""
+
+    def setUp(self):
+        self.superuser = make_superuser("shopadmin3")
+        self.client.force_authenticate(user=self.superuser)
+        self.template = make_template(slug="admin-filter-template")
+
+    def test_search_filters_by_name(self):
+        make_product(self.template, slug="admin-filter-alpha")
+        p2 = make_product(self.template, slug="admin-filter-zebra")
+        p2.name = "Zebra Print Hoodie"
+        p2.save(update_fields=["name"])
+        response = self.client.get("/api/shop/admin/products/?search=zebra")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        slugs = [row["slug"] for row in response.data["results"]]
+        self.assertEqual(slugs, ["admin-filter-zebra"])
+
+    def test_is_active_filter(self):
+        make_product(self.template, slug="admin-filter-inactive", is_active=False)
+        make_product(self.template, slug="admin-filter-active", is_active=True)
+        response = self.client.get("/api/shop/admin/products/?is_active=true")
+        slugs = {row["slug"] for row in response.data["results"]}
+        self.assertEqual(slugs, {"admin-filter-active"})
+
+    def test_ready_status_filter_separates_ready_from_needs_attention(self):
+        ready = make_product(self.template, slug="admin-filter-ready", is_active=True)
+        make_variant(ready, self.template, base_cost=Decimal("10.00"))
+
+        needs_attention = make_product(self.template, slug="admin-filter-needs-attention", is_active=True)
+        variant = make_variant(needs_attention, self.template, base_cost=Decimal("10.00"), color_name="Blue")
+        variant.is_available = False
+        variant.save(update_fields=["is_available"])
+
+        draft = make_product(self.template, slug="admin-filter-draft", is_active=False)
+
+        ready_response = self.client.get("/api/shop/admin/products/?ready_status=ready")
+        self.assertEqual({row["slug"] for row in ready_response.data["results"]}, {"admin-filter-ready"})
+
+        attention_response = self.client.get("/api/shop/admin/products/?ready_status=needs_attention")
+        self.assertEqual(
+            {row["slug"] for row in attention_response.data["results"]}, {"admin-filter-needs-attention"}
+        )
+
+        draft_response = self.client.get("/api/shop/admin/products/?ready_status=inactive_draft")
+        self.assertEqual({row["slug"] for row in draft_response.data["results"]}, {"admin-filter-draft"})
+
+    def test_readiness_field_present_on_list_and_detail(self):
+        product = make_product(self.template, slug="admin-filter-readiness-shape", is_active=True)
+        make_variant(product, self.template, base_cost=Decimal("10.00"))
+
+        list_response = self.client.get("/api/shop/admin/products/")
+        row = next(r for r in list_response.data["results"] if r["slug"] == "admin-filter-readiness-shape")
+        self.assertEqual(row["readiness"], {"is_ready": True, "status": READINESS_READY, "issues": []})
+
+        detail_response = self.client.get(f"/api/shop/admin/products/{product.id}/")
+        self.assertEqual(detail_response.data["readiness"]["status"], READINESS_READY)
+
+    def test_ordering_by_name(self):
+        for slug, name in (("admin-filter-order-b", "Bravo"), ("admin-filter-order-a", "Alpha")):
+            product = make_product(self.template, slug=slug)
+            product.name = name
+            product.save(update_fields=["name"])
+        response = self.client.get("/api/shop/admin/products/?ordering=name")
+        names = [row["name"] for row in response.data["results"]]
+        self.assertLess(names.index("Alpha"), names.index("Bravo"))

@@ -84,3 +84,76 @@ class AdminSiteConfigurationSingletonTests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(SiteConfiguration.get_solo().maintenance_mode)
+
+
+class AdminDashboardTests(APITestCase):
+    """The Dashboard's aggregated summary endpoint — superuser-gated like every other admin
+    endpoint, shape-checked (no accidental leak of per-user detail), and query-count-bounded
+    (a handful of aggregate queries, never one per row of any table)."""
+
+    def setUp(self):
+        self.superuser = make_user("dashboardadmin", is_staff=True, is_superuser=True)
+        self.client.force_authenticate(user=self.superuser)
+
+    def test_requires_superuser(self):
+        self.client.logout()
+        response = self.client.get("/api/auth/admin/dashboard/")
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        staff_only = make_user("dashboardstaffonly", is_staff=True, is_superuser=False)
+        self.client.force_authenticate(user=staff_only)
+        response = self.client.get("/api/auth/admin/dashboard/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_response_shape_has_no_fabricated_commerce_metrics(self):
+        response = self.client.get("/api/auth/admin/dashboard/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            set(response.data.keys()), {"products", "variants", "printify", "generator", "commerce", "users"}
+        )
+        self.assertEqual(
+            set(response.data["products"].keys()), {"active", "inactive", "needs_attention"}
+        )
+        self.assertEqual(set(response.data["variants"].keys()), {"sellable", "missing_cost", "unavailable"})
+        self.assertEqual(set(response.data["commerce"].keys()), {"current_carts"})
+        # No "revenue"/"sales"/"orders" key anywhere — those systems don't exist yet.
+        flattened_keys = {k for section in response.data.values() for k in section}
+        for forbidden in ("revenue", "sales", "orders", "total_price"):
+            self.assertNotIn(forbidden, flattened_keys)
+
+    def test_counts_reflect_actual_data(self):
+        from apps.generator.models import MockupTemplate, MockupTemplatePart, ProductVariant
+        from apps.shop.models import Product, ProductCategory
+
+        template = MockupTemplate.objects.create(
+            name="Dashboard Template", slug="dashboard-template", product_type=MockupTemplate.ProductType.TSHIRT
+        )
+        MockupTemplatePart.objects.create(template=template, name=MockupTemplatePart.PartName.FRONT)
+        category = ProductCategory.objects.create(name="Dashboard Cat", slug="dashboard-cat")
+
+        active_product = Product.objects.create(
+            name="Active", slug="dashboard-active", category=category, mockup_template=template, is_active=True
+        )
+        ProductVariant.objects.create(
+            product=active_product, template=template, color_name="Black", size="M", base_cost="10.00"
+        )
+        Product.objects.create(
+            name="Inactive", slug="dashboard-inactive", category=category, mockup_template=template, is_active=False
+        )
+
+        response = self.client.get("/api/auth/admin/dashboard/")
+        self.assertGreaterEqual(response.data["products"]["active"], 1)
+        self.assertGreaterEqual(response.data["products"]["inactive"], 1)
+        self.assertGreaterEqual(response.data["variants"]["sellable"], 1)
+        self.assertGreaterEqual(response.data["users"]["total"], 1)
+
+    def test_query_count_is_bounded(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.get("/api/auth/admin/dashboard/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # A handful of aggregate COUNT queries, not dozens — generous headroom against a future
+        # regression turning one of these into a per-row Python loop.
+        self.assertLess(len(queries.captured_queries), 20)

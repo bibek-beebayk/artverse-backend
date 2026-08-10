@@ -1,9 +1,10 @@
 import secrets
 from uuid import uuid4
 from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.core import signing
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import F, Q
 from rest_framework import status
 from rest_framework.generics import CreateAPIView, ListAPIView, RetrieveUpdateAPIView
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -237,3 +238,75 @@ class AdminSiteConfigurationView(RetrieveUpdateAPIView):
 
     def get_object(self):
         return SiteConfiguration.get_solo()
+
+
+class AdminDashboardView(APIView):
+    """The admin panel's Dashboard landing page — one aggregated read of operational/catalogue
+    health, entirely from data this app already has. Deliberately excludes anything
+    orders/payments/shipping/revenue-shaped: those systems don't exist yet (see TODO.md), and a
+    dashboard number implying they do would be worse than not showing one. Every count below is a
+    single SQL aggregate/EXISTS query — no per-row Python loop over the full catalogue, no N+1 —
+    so this stays cheap regardless of catalogue size. Never returns per-user identifying detail,
+    only a total count."""
+
+    permission_classes = [IsSuperUser]
+
+    def get(self, request):
+        from django.db.models import Count as DjCount
+
+        from apps.cart.models import Cart
+        from apps.generator.models import GeneratedPrintFile, GenerationRequest, MockupRender, ProductVariant
+        from apps.printify.models import PrintifySyncRun
+        from apps.shop.models import Product
+        from apps.shop.services import (
+            READINESS_NEEDS_ATTENTION,
+            annotate_product_readiness,
+            product_readiness_issue_filter,
+        )
+
+        User = get_user_model()
+
+        products_needing_attention = (
+            annotate_product_readiness(Product.objects.filter(is_active=True))
+            .filter(product_readiness_issue_filter())
+            .count()
+        )
+
+        sellable_variants = ProductVariant.objects.filter(
+            is_available=True,
+            base_cost__isnull=False,
+            template_id=F("product__mockup_template_id"),
+        ).filter(Q(external_provider="") | ~Q(external_variant_id="")).count()
+
+        current_carts = Cart.objects.annotate(_item_count=DjCount("items")).filter(_item_count__gt=0).count()
+
+        return Response(
+            {
+                "products": {
+                    "active": Product.objects.filter(is_active=True).count(),
+                    "inactive": Product.objects.filter(is_active=False).count(),
+                    "needs_attention": products_needing_attention,
+                },
+                "variants": {
+                    "sellable": sellable_variants,
+                    "missing_cost": ProductVariant.objects.filter(base_cost__isnull=True).count(),
+                    "unavailable": ProductVariant.objects.filter(is_available=False).count(),
+                },
+                "printify": {
+                    "failed_sync_runs": PrintifySyncRun.objects.filter(status=PrintifySyncRun.Status.FAILED).count(),
+                },
+                "generator": {
+                    "failed_mockup_renders": MockupRender.objects.filter(status=MockupRender.Status.FAILED).count(),
+                    "failed_generation_requests": GenerationRequest.objects.filter(
+                        status=GenerationRequest.Status.FAILED
+                    ).count(),
+                    "print_files": GeneratedPrintFile.objects.count(),
+                },
+                "commerce": {
+                    "current_carts": current_carts,
+                },
+                "users": {
+                    "total": User.objects.count(),
+                },
+            }
+        )

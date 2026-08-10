@@ -3,7 +3,7 @@ from rest_framework import serializers
 from apps.generator.serializers import ProductVariantSerializer
 
 from .models import NotificationSubscription, Product, ProductCategory
-from .services import _sellable_variants_for_product, get_product_starting_price
+from .services import _sellable_variants_for_product, get_product_readiness, get_product_starting_price
 
 
 class ProductCategorySerializer(serializers.ModelSerializer):
@@ -182,6 +182,7 @@ class AdminProductSerializer(serializers.ModelSerializer):
     starting_price = serializers.SerializerMethodField()
     available_variant_count = serializers.SerializerMethodField()
     total_variant_count = serializers.SerializerMethodField()
+    readiness = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
@@ -199,6 +200,7 @@ class AdminProductSerializer(serializers.ModelSerializer):
             "starting_price",
             "available_variant_count",
             "total_variant_count",
+            "readiness",
             "created_at",
             "updated_at",
         )
@@ -209,10 +211,23 @@ class AdminProductSerializer(serializers.ModelSerializer):
         return str(price) if price is not None else None
 
     def get_available_variant_count(self, obj: Product):
+        # Reuses the view's `variants` prefetch (AdminProductListCreateView/AdminProductDetailView)
+        # when present — `.filter()`/`.count()` on a prefetched relation would otherwise bypass
+        # the cache and issue a fresh query per row.
+        if hasattr(obj, "_prefetched_objects_cache") and "variants" in obj._prefetched_objects_cache:
+            return sum(1 for v in obj.variants.all() if v.is_available and v.base_cost is not None)
         return obj.variants.filter(is_available=True, base_cost__isnull=False).count()
 
     def get_total_variant_count(self, obj: Product):
+        if hasattr(obj, "_prefetched_objects_cache") and "variants" in obj._prefetched_objects_cache:
+            return len(obj.variants.all())
         return obj.variants.count()
+
+    def get_readiness(self, obj: Product):
+        # Reuses whatever `variants` the view already prefetched (see
+        # AdminProductListCreateView/AdminProductDetailView) — get_product_readiness() only reads
+        # obj.variants.all() in Python, never re-queries when it's already cached.
+        return get_product_readiness(obj)
 
 
 class AdminNotificationSubscriptionSerializer(serializers.ModelSerializer):
