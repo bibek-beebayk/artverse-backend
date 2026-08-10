@@ -1,14 +1,33 @@
-from django.db.models import F, Min, Q
-from rest_framework.generics import CreateAPIView, ListAPIView, RetrieveAPIView
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db.models import F, Min, Prefetch, Q
+from django.shortcuts import get_object_or_404
+from rest_framework import status
+from rest_framework.generics import (
+    CreateAPIView,
+    DestroyAPIView,
+    ListAPIView,
+    ListCreateAPIView,
+    RetrieveAPIView,
+    RetrieveUpdateDestroyAPIView,
+)
+from rest_framework.response import Response
+from rest_framework.views import APIView
 
-from .models import Product, ProductCategory
+from apps.accounts.permissions import IsSuperUser
+from apps.generator.models import MockupTemplatePart
+from apps.printify.services import PrintifyError, sync_product_variants_from_printify
+
+from .models import NotificationSubscription, Product, ProductCategory
 from .pagination import StandardResultsSetPagination
 from .serializers import (
+    AdminNotificationSubscriptionSerializer,
+    AdminProductCategorySerializer,
+    AdminProductSerializer,
     NotificationSubscriptionSerializer,
     ProductCategorySerializer,
     ProductSerializer,
 )
-from .services import sellable_variant_exists_subquery
+from .services import activate_product, deactivate_product, sellable_variant_exists_subquery
 
 # Shared by both public views: active AND has at least one sellable variant (see
 # apps.shop.services.sellable_variant_exists_subquery — kept in sync with
@@ -55,7 +74,16 @@ class ProductListView(ListAPIView):
     def get_queryset(self):
         queryset = (
             _PUBLIC_PRODUCTS.select_related("category", "mockup_template")
-            .prefetch_related("variants")
+            .prefetch_related(
+                "variants",
+                # ProductSerializer._fallback_template_image_url() reads mockup_template.parts
+                # (only when the product has no photo of its own) — prefetch it here or that
+                # rare fallback N+1s per row once enough products hit it.
+                Prefetch(
+                    "mockup_template__parts",
+                    queryset=MockupTemplatePart.objects.only("id", "template_id", "name", "base_image"),
+                ),
+            )
             .annotate(
                 _min_sellable_cost=Min(
                     "variants__base_cost",
@@ -93,7 +121,13 @@ class ProductListView(ListAPIView):
 
 
 class ProductDetailView(RetrieveAPIView):
-    queryset = _PUBLIC_PRODUCTS.select_related("category", "mockup_template").prefetch_related("variants")
+    queryset = _PUBLIC_PRODUCTS.select_related("category", "mockup_template").prefetch_related(
+        "variants",
+        Prefetch(
+            "mockup_template__parts",
+            queryset=MockupTemplatePart.objects.only("id", "template_id", "name", "base_image"),
+        ),
+    )
     serializer_class = ProductSerializer
     lookup_field = "slug"
 
@@ -104,3 +138,80 @@ class NotificationSubscriptionCreateView(CreateAPIView):
     def perform_create(self, serializer):
         user = self.request.user if self.request.user.is_authenticated else None
         serializer.save(user=user)
+
+
+# --- Admin management panel (superuser-only) ---------------------------------------------
+
+
+class AdminProductCategoryListCreateView(ListCreateAPIView):
+    queryset = ProductCategory.objects.all()
+    serializer_class = AdminProductCategorySerializer
+    permission_classes = [IsSuperUser]
+
+
+class AdminProductCategoryDetailView(RetrieveUpdateDestroyAPIView):
+    queryset = ProductCategory.objects.all()
+    serializer_class = AdminProductCategorySerializer
+    permission_classes = [IsSuperUser]
+
+
+class AdminProductListCreateView(ListCreateAPIView):
+    queryset = Product.objects.select_related("category", "mockup_template").all().order_by("-created_at")
+    serializer_class = AdminProductSerializer
+    permission_classes = [IsSuperUser]
+
+
+class AdminProductDetailView(RetrieveUpdateDestroyAPIView):
+    queryset = Product.objects.select_related("category", "mockup_template").all()
+    serializer_class = AdminProductSerializer
+    permission_classes = [IsSuperUser]
+
+
+class AdminProductActivateView(APIView):
+    """Mirrors apps.shop.admin.ProductAdmin's "Activate selected products" action — runs the same
+    validate_product_can_be_activated() gate, never lets the frontend flip is_active directly."""
+
+    permission_classes = [IsSuperUser]
+
+    def post(self, request, pk):
+        product = get_object_or_404(Product, pk=pk)
+        try:
+            activate_product(product)
+        except DjangoValidationError as exc:
+            return Response({"detail": " ".join(exc.messages)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(AdminProductSerializer(product).data)
+
+
+class AdminProductDeactivateView(APIView):
+    permission_classes = [IsSuperUser]
+
+    def post(self, request, pk):
+        product = get_object_or_404(Product, pk=pk)
+        deactivate_product(product)
+        return Response(AdminProductSerializer(product).data)
+
+
+class AdminProductSyncVariantsView(APIView):
+    """Mirrors apps.shop.admin.ProductAdmin's "Sync variants from mapped Printify print provider"
+    action."""
+
+    permission_classes = [IsSuperUser]
+
+    def post(self, request, pk):
+        product = get_object_or_404(Product, pk=pk)
+        try:
+            summary = sync_product_variants_from_printify(product)
+        except PrintifyError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(summary)
+
+
+class AdminNotificationSubscriptionListView(ListAPIView):
+    queryset = NotificationSubscription.objects.select_related("product", "user").all()
+    serializer_class = AdminNotificationSubscriptionSerializer
+    permission_classes = [IsSuperUser]
+
+
+class AdminNotificationSubscriptionDeleteView(DestroyAPIView):
+    queryset = NotificationSubscription.objects.all()
+    permission_classes = [IsSuperUser]

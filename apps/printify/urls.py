@@ -7,6 +7,7 @@ from .views import (
     PrintifyConnectionStatusView,
     PrintifySyncBlueprintsView,
     PrintifySyncProvidersView,
+    PrintifySyncRunListView,
 )
 
 
@@ -21,4 +22,5 @@ urlpatterns = [
         name="printify-blueprint-sync-providers",
     ),
     path("sync-blueprints/", PrintifySyncBlueprintsView.as_view(), name="printify-sync-blueprints"),
+    path("sync-runs/", PrintifySyncRunListView.as_view(), name="printify-sync-run-list"),
 ]

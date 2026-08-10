@@ -3,8 +3,9 @@ from uuid import uuid4
 from django.conf import settings
 from django.core import signing
 from django.db import transaction
+from django.db.models import Q
 from rest_framework import status
-from rest_framework.generics import CreateAPIView, RetrieveUpdateAPIView
+from rest_framework.generics import CreateAPIView, ListAPIView, RetrieveUpdateAPIView
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -12,7 +13,14 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from .firebase_auth import FirebaseConfigurationError, verify_firebase_id_token
 from .models import SiteConfiguration, User
-from .serializers import GoogleAuthSerializer, RegisterSerializer, UserSerializer
+from .permissions import IsSuperUser
+from .serializers import (
+    AdminUserSerializer,
+    GoogleAuthSerializer,
+    RegisterSerializer,
+    SiteConfigurationSerializer,
+    UserSerializer,
+)
 
 
 def validate_maintenance_token(token: str, access_key: str, token_max_age: int) -> bool:
@@ -192,3 +200,40 @@ class MaintenanceAccessView(APIView):
                 "token": token,
             }
         )
+
+
+# --- Admin management panel (superuser-only) ---------------------------------------------
+
+
+class AdminUserListView(ListAPIView):
+    """Users & Access — flags only (is_staff/is_superuser/is_artist/is_active), never
+    identity/password fields. Search by username/email/display_name via ?search=."""
+
+    serializer_class = AdminUserSerializer
+    permission_classes = [IsSuperUser]
+
+    def get_queryset(self):
+        queryset = User.objects.all().order_by("-date_joined")
+        search = self.request.query_params.get("search")
+        if search:
+            queryset = queryset.filter(
+                Q(username__icontains=search) | Q(email__icontains=search) | Q(display_name__icontains=search)
+            )
+        return queryset
+
+
+class AdminUserDetailView(RetrieveUpdateAPIView):
+    queryset = User.objects.all()
+    serializer_class = AdminUserSerializer
+    permission_classes = [IsSuperUser]
+
+
+class AdminSiteConfigurationView(RetrieveUpdateAPIView):
+    """Singleton — Site → Site Configuration. Same get_solo() pattern the Django admin's own
+    SiteConfigurationAdmin uses (apps/accounts/admin.py)."""
+
+    serializer_class = SiteConfigurationSerializer
+    permission_classes = [IsSuperUser]
+
+    def get_object(self):
+        return SiteConfiguration.get_solo()

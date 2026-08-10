@@ -1,6 +1,18 @@
 from django.urls import path
 
 from .views import (
+    AdminDesignProjectListView,
+    AdminGeneratedImageListView,
+    AdminGeneratedPrintFileListView,
+    AdminGenerationRequestListView,
+    AdminMockupRenderListView,
+    AdminMockupTemplateDetailView,
+    AdminMockupTemplateListCreateView,
+    AdminMockupTemplatePartDetailView,
+    AdminMockupTemplatePartListCreateView,
+    AdminProductVariantDetailView,
+    AdminProductVariantListCreateView,
+    AdminSourceDesignAssetListView,
     DesignProjectDetailView,
     DesignProjectDuplicateView,
     DesignProjectGeneratePrintFilesView,
@@ -48,5 +60,49 @@ urlpatterns = [
         "design-projects/<int:pk>/print-files/",
         DesignProjectPrintFilesView.as_view(),
         name="design-project-print-files",
+    ),
+    path(
+        "admin/mockup-templates/",
+        AdminMockupTemplateListCreateView.as_view(),
+        name="admin-mockup-template-list",
+    ),
+    path(
+        "admin/mockup-templates/<int:pk>/",
+        AdminMockupTemplateDetailView.as_view(),
+        name="admin-mockup-template-detail",
+    ),
+    path(
+        "admin/mockup-template-parts/",
+        AdminMockupTemplatePartListCreateView.as_view(),
+        name="admin-mockup-template-part-list",
+    ),
+    path(
+        "admin/mockup-template-parts/<int:pk>/",
+        AdminMockupTemplatePartDetailView.as_view(),
+        name="admin-mockup-template-part-detail",
+    ),
+    path("admin/product-variants/", AdminProductVariantListCreateView.as_view(), name="admin-product-variant-list"),
+    path(
+        "admin/product-variants/<int:pk>/",
+        AdminProductVariantDetailView.as_view(),
+        name="admin-product-variant-detail",
+    ),
+    path("admin/design-projects/", AdminDesignProjectListView.as_view(), name="admin-design-project-list"),
+    path("admin/mockup-renders/", AdminMockupRenderListView.as_view(), name="admin-mockup-render-list"),
+    path(
+        "admin/generated-print-files/",
+        AdminGeneratedPrintFileListView.as_view(),
+        name="admin-generated-print-file-list",
+    ),
+    path(
+        "admin/generation-requests/",
+        AdminGenerationRequestListView.as_view(),
+        name="admin-generation-request-list",
+    ),
+    path("admin/generated-images/", AdminGeneratedImageListView.as_view(), name="admin-generated-image-list"),
+    path(
+        "admin/source-design-assets/",
+        AdminSourceDesignAssetListView.as_view(),
+        name="admin-source-design-asset-list",
     ),
 ]

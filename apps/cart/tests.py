@@ -31,7 +31,6 @@ def make_template(slug="cart-test-template"):
         slug=slug,
         product_type=MockupTemplate.ProductType.TSHIRT,
         is_active=True,
-        config={"placement": {"x": 100, "y": 100, "width": 200, "height": 200, "fit": "contain"}},
     )
     for part_name in (MockupTemplatePart.PartName.FRONT, MockupTemplatePart.PartName.BACK):
         MockupTemplatePart.objects.create(
@@ -672,3 +671,64 @@ class CartMergeApiTests(CartApiTestBase):
         )
         self.assertEqual(len(response.data["cart"]["items"]), 1)
         self.assertEqual(response.data["cart"]["items"][0]["quantity"], 3)
+
+
+def make_superuser(username="cartadmin"):
+    return User.objects.create_user(
+        username=username, email=f"{username}@example.com", password="testpass123", is_staff=True, is_superuser=True
+    )
+
+
+class AdminPricingRuleScopeValidationTests(APITestCase):
+    """Admin-panel serializer-level mirror of PricingRule.clean()'s CheckConstraint — a friendly
+    400 with a field error instead of the request hitting the raw DB IntegrityError."""
+
+    def setUp(self):
+        self.superuser = make_superuser()
+        self.client.force_authenticate(user=self.superuser)
+
+    def test_category_rule_without_category_is_rejected(self):
+        response = self.client.post(
+            "/api/cart/admin/pricing-rules/",
+            {"name": "Bad Category Rule", "rule_type": "category", "markup_type": "fixed", "amount": "5.00"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("category", response.data)
+
+    def test_global_rule_with_category_is_rejected(self):
+        category = ProductCategory.objects.create(name="Admin Test Category", slug="admin-test-category")
+        response = self.client.post(
+            "/api/cart/admin/pricing-rules/",
+            {
+                "name": "Bad Global Rule",
+                "rule_type": "global",
+                "markup_type": "fixed",
+                "amount": "5.00",
+                "category": category.id,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_valid_global_rule_is_created(self):
+        response = self.client.post(
+            "/api/cart/admin/pricing-rules/",
+            {"name": "Global Markup", "rule_type": "global", "markup_type": "percentage", "amount": "10.00"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(PricingRule.objects.filter(name="Global Markup").exists())
+
+
+class AdminPricingConfigSingletonTests(APITestCase):
+    def setUp(self):
+        self.superuser = make_superuser("cartadmin2")
+        self.client.force_authenticate(user=self.superuser)
+
+    def test_patch_updates_solo_instance(self):
+        response = self.client.patch(
+            "/api/cart/admin/pricing-configuration/", {"tax_percentage": "8.25"}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(PricingConfig.get_solo().tax_percentage, Decimal("8.25"))

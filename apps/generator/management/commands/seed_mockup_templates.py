@@ -333,7 +333,6 @@ class Command(BaseCommand):
                 "description": "Starter black T-shirt template generated locally for merch preview setup.",
                 "colors": ["Midnight Black", "Cyber White", "Ash Grey"],
                 "sizes": ["S", "M", "L", "XL", "XXL"],
-                "builder": build_tshirt_assets,
                 "part_builders": {
                     MockupTemplatePart.PartName.FRONT: build_tshirt_assets,
                     MockupTemplatePart.PartName.BACK: build_tshirt_back_assets,
@@ -348,7 +347,6 @@ class Command(BaseCommand):
                 "description": "Starter black hoodie template generated locally for merch preview setup.",
                 "colors": ["Midnight Black", "Cyber White", "Heather Grey"],
                 "sizes": ["S", "M", "L", "XL", "XXL"],
-                "builder": build_hoodie_assets,
                 "part_builders": {
                     MockupTemplatePart.PartName.FRONT: build_hoodie_assets,
                     MockupTemplatePart.PartName.BACK: build_hoodie_back_assets,
@@ -368,20 +366,15 @@ class Command(BaseCommand):
                 },
             )
 
-            base, mask, shadow, highlight, config = spec["builder"]()
+            # Root template-level images no longer exist (see CHANGELOG.md) — every layer lives
+            # on a MockupTemplatePart now, including 'front', built below from the exact same
+            # part_builders['front'] function that used to also populate the root fields.
             template.name = spec["name"]
             template.product_type = spec["product_type"]
             template.description = spec["description"]
-            template.is_active = True
-            template.config = config
             template.supported_colors = spec["colors"]
             template.supported_sizes = spec["sizes"]
             template.template_version = max(1, template.template_version)
-
-            _save_image_to_field(template, "base_image", f"{spec['slug']}-base.png", base)
-            _save_image_to_field(template, "mask_image", f"{spec['slug']}-mask.png", mask.convert("RGBA"))
-            _save_image_to_field(template, "shadow_layer", f"{spec['slug']}-shadow.png", shadow)
-            _save_image_to_field(template, "highlight_layer", f"{spec['slug']}-highlight.png", highlight)
             template.save()
 
             action = "Created" if created else "Updated"
@@ -404,3 +397,9 @@ class Command(BaseCommand):
                 self.stdout.write(
                     self.style.SUCCESS(f"  {part_action} part '{part_name}' for '{template.slug}'.")
                 )
+
+            # Now that every part exists, the template is actually usable — activate it (mirrors
+            # AdminMockupTemplateSerializer.validate()'s "needs >= 1 part" rule).
+            if not template.is_active:
+                template.is_active = True
+                template.save(update_fields=["is_active", "updated_at"])

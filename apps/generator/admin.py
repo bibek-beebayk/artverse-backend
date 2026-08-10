@@ -60,31 +60,16 @@ class MockupConfigEditorWidget(forms.Textarea):
 
 
 class MockupTemplateAdminForm(forms.ModelForm):
+    """No visual placement editor here anymore — MockupTemplate no longer has its own
+    base_image/config; every printable surface is a MockupTemplatePart (see
+    MockupTemplatePartForm below, which still uses MockupConfigEditorWidget)."""
+
     class Meta:
         model = MockupTemplate
         fields = "__all__"
-        widgets = {
-            "config": MockupConfigEditorWidget(
-                attrs={
-                    "rows": 16,
-                    "class": "vLargeTextField",
-                }
-            ),
-        }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        widget = self.fields["config"].widget
-        if isinstance(widget, MockupConfigEditorWidget):
-            if self.instance.pk and self.instance.base_image:
-                try:
-                    widget.base_image_url = self.instance.base_image.url
-                except Exception:
-                    widget.base_image_url = ""
-            self.fields["config"].help_text = (
-                "Use the visual placement editor below to drag and resize the print area. "
-                "The JSON stays available for advanced tuning."
-            )
         if "selected_print_provider" in self.fields:
             from apps.printify.models import PrintifyPrintProvider
 
@@ -206,6 +191,13 @@ class GeneratedImageAdmin(admin.ModelAdmin):
 
 @admin.register(MockupTemplate)
 class MockupTemplateAdmin(admin.ModelAdmin):
+    """Lifecycle: create a draft (is_active=False) -> add at least one Part inline (Front, at
+    minimum) -> activate. Activation is deferred to save_related(), after the inline Part
+    formset has actually been persisted — see save_model()/save_related() below, same reasoning
+    as apps.shop.admin.ProductAdmin (checking readiness in clean() would validate against
+    whatever parts existed *before* this request, not the ones just submitted in the inline
+    formset alongside it)."""
+
     form = MockupTemplateAdminForm
     list_display = ("id", "name", "product_type", "template_version", "is_active", "updated_at")
     list_filter = ("product_type", "is_active")
@@ -218,20 +210,35 @@ class MockupTemplateAdmin(admin.ModelAdmin):
         "product_type",
         "description",
         "is_active",
-        "base_image",
-        "mask_image",
-        "displacement_map",
-        "shadow_layer",
-        "highlight_layer",
         "template_version",
-        "config",
         "supported_colors",
         "supported_sizes",
-        "canvas_width",
-        "canvas_height",
         "supported_file_formats",
         "selected_print_provider",
     )
+
+    def save_model(self, request, obj, form, change):
+        was_active = bool(change and form.initial.get("is_active"))
+        self._activation_requested = bool(obj.is_active) and not was_active
+        if self._activation_requested:
+            obj.is_active = False
+        super().save_model(request, obj, form, change)
+
+    def save_related(self, request, form, formsets, change):
+        super().save_related(request, form, formsets, change)
+        if getattr(self, "_activation_requested", False):
+            self._activation_requested = False
+            template = form.instance
+            if template.parts.count() == 0:
+                self.message_user(
+                    request,
+                    f"{template.name}: could not activate — add at least one part first.",
+                    level=messages.ERROR,
+                )
+            else:
+                template.is_active = True
+                template.save(update_fields=["is_active", "updated_at"])
+                self.message_user(request, f"{template.name}: activated.", level=messages.SUCCESS)
 
 
 @admin.register(SourceDesignAsset)

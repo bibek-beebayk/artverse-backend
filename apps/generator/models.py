@@ -116,22 +116,16 @@ class MockupTemplate(models.Model):
     slug = models.SlugField(unique=True)
     product_type = models.CharField(max_length=30, choices=ProductType.choices)
     description = models.TextField(blank=True)
-    is_active = models.BooleanField(default=True)
-    base_image = models.ImageField(upload_to="mockup-templates/base/", blank=True, null=True)
-    mask_image = models.ImageField(upload_to="mockup-templates/masks/", blank=True, null=True)
-    displacement_map = models.ImageField(upload_to="mockup-templates/displacement/", blank=True, null=True)
-    shadow_layer = models.ImageField(upload_to="mockup-templates/shadows/", blank=True, null=True)
-    highlight_layer = models.ImageField(upload_to="mockup-templates/highlights/", blank=True, null=True)
+    # Draft by default, same as shop.Product — a template isn't usable until it has at least one
+    # MockupTemplatePart (enforced in clean() below), so there's nothing meaningful to activate
+    # until an admin has added one. There is deliberately no template-level base_image/config/
+    # mask_image/displacement_map/shadow_layer/highlight_layer/canvas_width/canvas_height
+    # anymore — every renderable surface must be a MockupTemplatePart now, never a "root" image
+    # that bypasses Parts entirely (see CHANGELOG.md for the removal).
+    is_active = models.BooleanField(default=False)
     template_version = models.PositiveIntegerField(default=1)
-    config = models.JSONField(default=dict, blank=True)
     supported_colors = models.JSONField(default=list, blank=True)
     supported_sizes = models.JSONField(default=list, blank=True)
-    canvas_width = models.PositiveIntegerField(
-        null=True, blank=True, help_text="Mockup canvas width in pixels, for templates without a root base_image."
-    )
-    canvas_height = models.PositiveIntegerField(
-        null=True, blank=True, help_text="Mockup canvas height in pixels, for templates without a root base_image."
-    )
     supported_file_formats = models.JSONField(
         default=list, blank=True, help_text="Accepted print-file formats, e.g. ['png', 'pdf']."
     )
@@ -154,9 +148,22 @@ class MockupTemplate(models.Model):
 
     def clean(self):
         super().clean()
+        # NOTE: the "must have >= 1 part before activation" rule is deliberately NOT enforced
+        # here, even though a template with zero parts renders nothing (see
+        # apps.generator.services.render_mockup_to_image, which only ever reads from a
+        # MockupTemplatePart). Same reasoning as apps.shop.models.Product / validate_product_
+        # can_be_activated: Django Admin saves the parent MockupTemplate row and its inline
+        # MockupTemplatePart formset in separate steps (parent first), so clean() running during
+        # the parent's own validation would see whatever parts happened to exist *before* this
+        # request, not the ones just submitted alongside it in the inline formset — a clean()
+        # check here would make "create a template, add its first part inline, check Active, "
+        # "save" permanently fail even though it's the normal way to set one up. Enforced instead
+        # in apps.generator.serializers.AdminMockupTemplateSerializer.validate() (the custom
+        # admin panel never combines part-creation and activation in one request, so no ordering
+        # issue there) and in MockupTemplateAdmin.save_model()/save_related() (deferred to after
+        # inlines save, mirroring ProductAdmin exactly).
         if self.selected_print_provider_id:
             from django.core.exceptions import ValidationError
-
             from apps.printify.validation import validate_provider_matches_template_blueprint
 
             try:

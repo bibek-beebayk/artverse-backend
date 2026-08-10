@@ -45,7 +45,6 @@ def make_template(slug="shop-test-template", **overrides):
         slug=slug,
         product_type=MockupTemplate.ProductType.TSHIRT,
         is_active=True,
-        config={"placement": {"x": 100, "y": 100, "width": 200, "height": 200, "fit": "contain"}},
         **overrides,
     )
     MockupTemplatePart.objects.create(
@@ -472,19 +471,21 @@ class ProductImageFallbackTests(TestCase):
     """A product with no photo of its own falls back to its linked template's blank mockup
     image, rather than the storefront showing nothing for it."""
 
-    def test_falls_back_to_template_base_image_when_product_has_no_image(self):
+    def test_falls_back_to_template_front_part_image_when_product_has_no_image(self):
         template = make_template(slug="fallback-template-with-image")
-        attach_image(template.base_image, "template-base.png")
+        front = template.parts.get(name="front")
+        attach_image(front.base_image, "template-part-base.png")
         product = make_product(template, is_active=True)
 
         data = ProductSerializer(product).data
         self.assertIsNotNone(data["image"])
         self.assertIsNotNone(data["thumbnail"])
-        self.assertIn("template-base", data["image"])
+        self.assertIn("template-part-base", data["image"])
 
     def test_product_s_own_image_takes_priority_over_template_fallback(self):
         template = make_template(slug="fallback-template-priority")
-        attach_image(template.base_image, "template-base.png")
+        front = template.parts.get(name="front")
+        attach_image(front.base_image, "template-part-base.png")
         product = make_product(template, is_active=True)
         attach_image(product.image, "product-own.png")
 
@@ -497,7 +498,7 @@ class ProductImageFallbackTests(TestCase):
         self.assertIsNone(data["image"])
         self.assertIsNone(data["thumbnail"])
 
-    def test_no_fallback_when_template_itself_has_no_base_image(self):
+    def test_no_fallback_when_template_parts_have_no_base_image(self):
         template = make_template(slug="fallback-template-no-image")
         product = make_product(template, is_active=True)
         data = ProductSerializer(product).data
@@ -703,3 +704,77 @@ class ProductCataloguePaginationTests(APITestCase):
         slugs = {row["slug"] for row in response.data["results"]}
         self.assertEqual(slugs, {"pg-visible"})
         self.assertEqual(response.data["count"], 1)
+
+
+def make_superuser(username="shopadmin"):
+    return User.objects.create_user(
+        username=username, email=f"{username}@example.com", password="testpass123", is_staff=True, is_superuser=True
+    )
+
+
+class AdminProductCategoryCrudTests(APITestCase):
+    """Representative full create->edit->delete round-trip for a schema-driven admin resource —
+    see also apps.accounts.tests.IsSuperUserPermissionTests for the permission gate itself."""
+
+    def setUp(self):
+        self.superuser = make_superuser()
+        self.client.force_authenticate(user=self.superuser)
+
+    def test_create_edit_delete_round_trip(self):
+        create_response = self.client.post(
+            "/api/shop/admin/categories/", {"name": "Outerwear", "slug": "outerwear"}, format="json"
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED)
+        category_id = create_response.data["id"]
+
+        patch_response = self.client.patch(
+            f"/api/shop/admin/categories/{category_id}/", {"name": "Outerwear Renamed"}, format="json"
+        )
+        self.assertEqual(patch_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(patch_response.data["name"], "Outerwear Renamed")
+
+        delete_response = self.client.delete(f"/api/shop/admin/categories/{category_id}/")
+        self.assertEqual(delete_response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(ProductCategory.objects.filter(pk=category_id).exists())
+
+
+class AdminProductActivationActionTests(APITestCase):
+    """The admin panel's Products screen deliberately never lets is_active be PATCHed directly —
+    it must go through these action endpoints, which reuse the same
+    apps.shop.services.validate_product_can_be_activated() gate as the Django admin action."""
+
+    def setUp(self):
+        self.superuser = make_superuser("shopadmin2")
+        self.client.force_authenticate(user=self.superuser)
+        self.template = make_template(slug="admin-activation-template")
+
+    def test_activate_rejects_product_with_no_sellable_variant(self):
+        product = make_product(self.template, slug="admin-activation-empty")
+        response = self.client.post(f"/api/shop/admin/products/{product.id}/activate/")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        product.refresh_from_db()
+        self.assertFalse(product.is_active)
+
+    def test_activate_accepts_product_with_sellable_variant(self):
+        product = make_product(self.template, slug="admin-activation-ready")
+        make_variant(product, self.template, base_cost="20.00")
+        response = self.client.post(f"/api/shop/admin/products/{product.id}/activate/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        product.refresh_from_db()
+        self.assertTrue(product.is_active)
+
+    def test_deactivate_always_succeeds(self):
+        product = make_product(self.template, slug="admin-activation-deactivate", is_active=True)
+        response = self.client.post(f"/api/shop/admin/products/{product.id}/deactivate/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        product.refresh_from_db()
+        self.assertFalse(product.is_active)
+
+    def test_is_active_is_not_directly_writable(self):
+        product = make_product(self.template, slug="admin-activation-readonly")
+        response = self.client.patch(
+            f"/api/shop/admin/products/{product.id}/", {"is_active": True}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        product.refresh_from_db()
+        self.assertFalse(product.is_active)

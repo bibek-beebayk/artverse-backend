@@ -1,5 +1,11 @@
 from rest_framework import status
-from rest_framework.generics import ListAPIView, RetrieveAPIView
+from rest_framework.exceptions import ValidationError
+from rest_framework.generics import (
+    ListAPIView,
+    ListCreateAPIView,
+    RetrieveAPIView,
+    RetrieveUpdateDestroyAPIView,
+)
 from rest_framework.parsers import MultiPartParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -11,10 +17,32 @@ from django.shortcuts import get_object_or_404
 import json
 import hashlib
 
+from apps.accounts.permissions import IsSuperUser
 from apps.gallery.models import Artwork
+from apps.shop.pagination import StandardResultsSetPagination
 
-from .models import DesignPlacement, DesignProject, GeneratedImage, GeneratedPrintFile, GenerationRequest, MockupRender, MockupTemplate, ProductVariant, SourceDesignAsset
+from .models import (
+    DesignPlacement,
+    DesignProject,
+    GeneratedImage,
+    GeneratedPrintFile,
+    GenerationRequest,
+    MockupRender,
+    MockupTemplate,
+    MockupTemplatePart,
+    ProductVariant,
+    SourceDesignAsset,
+)
 from .serializers import (
+    AdminDesignProjectSerializer,
+    AdminGeneratedImageSerializer,
+    AdminGeneratedPrintFileSerializer,
+    AdminGenerationRequestSerializer,
+    AdminMockupRenderSerializer,
+    AdminMockupTemplatePartSerializer,
+    AdminMockupTemplateSerializer,
+    AdminProductVariantSerializer,
+    AdminSourceDesignAssetSerializer,
     DesignProjectListSerializer,
     DesignProjectSerializer,
     DesignProjectWriteSerializer,
@@ -310,8 +338,13 @@ class MockupRenderListCreateView(APIView):
         source_image_url = serializer.validated_data.get("source_image_url", "").strip()
         persisted_source_image_url = "" if source_image_url.startswith("data:image/") else source_image_url
         source_prompt = serializer.validated_data.get("source_prompt", "").strip()
-        part_name = serializer.validated_data.get("part_name", "").strip()
-        if part_name and not template.parts.filter(name=part_name).exists():
+        # Every active template has >= 1 part (MockupTemplate.clean()), so a blank part_name is
+        # never actually ambiguous — it means "the default part", which is 'front' unless the
+        # caller says otherwise. Normalizing here (rather than leaving it blank) is what lets
+        # render_mockup_to_image() require a real MockupTemplatePart unconditionally, with no
+        # template-level base_image/config to fall back to.
+        part_name = serializer.validated_data.get("part_name", "").strip() or MockupTemplatePart.PartName.FRONT
+        if not template.parts.filter(name=part_name).exists():
             return Response(
                 {"part_name": [f"Template '{template.slug}' has no part named '{part_name}'."]},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -444,7 +477,13 @@ class DesignProjectListCreateView(APIView):
                 Prefetch(
                     "placements",
                     queryset=DesignPlacement.objects.only("id", "design_project_id", "part_name", "preview_url"),
-                )
+                ),
+                # resolve_display_thumbnail_url()'s tier-5 fallback (mockup template's 'front'
+                # part image) reads mockup_template.parts — prefetch it here or it N+1s per row.
+                Prefetch(
+                    "mockup_template__parts",
+                    queryset=MockupTemplatePart.objects.only("id", "template_id", "name", "base_image"),
+                ),
             )
         )
 
@@ -747,3 +786,118 @@ class DesignProjectPrintFilesView(APIView):
 
         overall_status = "failed" if any(p["status"] == "failed" for p in parts_response) else "completed"
         return Response({"project_id": design_project.id, "status": overall_status, "parts": parts_response})
+
+
+# --- Admin management panel (superuser-only) ---------------------------------------------
+
+
+class AdminMockupTemplateListCreateView(ListCreateAPIView):
+    queryset = MockupTemplate.objects.select_related("selected_print_provider").prefetch_related("parts")
+    serializer_class = AdminMockupTemplateSerializer
+    permission_classes = [IsSuperUser]
+
+
+class AdminMockupTemplateDetailView(RetrieveUpdateDestroyAPIView):
+    queryset = MockupTemplate.objects.select_related("selected_print_provider").prefetch_related("parts")
+    serializer_class = AdminMockupTemplateSerializer
+    permission_classes = [IsSuperUser]
+
+
+class AdminMockupTemplatePartListCreateView(ListCreateAPIView):
+    """Nested under a template — filtered by ?template=<id>, matching the
+    DesignPlacement/DesignProject nested-list convention used elsewhere in this app."""
+
+    serializer_class = AdminMockupTemplatePartSerializer
+    permission_classes = [IsSuperUser]
+
+    def get_queryset(self):
+        queryset = MockupTemplatePart.objects.all()
+        template_id = self.request.query_params.get("template")
+        if template_id:
+            queryset = queryset.filter(template_id=template_id)
+        return queryset
+
+
+class AdminMockupTemplatePartDetailView(RetrieveUpdateDestroyAPIView):
+    queryset = MockupTemplatePart.objects.all()
+    serializer_class = AdminMockupTemplatePartSerializer
+    permission_classes = [IsSuperUser]
+
+    def perform_destroy(self, instance):
+        # Deleting a template's only remaining part while it's active would leave an
+        # is_active=True template with zero parts — the exact state MockupTemplate.clean()
+        # exists to prevent on save, but a DELETE never runs the parent's clean(). Block it here
+        # instead of leaving the template silently broken (render_mockup_to_image would start
+        # raising for every request against it).
+        template = instance.template
+        if template.is_active and template.parts.count() <= 1:
+            raise ValidationError(
+                "Cannot delete the only part of an active template. Deactivate the template first, "
+                "or add another part before removing this one."
+            )
+        super().perform_destroy(instance)
+
+
+class AdminProductVariantListCreateView(ListCreateAPIView):
+    queryset = ProductVariant.objects.select_related("product", "template").all()
+    serializer_class = AdminProductVariantSerializer
+    permission_classes = [IsSuperUser]
+    pagination_class = StandardResultsSetPagination
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        product_id = self.request.query_params.get("product")
+        if product_id:
+            queryset = queryset.filter(product_id=product_id)
+        return queryset
+
+
+class AdminProductVariantDetailView(RetrieveUpdateDestroyAPIView):
+    queryset = ProductVariant.objects.select_related("product", "template").all()
+    serializer_class = AdminProductVariantSerializer
+    permission_classes = [IsSuperUser]
+
+
+class AdminDesignProjectListView(ListAPIView):
+    """Support & Monitoring — admin-wide, read-only. Distinct from
+    DesignProjectListCreateView, which is owner-scoped and full CRUD."""
+
+    queryset = DesignProject.objects.select_related("user", "product", "mockup_template").all()
+    serializer_class = AdminDesignProjectSerializer
+    permission_classes = [IsSuperUser]
+    pagination_class = StandardResultsSetPagination
+
+
+class AdminMockupRenderListView(ListAPIView):
+    queryset = MockupRender.objects.select_related("user", "template").all()
+    serializer_class = AdminMockupRenderSerializer
+    permission_classes = [IsSuperUser]
+    pagination_class = StandardResultsSetPagination
+
+
+class AdminGeneratedPrintFileListView(ListAPIView):
+    queryset = GeneratedPrintFile.objects.select_related("design_placement", "template_part").all()
+    serializer_class = AdminGeneratedPrintFileSerializer
+    permission_classes = [IsSuperUser]
+    pagination_class = StandardResultsSetPagination
+
+
+class AdminGenerationRequestListView(ListAPIView):
+    queryset = GenerationRequest.objects.select_related("user").all()
+    serializer_class = AdminGenerationRequestSerializer
+    permission_classes = [IsSuperUser]
+    pagination_class = StandardResultsSetPagination
+
+
+class AdminGeneratedImageListView(ListAPIView):
+    queryset = GeneratedImage.objects.select_related("user", "generation_request").all()
+    serializer_class = AdminGeneratedImageSerializer
+    permission_classes = [IsSuperUser]
+    pagination_class = StandardResultsSetPagination
+
+
+class AdminSourceDesignAssetListView(ListAPIView):
+    queryset = SourceDesignAsset.objects.select_related("owner", "artwork").all()
+    serializer_class = AdminSourceDesignAssetSerializer
+    permission_classes = [IsSuperUser]
+    pagination_class = StandardResultsSetPagination

@@ -1,11 +1,28 @@
 from rest_framework import status
+from rest_framework.generics import (
+    ListAPIView,
+    ListCreateAPIView,
+    RetrieveUpdateAPIView,
+    RetrieveUpdateDestroyAPIView,
+)
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.accounts.permissions import IsSuperUser
+from apps.shop.pagination import StandardResultsSetPagination
+
 from . import services
+from .models import Cart, Coupon, PricingConfig, PricingRule, PrintAreaCharge
 from .pricing import CouponError
-from .serializers import serialize_cart
+from .serializers import (
+    AdminCartSerializer,
+    AdminCouponSerializer,
+    AdminPricingConfigSerializer,
+    AdminPricingRuleSerializer,
+    AdminPrintAreaChargeSerializer,
+    serialize_cart,
+)
 
 
 class CartDetailView(APIView):
@@ -92,3 +109,57 @@ class CartMergeView(APIView):
         result = services.merge_guest_cart(user=request.user, entries=entries)
         cart = services.get_or_create_cart(request.user)
         return Response({**result, "cart": serialize_cart(cart)})
+
+
+# --- Admin management panel (superuser-only) ---------------------------------------------
+
+
+class AdminPricingConfigView(RetrieveUpdateAPIView):
+    serializer_class = AdminPricingConfigSerializer
+    permission_classes = [IsSuperUser]
+
+    def get_object(self):
+        return PricingConfig.get_solo()
+
+
+class AdminPrintAreaChargeListCreateView(ListCreateAPIView):
+    queryset = PrintAreaCharge.objects.all()
+    serializer_class = AdminPrintAreaChargeSerializer
+    permission_classes = [IsSuperUser]
+
+
+class AdminPrintAreaChargeDetailView(RetrieveUpdateDestroyAPIView):
+    queryset = PrintAreaCharge.objects.all()
+    serializer_class = AdminPrintAreaChargeSerializer
+    permission_classes = [IsSuperUser]
+
+
+class AdminPricingRuleListCreateView(ListCreateAPIView):
+    queryset = PricingRule.objects.select_related("category", "product").all()
+    serializer_class = AdminPricingRuleSerializer
+    permission_classes = [IsSuperUser]
+
+
+class AdminPricingRuleDetailView(RetrieveUpdateDestroyAPIView):
+    queryset = PricingRule.objects.select_related("category", "product").all()
+    serializer_class = AdminPricingRuleSerializer
+    permission_classes = [IsSuperUser]
+
+
+class AdminCouponListCreateView(ListCreateAPIView):
+    queryset = Coupon.objects.all().order_by("-created_at")
+    serializer_class = AdminCouponSerializer
+    permission_classes = [IsSuperUser]
+
+
+class AdminCouponDetailView(RetrieveUpdateDestroyAPIView):
+    queryset = Coupon.objects.all()
+    serializer_class = AdminCouponSerializer
+    permission_classes = [IsSuperUser]
+
+
+class AdminCartListView(ListAPIView):
+    queryset = Cart.objects.select_related("user", "coupon").all().order_by("-updated_at")
+    serializer_class = AdminCartSerializer
+    permission_classes = [IsSuperUser]
+    pagination_class = StandardResultsSetPagination

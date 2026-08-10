@@ -37,22 +37,20 @@ def attach_image(field_file, filename="test.png"):
     field_file.save(filename, ContentFile(buffer.getvalue()), save=True)
 
 
-def make_template(slug="tshirt-test", with_parts=True, **overrides):
+def make_template(slug="tshirt-test", **overrides):
     template = MockupTemplate.objects.create(
         name=overrides.pop("name", "Test Tshirt"),
         slug=slug,
         product_type=MockupTemplate.ProductType.TSHIRT,
         is_active=True,
-        config={"placement": {"x": 100, "y": 100, "width": 200, "height": 200, "fit": "contain"}},
         **overrides,
     )
-    if with_parts:
-        for part_name in (MockupTemplatePart.PartName.FRONT, MockupTemplatePart.PartName.BACK):
-            MockupTemplatePart.objects.create(
-                template=template,
-                name=part_name,
-                config={"placement": {"x": 10, "y": 10, "width": 50, "height": 50}},
-            )
+    for part_name in (MockupTemplatePart.PartName.FRONT, MockupTemplatePart.PartName.BACK):
+        MockupTemplatePart.objects.create(
+            template=template,
+            name=part_name,
+            config={"placement": {"x": 10, "y": 10, "width": 50, "height": 50}},
+        )
     return template
 
 
@@ -688,16 +686,6 @@ class DesignProjectValidationTests(APITestCase):
         # The variant was never silently swapped out for something else.
         self.assertEqual(patch_response.data["selected_variant"]["id"], variant.id)
 
-    def test_rejects_unsupported_part_for_template_without_parts(self):
-        bare_template = make_template(slug="bare", with_parts=False)
-        response = self.client.post(
-            "/api/generator/design-projects/",
-            {"mockup_template_id": bare_template.id, "placements": [{"part_name": "back"}]},
-            format="json",
-        )
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("placements", response.data)
-
     def test_rejects_part_variant_does_not_support(self):
         variant = make_variant(self.template_a, product=self.product_a, supported_print_areas=["front"])
         response = self.client.post(
@@ -1110,11 +1098,12 @@ class DesignProjectThumbnailTests(TestCase):
         DesignPlacement.objects.create(design_project=project, part_name="back", preview_url="https://example.com/back.png")
         self.assertEqual(self._resolved(project), "https://example.com/back.png")
 
-    def test_template_base_image_used_when_no_previews(self):
-        attach_image(self.template.base_image, "template-base.png")
+    def test_template_front_part_image_used_when_no_previews(self):
+        front = self.template.parts.get(name=MockupTemplatePart.PartName.FRONT)
+        attach_image(front.base_image, "template-part-base.png")
         project = self._project()
         DesignPlacement.objects.create(design_project=project, part_name="front", preview_url="")
-        self.assertIn("mockup-templates/base/", self._resolved(project))
+        self.assertIn("mockup-templates/parts/base/", self._resolved(project))
 
     def test_empty_when_nothing_available(self):
         project = self._project()
@@ -1221,9 +1210,10 @@ class PreviewResolutionTests(TestCase):
     def test_process_mockup_render_tags_output_as_preview_quality(self):
         from .services import process_mockup_render
 
-        template = make_template(with_parts=False)
-        attach_image(template.base_image, filename="base.png")
-        attach_image(template.mask_image, filename="mask.png")
+        template = make_template()
+        front = template.parts.get(name=MockupTemplatePart.PartName.FRONT)
+        attach_image(front.base_image, filename="base.png")
+        attach_image(front.mask_image, filename="mask.png")
 
         render = MockupRender.objects.create(
             template=template,
@@ -2467,3 +2457,105 @@ class MockupTemplateDetailApiTests(APITestCase):
     def test_missing_template_returns_404(self):
         response = self.client.get("/api/generator/mockup-templates/999999/")
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+def make_generator_superuser(username="genadmin"):
+    return User.objects.create_user(
+        username=username, email=f"{username}@example.com", password="testpass123", is_staff=True, is_superuser=True
+    )
+
+
+class AdminMockupTemplateActivationTests(APITestCase):
+    """The admin panel's Mockup Templates screen mirrors shop.Product's activation gate: a
+    template with zero parts can never be is_active=True — every renderable surface is a
+    MockupTemplatePart now, there's no more template-level root image to bypass Parts with."""
+
+    def setUp(self):
+        self.superuser = make_generator_superuser()
+        self.client.force_authenticate(user=self.superuser)
+
+    def test_cannot_create_active_template_with_no_parts(self):
+        response = self.client.post(
+            "/api/generator/admin/mockup-templates/",
+            {"name": "Bare", "slug": "bare-admin-test", "product_type": "tshirt", "is_active": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("is_active", response.data)
+        self.assertFalse(MockupTemplate.objects.filter(slug="bare-admin-test").exists())
+
+    def test_can_create_draft_template_with_no_parts(self):
+        response = self.client.post(
+            "/api/generator/admin/mockup-templates/",
+            {"name": "Bare Draft", "slug": "bare-draft-admin-test", "product_type": "tshirt", "is_active": False},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertFalse(response.data["is_active"])
+
+    def test_cannot_activate_existing_template_with_no_parts(self):
+        template = MockupTemplate.objects.create(
+            name="Existing Bare", slug="existing-bare-admin-test", product_type=MockupTemplate.ProductType.TSHIRT
+        )
+        response = self.client.patch(
+            f"/api/generator/admin/mockup-templates/{template.id}/", {"is_active": True}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        template.refresh_from_db()
+        self.assertFalse(template.is_active)
+
+    def test_can_activate_once_a_part_exists(self):
+        create_response = self.client.post(
+            "/api/generator/admin/mockup-templates/",
+            {"name": "Almost Ready", "slug": "almost-ready-admin-test", "product_type": "tshirt"},
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED)
+        template_id = create_response.data["id"]
+
+        # base_image is a required field on the part serializer (real admin usage always
+        # uploads a photo) — going through MockupTemplatePartListCreateView here would just be
+        # testing multipart file upload, not the thing this test cares about (activation gating
+        # on part *existence*), so create the part directly instead.
+        MockupTemplatePart.objects.create(
+            template_id=template_id, name=MockupTemplatePart.PartName.FRONT
+        )
+
+        activate_response = self.client.patch(
+            f"/api/generator/admin/mockup-templates/{template_id}/", {"is_active": True}, format="json"
+        )
+        self.assertEqual(activate_response.status_code, status.HTTP_200_OK)
+        self.assertTrue(activate_response.data["is_active"])
+
+    def test_cannot_delete_the_only_part_of_an_active_template(self):
+        template = MockupTemplate.objects.create(
+            name="Single Part Active",
+            slug="single-part-active-admin-test",
+            product_type=MockupTemplate.ProductType.TSHIRT,
+        )
+        part = MockupTemplatePart.objects.create(template=template, name=MockupTemplatePart.PartName.FRONT)
+        template.is_active = True
+        template.save(update_fields=["is_active"])
+
+        response = self.client.delete(f"/api/generator/admin/mockup-template-parts/{part.id}/")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertTrue(MockupTemplatePart.objects.filter(pk=part.id).exists())
+
+    def test_can_delete_a_part_when_another_remains(self):
+        template = make_template(slug="two-parts-active-admin-test")
+        front = template.parts.get(name=MockupTemplatePart.PartName.FRONT)
+
+        response = self.client.delete(f"/api/generator/admin/mockup-template-parts/{front.id}/")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(MockupTemplatePart.objects.filter(pk=front.id).exists())
+
+    def test_can_delete_the_only_part_of_an_inactive_template(self):
+        template = MockupTemplate.objects.create(
+            name="Single Part Draft",
+            slug="single-part-draft-admin-test",
+            product_type=MockupTemplate.ProductType.TSHIRT,
+        )
+        part = MockupTemplatePart.objects.create(template=template, name=MockupTemplatePart.PartName.FRONT)
+
+        response = self.client.delete(f"/api/generator/admin/mockup-template-parts/{part.id}/")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)

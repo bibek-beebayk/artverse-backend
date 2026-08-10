@@ -6,6 +6,7 @@ from .models import (
     DesignPlacement,
     DesignProject,
     GeneratedImage,
+    GeneratedPrintFile,
     GenerationRequest,
     MockupRender,
     MockupTemplate,
@@ -216,13 +217,14 @@ class MockupTemplateSerializer(serializers.ModelSerializer):
     every template regardless of which storefront product asked, which balloons payload size
     for templates shared across many products. Fetch variants for a specific product/template
     via GET /api/generator/product-variants/?product_id=&template_id= instead (see
-    ProductVariantListView), or shop.ProductSerializer.variants for a specific product."""
+    ProductVariantListView), or shop.ProductSerializer.variants for a specific product.
 
-    base_image = serializers.SerializerMethodField()
-    mask_image = serializers.SerializerMethodField()
-    displacement_map = serializers.SerializerMethodField()
-    shadow_layer = serializers.SerializerMethodField()
-    highlight_layer = serializers.SerializerMethodField()
+    No template-level base_image/mask_image/displacement_map/shadow_layer/highlight_layer/
+    config/canvas_width/canvas_height fields anymore — every renderable surface is a
+    MockupTemplatePart now (`parts` below), never a template-level "root" image. A template
+    with zero parts can't be `is_active` (see MockupTemplate.clean()), so `parts` is never
+    empty for anything this serializer would realistically be asked to represent."""
+
     product_type_display = serializers.CharField(source="get_product_type_display", read_only=True)
     parts = MockupTemplatePartSerializer(many=True, read_only=True)
 
@@ -236,44 +238,13 @@ class MockupTemplateSerializer(serializers.ModelSerializer):
             "product_type_display",
             "description",
             "is_active",
-            "base_image",
-            "mask_image",
-            "displacement_map",
-            "shadow_layer",
-            "highlight_layer",
             "template_version",
-            "config",
             "supported_colors",
             "supported_sizes",
-            "canvas_width",
-            "canvas_height",
             "supported_file_formats",
             "parts",
             "updated_at",
         )
-
-    def _get_file_url(self, file_field):
-        if not file_field:
-            return None
-        try:
-            return file_field.url
-        except Exception:
-            return None
-
-    def get_base_image(self, obj: MockupTemplate):
-        return self._get_file_url(obj.base_image)
-
-    def get_mask_image(self, obj: MockupTemplate):
-        return self._get_file_url(obj.mask_image)
-
-    def get_displacement_map(self, obj: MockupTemplate):
-        return self._get_file_url(obj.displacement_map)
-
-    def get_shadow_layer(self, obj: MockupTemplate):
-        return self._get_file_url(obj.shadow_layer)
-
-    def get_highlight_layer(self, obj: MockupTemplate):
-        return self._get_file_url(obj.highlight_layer)
 
 
 class MockupRenderSerializer(serializers.ModelSerializer):
@@ -521,7 +492,8 @@ def resolve_display_thumbnail_url(project: "DesignProject") -> str:
     """The one authoritative thumbnail for a design project, in fallback order:
     1. uploaded project thumbnail, 2. project.thumbnail_url, 3. the 'front' placement's
     preview_url, 4. the first placement (in any order) with a preview_url, 5. the mockup
-    template's base image, 6. empty string (frontend shows a neutral placeholder).
+    template's 'front' part's base image (or its first part, if it has no 'front'),
+    6. empty string (frontend shows a neutral placeholder).
 
     Expects `project.placements.all()` to already be prefetched by the caller — this walks
     the prefetched list in Python rather than issuing new queries.
@@ -545,11 +517,15 @@ def resolve_display_thumbnail_url(project: "DesignProject") -> str:
     if first_with_preview:
         return first_with_preview.preview_url
 
-    if project.mockup_template_id and project.mockup_template.base_image:
-        try:
-            return project.mockup_template.base_image.url
-        except Exception:
-            pass
+    if project.mockup_template_id:
+        parts = list(project.mockup_template.parts.all())
+        front_part = next((p for p in parts if p.name == "front" and p.base_image), None)
+        part = front_part or next((p for p in parts if p.base_image), None)
+        if part:
+            try:
+                return part.base_image.url
+            except Exception:
+                pass
 
     return ""
 
@@ -786,6 +762,10 @@ class DesignProjectWriteSerializer(serializers.Serializer):
             if not owned:
                 errors["source_generated_image_id"] = "This generated image does not belong to you."
 
+        # Every active template has >= 1 part (MockupTemplate.clean()) — there's no more "this
+        # template has no configured parts, only 'front' is valid" fallback branch to consider.
+        # template_parts_by_name is only ever {} here when `template` itself is None, i.e. the
+        # mockup_template_id validation above already failed and added its own error.
         template_parts_by_name = {part.name: part for part in template.parts.all()} if template else {}
 
         placement_errors = []
@@ -793,17 +773,10 @@ class DesignProjectWriteSerializer(serializers.Serializer):
             item_errors = {}
             part_name = placement["part_name"]
 
-            if template_parts_by_name:
-                matched_part = template_parts_by_name.get(part_name)
-                if not matched_part:
-                    item_errors["part_name"] = f"Template '{template.slug}' has no part named '{part_name}'."
-                placement["_template_part"] = matched_part
-            else:
-                if part_name != MockupTemplatePart.PartName.FRONT:
-                    item_errors["part_name"] = (
-                        "This template has no configured parts; only 'front' is a valid part_name."
-                    )
-                placement["_template_part"] = None
+            matched_part = template_parts_by_name.get(part_name)
+            if template is not None and not matched_part:
+                item_errors["part_name"] = f"Template '{template.slug}' has no part named '{part_name}'."
+            placement["_template_part"] = matched_part
 
             if variant and variant.supported_print_areas and part_name not in variant.supported_print_areas:
                 item_errors["part_name"] = f"The selected variant does not support printing on '{part_name}'."
@@ -836,5 +809,288 @@ class DesignProjectWriteSerializer(serializers.Serializer):
 
         if errors:
             raise serializers.ValidationError(errors)
+
+        return attrs
+
+
+# --- Admin management panel (superuser-only) ---------------------------------------------
+
+
+class AdminMockupTemplatePartSerializer(serializers.ModelSerializer):
+    """Unlike the public MockupTemplatePartSerializer above, image fields are plain writable
+    ImageFields here (not SerializerMethodField URLs) — this is a create/edit form, not a
+    read-only render payload. `config`/`safe_area`/`bleed_area` are edited as raw JSON per the
+    plan's disclosed simplification — Django admin's visual drag-resize widget is not rebuilt
+    here; both edit the same underlying JSON either way."""
+
+    class Meta:
+        model = MockupTemplatePart
+        fields = (
+            "id",
+            "template",
+            "name",
+            "base_image",
+            "mask_image",
+            "displacement_map",
+            "shadow_layer",
+            "highlight_layer",
+            "config",
+            "dpi",
+            "safe_area",
+            "bleed_area",
+            "print_file_width",
+            "print_file_height",
+            "printify_placeholder_position",
+            "printify_placeholder_config",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = ("id", "created_at", "updated_at")
+
+
+class AdminMockupTemplateSerializer(serializers.ModelSerializer):
+    """No template-level base_image/mask_image/displacement_map/shadow_layer/highlight_layer/
+    config/canvas_width/canvas_height fields — every renderable surface is a
+    MockupTemplatePart now, managed separately via AdminMockupTemplatePartListCreateView (the
+    Parts tab in the admin panel), never a template-level "root" image. `is_active` mirrors
+    MockupTemplate.clean(): a template can't be activated with zero parts."""
+
+    parts = AdminMockupTemplatePartSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = MockupTemplate
+        fields = (
+            "id",
+            "name",
+            "slug",
+            "product_type",
+            "description",
+            "is_active",
+            "template_version",
+            "supported_colors",
+            "supported_sizes",
+            "supported_file_formats",
+            "selected_print_provider",
+            "parts",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = ("id", "created_at", "updated_at")
+
+    def validate(self, attrs):
+        is_active = attrs.get("is_active", getattr(self.instance, "is_active", False))
+        if is_active:
+            parts_count = self.instance.parts.count() if self.instance else 0
+            if parts_count == 0:
+                raise serializers.ValidationError(
+                    {"is_active": "A template must have at least one part before it can be activated."}
+                )
+        return attrs
+
+
+class AdminProductVariantSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProductVariant
+        fields = (
+            "id",
+            "product",
+            "template",
+            "sku",
+            "name",
+            "color_name",
+            "color_hex",
+            "size",
+            "external_provider",
+            "external_variant_id",
+            "base_cost",
+            "retail_price",
+            "inventory",
+            "is_available",
+            "image",
+            "supported_print_areas",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = ("id", "created_at", "updated_at")
+
+
+class AdminGenerationRequestSerializer(serializers.ModelSerializer):
+    """Support & Monitoring — read-only, admin-wide (no per-user scoping)."""
+
+    user = serializers.SerializerMethodField()
+
+    class Meta:
+        model = GenerationRequest
+        fields = (
+            "id",
+            "user",
+            "prompt",
+            "style",
+            "provider",
+            "model_name",
+            "status",
+            "error_message",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = fields
+
+    def get_user(self, obj: GenerationRequest):
+        return {"id": obj.user_id, "username": obj.user.username} if obj.user_id else None
+
+
+class AdminGeneratedImageSerializer(serializers.ModelSerializer):
+    user = serializers.SerializerMethodField()
+    image = serializers.SerializerMethodField()
+
+    class Meta:
+        model = GeneratedImage
+        fields = ("id", "user", "generation_request", "prompt", "image", "image_url", "created_at")
+        read_only_fields = fields
+
+    def get_user(self, obj: GeneratedImage):
+        return {"id": obj.user_id, "username": obj.user.username} if obj.user_id else None
+
+    def get_image(self, obj: GeneratedImage):
+        if not obj.image:
+            return None
+        try:
+            return obj.image.url
+        except Exception:
+            return None
+
+
+class AdminSourceDesignAssetSerializer(serializers.ModelSerializer):
+    owner = serializers.SerializerMethodField()
+    image = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SourceDesignAsset
+        fields = (
+            "id",
+            "artwork",
+            "owner",
+            "source_type",
+            "title",
+            "source_url",
+            "image",
+            "width",
+            "height",
+            "mime_type",
+            "file_size",
+            "has_transparency",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = fields
+
+    def get_owner(self, obj: SourceDesignAsset):
+        return {"id": obj.owner_id, "username": obj.owner.username} if obj.owner_id else None
+
+    def get_image(self, obj: SourceDesignAsset):
+        if not obj.image:
+            return None
+        try:
+            return obj.image.url
+        except Exception:
+            return None
+
+
+class AdminMockupRenderSerializer(serializers.ModelSerializer):
+    user = serializers.SerializerMethodField()
+    output_image = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MockupRender
+        fields = (
+            "id",
+            "user",
+            "template",
+            "part_name",
+            "variant_color",
+            "variant_size",
+            "status",
+            "output_image",
+            "output_image_url",
+            "error_message",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = fields
+
+    def get_user(self, obj: MockupRender):
+        return {"id": obj.user_id, "username": obj.user.username} if obj.user_id else None
+
+    def get_output_image(self, obj: MockupRender):
+        if not obj.output_image:
+            return None
+        try:
+            return obj.output_image.url
+        except Exception:
+            return None
+
+
+class AdminGeneratedPrintFileSerializer(serializers.ModelSerializer):
+    """Support & Monitoring — audit visibility only, mirrors Django admin's own read-only
+    treatment of GeneratedPrintFile (never manually created/edited, only produced by the render
+    pipeline — see apps.generator.services.create_or_reuse_print_file)."""
+
+    output_file = serializers.SerializerMethodField()
+
+    class Meta:
+        model = GeneratedPrintFile
+        fields = (
+            "id",
+            "design_placement",
+            "template_part",
+            "output_file",
+            "width",
+            "height",
+            "dpi",
+            "status",
+            "error_message",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = fields
+
+    def get_output_file(self, obj: GeneratedPrintFile):
+        if not obj.output_file:
+            return None
+        try:
+            return obj.output_file.url
+        except Exception:
+            return None
+
+
+class AdminDesignProjectSerializer(serializers.ModelSerializer):
+    """Admin-wide, read-only visibility into any user's design projects — for Support &
+    Monitoring, distinct from the owner-scoped DesignProjectListCreateView/DesignProjectDetailView."""
+
+    user = serializers.SerializerMethodField()
+    product_name = serializers.SerializerMethodField()
+    mockup_template_name = serializers.CharField(source="mockup_template.name", read_only=True)
+
+    class Meta:
+        model = DesignProject
+        fields = (
+            "id",
+            "user",
+            "name",
+            "status",
+            "product_name",
+            "mockup_template_name",
+            "selected_color",
+            "selected_size",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = fields
+
+    def get_user(self, obj: DesignProject):
+        return {"id": obj.user_id, "username": obj.user.username} if obj.user_id else None
+
+    def get_product_name(self, obj: DesignProject):
+        return obj.product.name if obj.product_id else None
 
         return attrs

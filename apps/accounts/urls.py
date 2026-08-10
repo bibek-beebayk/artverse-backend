@@ -1,6 +1,15 @@
 from django.urls import path
 
-from .views import GoogleLoginView, MaintenanceAccessView, MaintenanceStatusView, MeView, RegisterView
+from .views import (
+    AdminSiteConfigurationView,
+    AdminUserDetailView,
+    AdminUserListView,
+    GoogleLoginView,
+    MaintenanceAccessView,
+    MaintenanceStatusView,
+    MeView,
+    RegisterView,
+)
 
 
 urlpatterns = [
@@ -9,4 +18,7 @@ urlpatterns = [
     path("maintenance-access/", MaintenanceAccessView.as_view(), name="maintenance-access"),
     path("register/", RegisterView.as_view(), name="register"),
     path("me/", MeView.as_view(), name="me"),
+    path("admin/users/", AdminUserListView.as_view(), name="admin-user-list"),
+    path("admin/users/<int:pk>/", AdminUserDetailView.as_view(), name="admin-user-detail"),
+    path("admin/site-configuration/", AdminSiteConfigurationView.as_view(), name="admin-site-configuration"),
 ]

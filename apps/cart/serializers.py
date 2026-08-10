@@ -3,7 +3,7 @@ from rest_framework import serializers
 from apps.generator.serializers import DesignProjectListSerializer
 from apps.shop.models import Product
 
-from .models import Cart, CartItem, Coupon
+from .models import Cart, CartItem, Coupon, PricingConfig, PricingRule, PrintAreaCharge
 from .services import recompute_cart
 
 
@@ -80,3 +80,107 @@ def serialize_cart(cart: Cart) -> dict:
         "is_checkout_ready": not has_warnings,
         "updated_at": cart.updated_at,
     }
+
+
+# --- Admin management panel (superuser-only) ---------------------------------------------
+
+
+class AdminPricingConfigSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PricingConfig
+        fields = (
+            "currency",
+            "tax_percentage",
+            "flat_shipping_amount",
+            "free_shipping_threshold",
+            "updated_at",
+        )
+        read_only_fields = ("updated_at",)
+
+
+class AdminPrintAreaChargeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PrintAreaCharge
+        fields = ("id", "part_name", "amount", "currency", "is_active", "updated_at")
+        read_only_fields = ("id", "updated_at")
+
+
+class AdminPricingRuleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PricingRule
+        fields = (
+            "id",
+            "name",
+            "rule_type",
+            "markup_type",
+            "amount",
+            "category",
+            "product",
+            "currency",
+            "priority",
+            "is_active",
+            "starts_at",
+            "ends_at",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = ("id", "created_at", "updated_at")
+
+    def validate(self, attrs):
+        # Mirrors PricingRule.clean() (CheckConstraint scope-matches-rule_type) as a friendly
+        # DRF validation error instead of letting an invalid combination reach the DB constraint.
+        rule_type = attrs.get("rule_type", getattr(self.instance, "rule_type", None))
+        category = attrs.get("category", getattr(self.instance, "category", None))
+        product = attrs.get("product", getattr(self.instance, "product", None))
+        if rule_type == PricingRule.RuleType.CATEGORY and not category:
+            raise serializers.ValidationError({"category": "Category markup rules require a category."})
+        if rule_type == PricingRule.RuleType.PRODUCT and not product:
+            raise serializers.ValidationError({"product": "Product-specific markup rules require a product."})
+        if rule_type == PricingRule.RuleType.GLOBAL and (category or product):
+            raise serializers.ValidationError(
+                {"rule_type": "Global markup rules must not set a category or product."}
+            )
+        return attrs
+
+
+class AdminCouponSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Coupon
+        fields = (
+            "id",
+            "code",
+            "discount_type",
+            "amount",
+            "currency",
+            "is_active",
+            "starts_at",
+            "ends_at",
+            "min_subtotal",
+            "max_redemptions",
+            "max_redemptions_per_user",
+            "times_redeemed",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = ("id", "times_redeemed", "created_at", "updated_at")
+
+
+class AdminCartSerializer(serializers.ModelSerializer):
+    """Support & Monitoring — read-only, admin-wide. A lightweight summary (item count, coupon
+    code), not the fully re-priced serialize_cart() payload above — that's an expensive
+    per-cart recompute meant for a single owner's own cart, not a paginated admin list."""
+
+    user = serializers.SerializerMethodField()
+    coupon_code = serializers.CharField(source="coupon.code", read_only=True, default=None)
+    item_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Cart
+        fields = ("id", "user", "currency", "coupon_code", "item_count", "created_at", "updated_at")
+        read_only_fields = fields
+
+    def get_user(self, obj: Cart):
+        return {"id": obj.user_id, "username": obj.user.username} if obj.user_id else None
+
+    def get_item_count(self, obj: Cart):
+        return obj.items.count()

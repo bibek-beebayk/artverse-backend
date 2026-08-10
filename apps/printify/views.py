@@ -177,3 +177,13 @@ class PrintifySyncProvidersView(APIView):
         run = sync_print_providers_for_blueprint(blueprint, triggered_by=request.user)
         response_status = status.HTTP_200_OK if run.status == PrintifySyncRun.Status.SUCCESS else status.HTTP_502_BAD_GATEWAY
         return Response(PrintifySyncRunSerializer(run).data, status=response_status)
+
+
+class PrintifySyncRunListView(ListAPIView):
+    """Admin panel's Printify > Sync Runs audit screen — previously only the single most-recent
+    run was surfaced (via PrintifyConnectionStatusView.last_sync_run); this exposes the full
+    history, read-only, same permission as every other Printify admin endpoint."""
+
+    queryset = PrintifySyncRun.objects.select_related("triggered_by").order_by("-started_at")
+    serializer_class = PrintifySyncRunSerializer
+    permission_classes = [IsAdminUser]

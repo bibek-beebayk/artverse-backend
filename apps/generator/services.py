@@ -830,20 +830,25 @@ def _draw_text_elements(image: Image.Image, text_elements: list) -> Image.Image:
 
 
 def render_mockup_to_image(render) -> Image.Image:
+    # Every template now requires at least one MockupTemplatePart (see MockupTemplate.clean()) —
+    # there is no more template-level "root" base_image/config to fall back to. render.part_name
+    # is still allowed to be blank (older callers/rows) and defaults to "front" here for
+    # backward compatibility, but MockupRenderView.post (views.py) already normalizes a blank
+    # part_name to "front" before saving the row, so in practice this only matters for rows
+    # created before that normalization existed.
     template = render.template
-    part = None
-    if render.part_name:
-        part = template.parts.filter(name=render.part_name).first()
+    part = template.parts.filter(name=render.part_name or MockupTemplatePart.PartName.FRONT).first()
+    if part is None:
+        raise ValueError(
+            f"No matching template part named '{render.part_name or 'front'}' on template {template.name}."
+        )
 
-    base_image_source = part.base_image if part else template.base_image
-    
-    base_image = _load_storage_image(base_image_source)
+    base_image = _load_storage_image(part.base_image)
     if base_image is None:
-        raise ValueError(f"Mockup template base image is missing for {template.name} ({render.part_name or 'root'}).")
+        raise ValueError(f"Template part base image is missing for {template.name} ({part.name}).")
 
     source_image = _load_source_image(render)
-    config = part.config if part else template.config
-    config = config or {}
+    config = part.config or {}
     placement = {
         **(config.get("placement") or {}),
         **_sanitize_placement_override(render.placement_override),
@@ -864,24 +869,19 @@ def render_mockup_to_image(render) -> Image.Image:
 
     design_layer = _draw_text_elements(design_layer, render.text_elements)
 
-    mask_image_source = part.mask_image if part else template.mask_image
-    displacement_map_source = part.displacement_map if part else template.displacement_map
-    
-    mask_image = _load_storage_image(mask_image_source)
-    displacement_map = _load_storage_image(displacement_map_source)
+    mask_image = _load_storage_image(part.mask_image)
+    displacement_map = _load_storage_image(part.displacement_map)
     design_layer = _apply_displacement_map(design_layer, displacement_map, config)
     design_layer = _apply_design_mask(design_layer, mask_image)
 
     composite = base_image.copy()
     composite.alpha_composite(design_layer)
 
-    shadow_layer_source = part.shadow_layer if part else template.shadow_layer
-    shadow_layer = _load_storage_image(shadow_layer_source)
+    shadow_layer = _load_storage_image(part.shadow_layer)
     if shadow_layer is not None:
         composite.alpha_composite(shadow_layer.resize(base_image.size, Image.Resampling.LANCZOS))
 
-    highlight_layer_source = part.highlight_layer if part else template.highlight_layer
-    highlight_layer = _load_storage_image(highlight_layer_source)
+    highlight_layer = _load_storage_image(part.highlight_layer)
     if highlight_layer is not None:
         composite.alpha_composite(highlight_layer.resize(base_image.size, Image.Resampling.LANCZOS))
 
