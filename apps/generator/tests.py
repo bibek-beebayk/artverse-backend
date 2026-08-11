@@ -2738,3 +2738,21 @@ class AdminProductVariantAdminApiTests(APITestCase):
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class AutoSlugGenerationTests(TestCase):
+    """A blank slug on create is auto-generated from name (config.slug_utils.unique_slugify),
+    with a unique `-2`, `-3`, ... suffix on collision — see apps.gallery.tests/apps.shop.tests
+    for the same behaviour on those apps' models."""
+
+    def test_template_slug_generated_and_unique_on_collision(self):
+        first = MockupTemplate.objects.create(name="Starter Hoodie", product_type=MockupTemplate.ProductType.HOODIE)
+        second = MockupTemplate.objects.create(name="Starter Hoodie", product_type=MockupTemplate.ProductType.HOODIE)
+        self.assertEqual(first.slug, "starter-hoodie")
+        self.assertEqual(second.slug, "starter-hoodie-2")
+
+    def test_explicit_slug_is_not_overridden(self):
+        template = MockupTemplate.objects.create(
+            name="Custom Slug Template", product_type=MockupTemplate.ProductType.MUG, slug="my-custom-slug"
+        )
+        self.assertEqual(template.slug, "my-custom-slug")

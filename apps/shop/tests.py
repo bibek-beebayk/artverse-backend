@@ -910,3 +910,31 @@ class AdminProductListFilteringTests(APITestCase):
         response = self.client.get("/api/shop/admin/products/?ordering=name")
         names = [row["name"] for row in response.data["results"]]
         self.assertLess(names.index("Alpha"), names.index("Bravo"))
+
+
+class AutoSlugGenerationTests(TestCase):
+    """A blank slug on create is auto-generated from name (config.slug_utils.unique_slugify),
+    with a unique `-2`, `-3`, ... suffix on collision — see apps.gallery.tests for the same
+    behaviour on the gallery models."""
+
+    def test_category_slug_generated_from_name(self):
+        category = ProductCategory.objects.create(name="Outerwear")
+        self.assertEqual(category.slug, "outerwear")
+
+    def test_product_slug_generated_and_unique_on_collision(self):
+        category = ProductCategory.objects.create(name="Auto Slug Products")
+        first = Product.objects.create(name="Classic Tee", category=category)
+        second = Product.objects.create(name="Classic Tee", category=category)
+        self.assertEqual(first.slug, "classic-tee")
+        self.assertEqual(second.slug, "classic-tee-2")
+
+    def test_explicit_slug_is_not_overridden(self):
+        category = ProductCategory.objects.create(name="Custom Slug Cat", slug="my-custom-slug")
+        self.assertEqual(category.slug, "my-custom-slug")
+
+    def test_updating_other_fields_does_not_regenerate_existing_slug(self):
+        category = ProductCategory.objects.create(name="Stable")
+        original_slug = category.slug
+        category.name = "Stable Renamed"
+        category.save()
+        self.assertEqual(category.slug, original_slug)

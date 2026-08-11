@@ -1,6 +1,8 @@
 from django.conf import settings
 from django.db import models
 
+from config.slug_utils import unique_slugify
+
 
 class GenerationRequest(models.Model):
     class Status(models.TextChoices):
@@ -113,7 +115,7 @@ class MockupTemplate(models.Model):
         TOTE_BAG = "tote_bag", "Tote Bag"
 
     name = models.CharField(max_length=120)
-    slug = models.SlugField(unique=True)
+    slug = models.SlugField(unique=True, blank=True, help_text="Leave blank to auto-generate a unique slug from the name.")
     product_type = models.CharField(max_length=30, choices=ProductType.choices)
     description = models.TextField(blank=True)
     # Draft by default, same as shop.Product — a template isn't usable until it has at least one
@@ -145,6 +147,11 @@ class MockupTemplate(models.Model):
 
     def __str__(self) -> str:
         return f"{self.name} ({self.get_product_type_display()})"
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = unique_slugify(self, self.name)
+        super().save(*args, **kwargs)
 
     def clean(self):
         super().clean()

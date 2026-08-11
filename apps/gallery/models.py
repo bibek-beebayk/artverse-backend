@@ -2,11 +2,12 @@ from django.conf import settings
 from django.db import models
 
 from config.image_utils import build_thumbnail_content
+from config.slug_utils import unique_slugify
 
 
 class Category(models.Model):
     name = models.CharField(max_length=120, unique=True)
-    slug = models.SlugField(unique=True)
+    slug = models.SlugField(unique=True, blank=True, help_text="Leave blank to auto-generate a unique slug from the name.")
 
     class Meta:
         ordering = ("name",)
@@ -14,10 +15,15 @@ class Category(models.Model):
     def __str__(self) -> str:
         return self.name
 
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = unique_slugify(self, self.name)
+        super().save(*args, **kwargs)
+
 
 class Collection(models.Model):
     name = models.CharField(max_length=120, unique=True)
-    slug = models.SlugField(unique=True)
+    slug = models.SlugField(unique=True, blank=True, help_text="Leave blank to auto-generate a unique slug from the name.")
     description = models.TextField(blank=True)
 
     class Meta:
@@ -26,10 +32,15 @@ class Collection(models.Model):
     def __str__(self) -> str:
         return self.name
 
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = unique_slugify(self, self.name)
+        super().save(*args, **kwargs)
+
 
 class Artwork(models.Model):
     title = models.CharField(max_length=255)
-    slug = models.SlugField(unique=True)
+    slug = models.SlugField(unique=True, blank=True, help_text="Leave blank to auto-generate a unique slug from the title.")
     category = models.ForeignKey(Category, on_delete=models.PROTECT, related_name="artworks")
     collection = models.ForeignKey(
         Collection,
@@ -69,6 +80,12 @@ class Artwork(models.Model):
         return True
 
     def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = unique_slugify(self, self.title)
+            update_fields = kwargs.get("update_fields")
+            if update_fields is not None:
+                kwargs["update_fields"] = list(update_fields) + ["slug"]
+
         update_fields = kwargs.get("update_fields")
         should_check_thumbnail = update_fields is None or "image" in update_fields or "thumbnail" in update_fields
         previous_image_name = None
@@ -95,7 +112,7 @@ class Artwork(models.Model):
 
 class VideoClip(models.Model):
     title = models.CharField(max_length=255)
-    slug = models.SlugField(unique=True)
+    slug = models.SlugField(unique=True, blank=True, help_text="Leave blank to auto-generate a unique slug from the title.")
     thumbnail_url = models.URLField(blank=True)
     video_url = models.URLField()
     is_published = models.BooleanField(default=True)
@@ -106,6 +123,11 @@ class VideoClip(models.Model):
 
     def __str__(self) -> str:
         return self.title
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = unique_slugify(self, self.title)
+        super().save(*args, **kwargs)
 
 
 class Favorite(models.Model):

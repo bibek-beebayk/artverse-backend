@@ -1,7 +1,8 @@
+from django.test import TestCase
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from .models import Artwork, Category
+from .models import Artwork, Category, Collection, VideoClip
 
 
 def make_category(slug="gallery-test-cat"):
@@ -75,3 +76,43 @@ class GalleryPaginationTests(APITestCase):
         make_artwork(title="A", slug="pg-order-a")
         response = self.client.get("/api/gallery/artworks/?ordering=__class__.mro")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+
+class AutoSlugGenerationTests(TestCase):
+    """A blank slug on create is auto-generated from the natural title/name field
+    (config.slug_utils.unique_slugify), and colliding names get a unique `-2`, `-3`, ... suffix
+    rather than a database IntegrityError."""
+
+    def test_category_slug_generated_from_name(self):
+        category = Category.objects.create(name="Cyberpunk Art")
+        self.assertEqual(category.slug, "cyberpunk-art")
+
+    def test_collection_slug_generated_and_unique_on_collision(self):
+        first = Collection.objects.create(name="Neon Dreams")
+        second = Collection.objects.create(name="Neon Dreams!!")  # slugifies to the same base
+        self.assertEqual(first.slug, "neon-dreams")
+        self.assertEqual(second.slug, "neon-dreams-2")
+
+    def test_artwork_slug_generated_from_title_and_unique(self):
+        category = Category.objects.create(name="Auto Slug Cat")
+        first = Artwork.objects.create(title="Sunset City", category=category)
+        second = Artwork.objects.create(title="Sunset City", category=category)
+        third = Artwork.objects.create(title="Sunset City", category=category)
+        self.assertEqual(first.slug, "sunset-city")
+        self.assertEqual(second.slug, "sunset-city-2")
+        self.assertEqual(third.slug, "sunset-city-3")
+
+    def test_video_clip_slug_generated_from_title(self):
+        clip = VideoClip.objects.create(title="Behind The Scenes", video_url="https://example.com/v.mp4")
+        self.assertEqual(clip.slug, "behind-the-scenes")
+
+    def test_explicit_slug_is_not_overridden(self):
+        category = Category.objects.create(name="Custom Slug Test", slug="totally-custom")
+        self.assertEqual(category.slug, "totally-custom")
+
+    def test_updating_other_fields_does_not_regenerate_existing_slug(self):
+        category = Category.objects.create(name="Stable Slug")
+        original_slug = category.slug
+        category.name = "Stable Slug Renamed"
+        category.save()
+        self.assertEqual(category.slug, original_slug)

@@ -2,17 +2,23 @@ from django.conf import settings
 from django.db import models
 
 from config.image_utils import build_thumbnail_content
+from config.slug_utils import unique_slugify
 
 
 class ProductCategory(models.Model):
     name = models.CharField(max_length=120, unique=True)
-    slug = models.SlugField(unique=True)
+    slug = models.SlugField(unique=True, blank=True, help_text="Leave blank to auto-generate a unique slug from the name.")
 
     class Meta:
         ordering = ("name",)
 
     def __str__(self) -> str:
         return self.name
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = unique_slugify(self, self.name)
+        super().save(*args, **kwargs)
 
 
 class Product(models.Model):
@@ -25,7 +31,7 @@ class Product(models.Model):
     the rule that's supposed to keep `is_active=True` and "no sellable variant" from coexisting."""
 
     name = models.CharField(max_length=255)
-    slug = models.SlugField(unique=True)
+    slug = models.SlugField(unique=True, blank=True, help_text="Leave blank to auto-generate a unique slug from the name.")
     category = models.ForeignKey(ProductCategory, on_delete=models.PROTECT, related_name="products")
     description = models.TextField(blank=True)
     image = models.ImageField(upload_to="products/", blank=True, null=True)
@@ -65,6 +71,12 @@ class Product(models.Model):
         return True
 
     def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = unique_slugify(self, self.name)
+            update_fields = kwargs.get("update_fields")
+            if update_fields is not None:
+                kwargs["update_fields"] = list(update_fields) + ["slug"]
+
         update_fields = kwargs.get("update_fields")
         should_check_thumbnail = update_fields is None or "image" in update_fields or "thumbnail" in update_fields
         previous_image_name = None
