@@ -1,12 +1,13 @@
 from django.db import transaction
-from django.db.models import Count
+from django.db.models import Count, Exists, OuterRef, Q
 from rest_framework import status
 from rest_framework.generics import ListAPIView, RetrieveAPIView
 from apps.accounts.permissions import IsSuperUser
+from apps.shop.pagination import StandardResultsSetPagination
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import PrintifyBlueprint, PrintifySyncRun
+from .models import PrintifyBlueprint, PrintifyPrintProvider, PrintifySyncRun
 from .serializers import (
     PrintifyBlueprintDetailSerializer,
     PrintifyBlueprintListSerializer,
@@ -64,12 +65,70 @@ class PrintifyConnectionStatusView(APIView):
 
 
 class PrintifyBlueprintListView(ListAPIView):
+    """Paginated (added 2026-08-11) — a real Printify catalogue sync can pull in thousands of
+    blueprints (the full catalogue, not just ones in use), and this previously had no
+    `pagination_class` at all, silently returning every synced row in one response. Besides the
+    obvious payload-size problem, it also broke the admin panel's blueprint-expand UI in
+    practice: the provider-inspection panel for a clicked row renders as a single block after the
+    *entire* table, so with an unpaginated multi-thousand-row table, expanding anything past the
+    first handful of rows put the panel far below the current scroll position — indistinguishable
+    from "nothing happened" without scrolling all the way down."""
+
     serializer_class = PrintifyBlueprintListSerializer
     permission_classes = [IsSuperUser]
+    pagination_class = StandardResultsSetPagination
+
+    # Whitelist only — never pass a raw ?ordering= straight to .order_by() (see
+    # apps.shop.views._ORDERING_FIELDS for the same convention on the Products admin list).
+    # "provider_count" orders by the same annotation the "Providers" column displays.
+    ORDERING_FIELDS = {
+        "title": "title",
+        "-title": "-title",
+        "brand": "brand",
+        "-brand": "-brand",
+        "newest": "-synced_at",
+        "oldest": "synced_at",
+        "provider_count": "provider_count_value",
+        "-provider_count": "-provider_count_value",
+    }
 
     def get_queryset(self):
         queryset = PrintifyBlueprint.objects.annotate(provider_count_value=Count("print_providers", distinct=True))
-        is_mapped = self.request.query_params.get("is_mapped")
+        params = self.request.query_params
+
+        search = params.get("search")
+        if search:
+            queryset = queryset.filter(
+                Q(title__icontains=search) | Q(brand__icontains=search) | Q(model__icontains=search)
+            )
+
+        title = params.get("title")
+        if title:
+            queryset = queryset.filter(title__icontains=title)
+
+        brand = params.get("brand")
+        if brand:
+            queryset = queryset.filter(brand__icontains=brand)
+
+        # A blueprint has no location of its own — only its print providers do (each is an
+        # actual print facility). "Filter blueprints by location" really means "blueprints that
+        # have at least one provider in that location". Uses a correlated EXISTS subquery rather
+        # than queryset.filter(print_providers__location__...) + .distinct(): filtering through a
+        # reverse FK on the same relation this queryset already .annotate()s a Count() over would
+        # add a second join, inflating that Count before the GROUP BY collapses rows — EXISTS
+        # sidesteps that entirely, same pattern as apps.shop.services.sellable_variant_exists_subquery().
+        # Key names (city/region/country) match PrintifyPrintProviderSerializer's location shape
+        # as synced from Printify's provider-location endpoint — adjust if real data differs.
+        provider_location = params.get("provider_location")
+        if provider_location:
+            matching_providers = PrintifyPrintProvider.objects.filter(blueprint=OuterRef("pk")).filter(
+                Q(location__city__icontains=provider_location)
+                | Q(location__region__icontains=provider_location)
+                | Q(location__country__icontains=provider_location)
+            )
+            queryset = queryset.filter(Exists(matching_providers))
+
+        is_mapped = params.get("is_mapped")
         if is_mapped == "true":
             queryset = queryset.filter(mockup_template__isnull=False)
         elif is_mapped == "false":
@@ -77,9 +136,15 @@ class PrintifyBlueprintListView(ListAPIView):
         # Reverse lookup for the Mockup Template edit screen's "Printify Mapping" section: given
         # a template id, find the blueprint (if any) mapped to it — PrintifyBlueprint.mockup_template
         # has no other query surface for this today.
-        mockup_template_id = self.request.query_params.get("mockup_template")
+        mockup_template_id = params.get("mockup_template")
         if mockup_template_id:
             queryset = queryset.filter(mockup_template_id=mockup_template_id)
+
+        # Explicit, deterministic ordering — required for stable pagination (an unordered/
+        # ambiguously-ordered queryset can duplicate or skip rows across page boundaries); `title`
+        # alone isn't guaranteed unique, so `id` always breaks ties, whitelisted or not.
+        order_field = self.ORDERING_FIELDS.get(params.get("ordering"))
+        queryset = queryset.order_by(order_field, "id") if order_field else queryset.order_by("title", "id")
         return queryset
 
 
