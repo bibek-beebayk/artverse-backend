@@ -8,6 +8,8 @@ from .views import (
     AdminMockupRenderListView,
     AdminMockupTemplateDetailView,
     AdminMockupTemplateListCreateView,
+    AdminMockupTemplatePartColorAssetDetailView,
+    AdminMockupTemplatePartColorAssetListCreateView,
     AdminMockupTemplatePartDetailView,
     AdminMockupTemplatePartListCreateView,
     AdminProductVariantBulkActionView,
@@ -81,6 +83,16 @@ urlpatterns = [
         "admin/mockup-template-parts/<int:pk>/",
         AdminMockupTemplatePartDetailView.as_view(),
         name="admin-mockup-template-part-detail",
+    ),
+    path(
+        "admin/mockup-template-part-color-assets/",
+        AdminMockupTemplatePartColorAssetListCreateView.as_view(),
+        name="admin-mockup-template-part-color-asset-list",
+    ),
+    path(
+        "admin/mockup-template-part-color-assets/<int:pk>/",
+        AdminMockupTemplatePartColorAssetDetailView.as_view(),
+        name="admin-mockup-template-part-color-asset-detail",
     ),
     path("admin/product-variants/", AdminProductVariantListCreateView.as_view(), name="admin-product-variant-list"),
     path(

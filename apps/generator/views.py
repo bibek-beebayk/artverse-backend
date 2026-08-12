@@ -31,6 +31,7 @@ from .models import (
     MockupRender,
     MockupTemplate,
     MockupTemplatePart,
+    MockupTemplatePartColorAsset,
     ProductVariant,
     SourceDesignAsset,
 )
@@ -40,6 +41,7 @@ from .serializers import (
     AdminGeneratedPrintFileSerializer,
     AdminGenerationRequestSerializer,
     AdminMockupRenderSerializer,
+    AdminMockupTemplatePartColorAssetSerializer,
     AdminMockupTemplatePartSerializer,
     AdminMockupTemplateSerializer,
     AdminProductVariantSerializer,
@@ -200,7 +202,7 @@ class MockupTemplateListView(ListAPIView):
     permission_classes = [AllowAny]
 
     def get_queryset(self):
-        queryset = MockupTemplate.objects.filter(is_active=True)
+        queryset = MockupTemplate.objects.filter(is_active=True).prefetch_related("parts", "parts__color_assets")
         product_type = self.request.query_params.get("product_type")
         if product_type:
             queryset = queryset.filter(product_type=product_type)
@@ -212,7 +214,7 @@ class MockupTemplateDetailView(RetrieveAPIView):
     `mockup_template_id` (e.g. shop.ProductSerializer) fetch just that template instead of
     filtering the full list client-side. Mirrors apps.shop.views.ProductDetailView's shape."""
 
-    queryset = MockupTemplate.objects.filter(is_active=True).prefetch_related("parts")
+    queryset = MockupTemplate.objects.filter(is_active=True).prefetch_related("parts", "parts__color_assets")
     serializer_class = MockupTemplateSerializer
     permission_classes = [AllowAny]
 
@@ -549,7 +551,7 @@ class DesignProjectDetailView(APIView):
         return get_object_or_404(
             DesignProject.objects.select_related(
                 "user", "product", "mockup_template", "selected_variant", "selected_variant__product"
-            ).prefetch_related(_placements_prefetch()),
+            ).prefetch_related(_placements_prefetch(), "mockup_template__parts__color_assets"),
             pk=pk,
             user=request.user,
         )
@@ -837,6 +839,27 @@ class AdminMockupTemplatePartDetailView(RetrieveUpdateDestroyAPIView):
                 "or add another part before removing this one."
             )
         super().perform_destroy(instance)
+
+
+class AdminMockupTemplatePartColorAssetListCreateView(ListCreateAPIView):
+    """Nested under a part — filtered by ?part=<id>, matching the same nested-list convention
+    as AdminMockupTemplatePartListCreateView above."""
+
+    serializer_class = AdminMockupTemplatePartColorAssetSerializer
+    permission_classes = [IsSuperUser]
+
+    def get_queryset(self):
+        queryset = MockupTemplatePartColorAsset.objects.select_related("part")
+        part_id = self.request.query_params.get("part")
+        if part_id:
+            queryset = queryset.filter(part_id=part_id)
+        return queryset
+
+
+class AdminMockupTemplatePartColorAssetDetailView(RetrieveUpdateDestroyAPIView):
+    queryset = MockupTemplatePartColorAsset.objects.select_related("part")
+    serializer_class = AdminMockupTemplatePartColorAssetSerializer
+    permission_classes = [IsSuperUser]
 
 
 # Whitelist only — never pass a raw ?ordering= straight to .order_by() (see

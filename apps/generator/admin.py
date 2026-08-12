@@ -14,6 +14,7 @@ from .models import (
     MockupRender,
     MockupTemplate,
     MockupTemplatePart,
+    MockupTemplatePartColorAsset,
     ProductVariant,
     SourceDesignAsset,
 )
@@ -119,6 +120,18 @@ class MockupTemplatePartInline(admin.StackedInline):
     model = MockupTemplatePart
     form = MockupTemplatePartForm
     extra = 0
+
+
+@admin.register(MockupTemplatePartColorAsset)
+class MockupTemplatePartColorAssetAdmin(admin.ModelAdmin):
+    """Registered standalone rather than nested inside MockupTemplatePartInline — Django admin
+    doesn't support inlines nested two levels deep (Template -> Part -> Colour Asset). Use the
+    "part" filter/search below, or the in-app React Admin's Mockup Template Part editor, which
+    manages these contextually per part."""
+
+    list_display = ("id", "part", "color_name", "updated_at")
+    list_filter = ("part__template",)
+    search_fields = ("color_name", "part__template__name")
 
 
 class ProductVariantInline(admin.TabularInline):

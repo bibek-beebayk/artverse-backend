@@ -247,6 +247,39 @@ class MockupTemplatePart(models.Model):
                 raise ValidationError({"printify_placeholder_position": str(exc)}) from exc
 
 
+class MockupTemplatePartColorAsset(models.Model):
+    """Colour-specific override of a `MockupTemplatePart`'s preview-only image layers.
+
+    One row per (part, colour) — e.g. Front+Black, Front+White — reused across every size
+    variant of that colour (sizing never affects which mockup photo is shown). Any field left
+    blank falls back to the parent part's own generic asset at render/display time; a part with
+    no matching colour row at all falls back entirely, so untouched parts behave exactly as
+    before this model existed. Preview-only: `generate_print_file_image` never reads this model
+    or its parent part's image fields, so none of this can affect production print files.
+    """
+
+    part = models.ForeignKey(MockupTemplatePart, on_delete=models.CASCADE, related_name="color_assets")
+    color_name = models.CharField(
+        max_length=100, help_text="Matches ProductVariant.color_name case-insensitively, e.g. 'Black'."
+    )
+    base_image = models.ImageField(upload_to="mockup-templates/parts/colors/base/")
+    mask_image = models.ImageField(upload_to="mockup-templates/parts/colors/masks/", blank=True, null=True)
+    displacement_map = models.ImageField(
+        upload_to="mockup-templates/parts/colors/displacement/", blank=True, null=True
+    )
+    shadow_layer = models.ImageField(upload_to="mockup-templates/parts/colors/shadows/", blank=True, null=True)
+    highlight_layer = models.ImageField(upload_to="mockup-templates/parts/colors/highlights/", blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("color_name",)
+        unique_together = (("part", "color_name"),)
+
+    def __str__(self) -> str:
+        return f"{self.part} - {self.color_name}"
+
+
 class ProductVariant(models.Model):
     """The single source of truth for sellable pricing, availability and inventory — a specific
     purchasable colour/size combination, belonging to both a storefront `Product` (what

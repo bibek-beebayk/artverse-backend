@@ -383,6 +383,51 @@ def create_uploaded_source_design_asset(
     return asset
 
 
+def fetch_base_image_from_printify_url(url: str) -> tuple[str, ContentFile]:
+    """Downloads a Printify-synced blueprint catalogue image and validates it exactly like a
+    direct file upload would (same constants/checks as create_uploaded_source_design_asset above)
+    — backs AdminMockupTemplatePartSerializer's "use a Printify catalog image" option for
+    base_image, an alternative to uploading your own photo. `url` is expected to already be one
+    of a PrintifyBlueprint's own stored `images` entries (resolved server-side by the caller from
+    trusted, already-synced data — this function never receives a raw client-supplied URL
+    directly, so there's no SSRF surface here from arbitrary user input). Raises
+    UploadValidationError for any client-fixable problem, same as the direct-upload path."""
+    try:
+        image_bytes, mime_type, extension = _read_remote_or_data_image(url)
+    except Exception as exc:
+        raise UploadValidationError("Could not download this image from Printify.") from exc
+
+    content_type = (mime_type or "").lower()
+    if content_type not in ALLOWED_UPLOAD_CONTENT_TYPES:
+        raise UploadValidationError(f"Unsupported image type from Printify: '{content_type or 'unknown'}'.")
+
+    if len(image_bytes) <= 0:
+        raise UploadValidationError("Printify returned an empty image.")
+    if len(image_bytes) > MAX_UPLOAD_SIZE_BYTES:
+        raise UploadValidationError(
+            f"Image is too large ({len(image_bytes) // (1024 * 1024)}MB). "
+            f"Maximum is {MAX_UPLOAD_SIZE_BYTES // (1024 * 1024)}MB."
+        )
+
+    try:
+        with Image.open(BytesIO(image_bytes)) as probe:
+            probe.verify()
+    except Exception as exc:
+        raise UploadValidationError("This file could not be read as a valid image.") from exc
+
+    with Image.open(BytesIO(image_bytes)) as decoded:
+        width, height = decoded.size
+
+    if width < MIN_UPLOAD_DIMENSION_PX or height < MIN_UPLOAD_DIMENSION_PX:
+        raise UploadValidationError(
+            f"Image is too small ({width}x{height}px). Minimum is "
+            f"{MIN_UPLOAD_DIMENSION_PX}x{MIN_UPLOAD_DIMENSION_PX}px."
+        )
+
+    filename = f"printify-catalog-image{extension}"
+    return filename, ContentFile(image_bytes)
+
+
 class AiGenerationError(RuntimeError):
     """Raised for any AI-generation-time problem (missing/invalid key, blocked or empty
     response, provider/network failure) — the view catches this specifically and marks the
@@ -829,6 +874,31 @@ def _draw_text_elements(image: Image.Image, text_elements: list) -> Image.Image:
     return image
 
 
+def resolve_part_color_asset(part, color_name):
+    """Looks up the MockupTemplatePartColorAsset on `part` matching `color_name`
+    case-insensitively. Returns None if `color_name` is blank or no row matches — callers
+    should fall back to `part`'s own generic assets in that case."""
+    if not color_name:
+        return None
+    return part.color_assets.filter(color_name__iexact=color_name).first()
+
+
+def resolve_part_assets(part, color_name):
+    """Resolves the effective base/mask/displacement/shadow/highlight image fields for
+    `part` given a selected variant colour, per-field: a colour-specific asset field wins
+    when present, otherwise the generic part field is used. Colour assets are reused across
+    every size of that colour (nothing here keys on size), and a part with no matching
+    colour row falls back entirely to its own generic fields — i.e. behavior is unchanged
+    from before colour assets existed whenever no matching row is found."""
+    color_asset = resolve_part_color_asset(part, color_name)
+    fields = ("base_image", "mask_image", "displacement_map", "shadow_layer", "highlight_layer")
+    resolved = {}
+    for field in fields:
+        color_value = getattr(color_asset, field, None) if color_asset else None
+        resolved[field] = color_value if color_value else getattr(part, field)
+    return resolved
+
+
 def render_mockup_to_image(render) -> Image.Image:
     # Every template now requires at least one MockupTemplatePart (see MockupTemplate.clean()) —
     # there is no more template-level "root" base_image/config to fall back to. render.part_name
@@ -843,7 +913,9 @@ def render_mockup_to_image(render) -> Image.Image:
             f"No matching template part named '{render.part_name or 'front'}' on template {template.name}."
         )
 
-    base_image = _load_storage_image(part.base_image)
+    assets = resolve_part_assets(part, render.variant_color)
+
+    base_image = _load_storage_image(assets["base_image"])
     if base_image is None:
         raise ValueError(f"Template part base image is missing for {template.name} ({part.name}).")
 
@@ -869,19 +941,19 @@ def render_mockup_to_image(render) -> Image.Image:
 
     design_layer = _draw_text_elements(design_layer, render.text_elements)
 
-    mask_image = _load_storage_image(part.mask_image)
-    displacement_map = _load_storage_image(part.displacement_map)
+    mask_image = _load_storage_image(assets["mask_image"])
+    displacement_map = _load_storage_image(assets["displacement_map"])
     design_layer = _apply_displacement_map(design_layer, displacement_map, config)
     design_layer = _apply_design_mask(design_layer, mask_image)
 
     composite = base_image.copy()
     composite.alpha_composite(design_layer)
 
-    shadow_layer = _load_storage_image(part.shadow_layer)
+    shadow_layer = _load_storage_image(assets["shadow_layer"])
     if shadow_layer is not None:
         composite.alpha_composite(shadow_layer.resize(base_image.size, Image.Resampling.LANCZOS))
 
-    highlight_layer = _load_storage_image(part.highlight_layer)
+    highlight_layer = _load_storage_image(assets["highlight_layer"])
     if highlight_layer is not None:
         composite.alpha_composite(highlight_layer.resize(base_image.size, Image.Resampling.LANCZOS))
 

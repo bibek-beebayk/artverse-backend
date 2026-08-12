@@ -11,6 +11,7 @@ from .models import (
     MockupRender,
     MockupTemplate,
     MockupTemplatePart,
+    MockupTemplatePartColorAsset,
     ProductVariant,
     SourceDesignAsset,
 )
@@ -85,12 +86,56 @@ class SourceDesignAssetSerializer(serializers.ModelSerializer):
         return self._get_file_url(obj)
 
 
+class MockupTemplatePartColorAssetSerializer(serializers.ModelSerializer):
+    base_image = serializers.SerializerMethodField()
+    mask_image = serializers.SerializerMethodField()
+    displacement_map = serializers.SerializerMethodField()
+    shadow_layer = serializers.SerializerMethodField()
+    highlight_layer = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MockupTemplatePartColorAsset
+        fields = (
+            "id",
+            "color_name",
+            "base_image",
+            "mask_image",
+            "displacement_map",
+            "shadow_layer",
+            "highlight_layer",
+        )
+
+    def _get_file_url(self, file_field):
+        if not file_field:
+            return None
+        try:
+            return file_field.url
+        except Exception:
+            return None
+
+    def get_base_image(self, obj: MockupTemplatePartColorAsset):
+        return self._get_file_url(obj.base_image)
+
+    def get_mask_image(self, obj: MockupTemplatePartColorAsset):
+        return self._get_file_url(obj.mask_image)
+
+    def get_displacement_map(self, obj: MockupTemplatePartColorAsset):
+        return self._get_file_url(obj.displacement_map)
+
+    def get_shadow_layer(self, obj: MockupTemplatePartColorAsset):
+        return self._get_file_url(obj.shadow_layer)
+
+    def get_highlight_layer(self, obj: MockupTemplatePartColorAsset):
+        return self._get_file_url(obj.highlight_layer)
+
+
 class MockupTemplatePartSerializer(serializers.ModelSerializer):
     base_image = serializers.SerializerMethodField()
     mask_image = serializers.SerializerMethodField()
     displacement_map = serializers.SerializerMethodField()
     shadow_layer = serializers.SerializerMethodField()
     highlight_layer = serializers.SerializerMethodField()
+    color_assets = MockupTemplatePartColorAssetSerializer(many=True, read_only=True)
 
     class Meta:
         model = MockupTemplatePart
@@ -102,6 +147,7 @@ class MockupTemplatePartSerializer(serializers.ModelSerializer):
             "displacement_map",
             "shadow_layer",
             "highlight_layer",
+            "color_assets",
             "config",
             "dpi",
             "safe_area",
@@ -821,7 +867,17 @@ class AdminMockupTemplatePartSerializer(serializers.ModelSerializer):
     ImageFields here (not SerializerMethodField URLs) — this is a create/edit form, not a
     read-only render payload. `config`/`safe_area`/`bleed_area` are edited as raw JSON per the
     plan's disclosed simplification — Django admin's visual drag-resize widget is not rebuilt
-    here; both edit the same underlying JSON either way."""
+    here; both edit the same underlying JSON either way.
+
+    `base_image` can also be set from one of the mapped Printify blueprint's own synced catalogue
+    images instead of an uploaded file — `printify_blueprint_id`/`printify_image_index` (write-
+    only, not model fields) name that image by *position* in `PrintifyBlueprint.images`, never by
+    a raw URL the client supplies directly: the actual URL is always resolved server-side from
+    already-synced, already-trusted data, so there's no SSRF surface from arbitrary client input
+    here the way there would be if this accepted an arbitrary image URL."""
+
+    printify_blueprint_id = serializers.IntegerField(write_only=True, required=False, allow_null=True)
+    printify_image_index = serializers.IntegerField(write_only=True, required=False, allow_null=True)
 
     class Meta:
         model = MockupTemplatePart
@@ -830,6 +886,8 @@ class AdminMockupTemplatePartSerializer(serializers.ModelSerializer):
             "template",
             "name",
             "base_image",
+            "printify_blueprint_id",
+            "printify_image_index",
             "mask_image",
             "displacement_map",
             "shadow_layer",
@@ -846,6 +904,157 @@ class AdminMockupTemplatePartSerializer(serializers.ModelSerializer):
             "updated_at",
         )
         read_only_fields = ("id", "created_at", "updated_at")
+        extra_kwargs = {"base_image": {"required": False}}
+
+    def validate(self, attrs):
+        has_uploaded_file = attrs.get("base_image") is not None
+        has_printify_selection = attrs.get("printify_blueprint_id") is not None and attrs.get("printify_image_index") is not None
+        has_existing_image = bool(self.instance and self.instance.base_image)
+        if not has_uploaded_file and not has_printify_selection and not has_existing_image:
+            raise serializers.ValidationError(
+                {"base_image": "Upload a file or select a Printify catalog image."}
+            )
+        return attrs
+
+    def _resolve_printify_image_url(self, validated_data: dict) -> str | None:
+        blueprint_id = validated_data.pop("printify_blueprint_id", None)
+        image_index = validated_data.pop("printify_image_index", None)
+        if blueprint_id is None or image_index is None:
+            return None
+
+        from apps.printify.models import PrintifyBlueprint
+
+        try:
+            blueprint = PrintifyBlueprint.objects.get(pk=blueprint_id)
+        except PrintifyBlueprint.DoesNotExist:
+            raise serializers.ValidationError({"printify_blueprint_id": "No such Printify blueprint."})
+
+        images = blueprint.images or []
+        if not isinstance(image_index, int) or not (0 <= image_index < len(images)):
+            raise serializers.ValidationError({"printify_image_index": "Invalid image index for this blueprint."})
+
+        url = images[image_index]
+        if not isinstance(url, str) or not url.startswith("https://"):
+            raise serializers.ValidationError({"printify_image_index": "This catalogue image entry isn't a usable URL."})
+        return url
+
+    def _apply_printify_image(self, instance: MockupTemplatePart, image_url: str) -> None:
+        from .services import UploadValidationError, fetch_base_image_from_printify_url
+
+        try:
+            filename, content = fetch_base_image_from_printify_url(image_url)
+        except UploadValidationError as exc:
+            raise serializers.ValidationError({"printify_image_index": str(exc)})
+        instance.base_image.save(filename, content, save=False)
+
+    def create(self, validated_data):
+        image_url = self._resolve_printify_image_url(validated_data)
+        instance = MockupTemplatePart(**validated_data)
+        if image_url:
+            self._apply_printify_image(instance, image_url)
+        instance.save()
+        return instance
+
+    def update(self, instance, validated_data):
+        image_url = self._resolve_printify_image_url(validated_data)
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        if image_url:
+            self._apply_printify_image(instance, image_url)
+        instance.save()
+        return instance
+
+
+class AdminMockupTemplatePartColorAssetSerializer(serializers.ModelSerializer):
+    """Writable admin form for a single (part, colour) override. `color_name` should match the
+    `ProductVariant.color_name` values an admin expects customers to select — matching against
+    it at render/preview time is case-insensitive (see apps.generator.services.
+    resolve_part_color_asset), so exact casing here doesn't matter.
+
+    `base_image` can also be set from one of a Printify blueprint's own synced catalogue images,
+    the same as AdminMockupTemplatePartSerializer above — `printify_blueprint_id`/
+    `printify_image_index` (write-only, not model fields) name that image by *position*, never a
+    raw client-supplied URL, so there's no SSRF surface here either."""
+
+    printify_blueprint_id = serializers.IntegerField(write_only=True, required=False, allow_null=True)
+    printify_image_index = serializers.IntegerField(write_only=True, required=False, allow_null=True)
+
+    class Meta:
+        model = MockupTemplatePartColorAsset
+        fields = (
+            "id",
+            "part",
+            "color_name",
+            "base_image",
+            "printify_blueprint_id",
+            "printify_image_index",
+            "mask_image",
+            "displacement_map",
+            "shadow_layer",
+            "highlight_layer",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = ("id", "created_at", "updated_at")
+        extra_kwargs = {"base_image": {"required": False}}
+
+    def validate(self, attrs):
+        has_uploaded_file = attrs.get("base_image") is not None
+        has_printify_selection = attrs.get("printify_blueprint_id") is not None and attrs.get("printify_image_index") is not None
+        has_existing_image = bool(self.instance and self.instance.base_image)
+        if not has_uploaded_file and not has_printify_selection and not has_existing_image:
+            raise serializers.ValidationError(
+                {"base_image": "Upload a file or select a Printify catalog image."}
+            )
+        return attrs
+
+    def _resolve_printify_image_url(self, validated_data: dict) -> str | None:
+        blueprint_id = validated_data.pop("printify_blueprint_id", None)
+        image_index = validated_data.pop("printify_image_index", None)
+        if blueprint_id is None or image_index is None:
+            return None
+
+        from apps.printify.models import PrintifyBlueprint
+
+        try:
+            blueprint = PrintifyBlueprint.objects.get(pk=blueprint_id)
+        except PrintifyBlueprint.DoesNotExist:
+            raise serializers.ValidationError({"printify_blueprint_id": "No such Printify blueprint."})
+
+        images = blueprint.images or []
+        if not isinstance(image_index, int) or not (0 <= image_index < len(images)):
+            raise serializers.ValidationError({"printify_image_index": "Invalid image index for this blueprint."})
+
+        url = images[image_index]
+        if not isinstance(url, str) or not url.startswith("https://"):
+            raise serializers.ValidationError({"printify_image_index": "This catalogue image entry isn't a usable URL."})
+        return url
+
+    def _apply_printify_image(self, instance: MockupTemplatePartColorAsset, image_url: str) -> None:
+        from .services import UploadValidationError, fetch_base_image_from_printify_url
+
+        try:
+            filename, content = fetch_base_image_from_printify_url(image_url)
+        except UploadValidationError as exc:
+            raise serializers.ValidationError({"printify_image_index": str(exc)})
+        instance.base_image.save(filename, content, save=False)
+
+    def create(self, validated_data):
+        image_url = self._resolve_printify_image_url(validated_data)
+        instance = MockupTemplatePartColorAsset(**validated_data)
+        if image_url:
+            self._apply_printify_image(instance, image_url)
+        instance.save()
+        return instance
+
+    def update(self, instance, validated_data):
+        image_url = self._resolve_printify_image_url(validated_data)
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        if image_url:
+            self._apply_printify_image(instance, image_url)
+        instance.save()
+        return instance
 
 
 class AdminMockupTemplateSerializer(serializers.ModelSerializer):

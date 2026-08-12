@@ -407,7 +407,10 @@ class PrintifyAdminAPITests(APITestCase):
         with CaptureQueriesContext(connection) as baseline:
             response = self.client.get("/api/printify/blueprints/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data), 4)  # self.blueprint (setUp) + 3 just created
+        # Paginated envelope (StandardResultsSetPagination) — the default page_size (24) still
+        # fits every row created below on a single page, so `results` is the full set, not a
+        # truncated one.
+        self.assertEqual(len(response.data["results"]), 4)  # self.blueprint (setUp) + 3 just created
         baseline_count = len(baseline.captured_queries)
 
         for i in range(3, 8):
@@ -417,7 +420,7 @@ class PrintifyAdminAPITests(APITestCase):
         with CaptureQueriesContext(connection) as scaled:
             response = self.client.get("/api/printify/blueprints/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data), 9)
+        self.assertEqual(len(response.data["results"]), 9)
         scaled_count = len(scaled.captured_queries)
 
         self.assertEqual(
@@ -426,7 +429,7 @@ class PrintifyAdminAPITests(APITestCase):
             f"Blueprint list query count grew with row count (N+1): {baseline_count} vs {scaled_count}.",
         )
         # Sanity check the annotation actually drives the value, not a coincidental match.
-        extra_row = next(r for r in response.data if r["blueprint_id"] == 107)
+        extra_row = next(r for r in response.data["results"] if r["blueprint_id"] == 107)
         self.assertEqual(extra_row["provider_count"], 1)
 
     def test_map_and_unmap_blueprint_to_template(self):
